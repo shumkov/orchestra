@@ -4,8 +4,17 @@
   "description": "Drive interactive Claude Code CLI sessions: spawn, inject messages via the MCP channels bridge, observe turns, recover. The transport-agnostic session engine extracted from polygram, shared by polygram (Telegram) and water (WhatsApp).",
   "type": "commonjs",
   "main": "index.js",
+  "files": [
+    "index.js",
+    "lib/",
+    "docs/",
+    "README.md"
+  ],
   "scripts": {
     "test": "node --test --test-force-exit tests/*.test.js"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "engines": {
     "node": ">=22"

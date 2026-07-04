@@ -8,7 +8,7 @@
 
 'use strict';
 
-const { Process } = require('./lib/process/process');
+const { Process, UnsupportedOperationError } = require('./lib/process/process');
 const { ProcessManager } = require('./lib/process/process-manager');
 const { CliProcess } = require('./lib/process/cli-process');
 const { createProcessFactory } = require('./lib/process/factory');
@@ -33,7 +33,7 @@ const approvalsStore = require('./lib/approvals/store');
 
 module.exports = {
   // pool + driver
-  Process, ProcessManager, CliProcess, createProcessFactory,
+  Process, UnsupportedOperationError, ProcessManager, CliProcess, createProcessFactory,
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle

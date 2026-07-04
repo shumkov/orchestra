@@ -1,0 +1,34 @@
+{
+  "name": "@shumkov/orchestra",
+  "version": "0.1.0",
+  "description": "Drive interactive Claude Code CLI sessions: spawn, inject messages via the MCP channels bridge, observe turns, recover. The transport-agnostic session engine extracted from polygram, shared by polygram (Telegram) and water (WhatsApp).",
+  "type": "commonjs",
+  "main": "index.js",
+  "scripts": {
+    "test": "node --test --test-force-exit tests/*.test.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.0.0"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "claude-cli",
+    "channels",
+    "mcp",
+    "session-pool",
+    "tmux",
+    "polygram",
+    "water"
+  ],
+  "author": "Ivan Shumkov <ivanshumkov@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shumkov/orchestra.git"
+  }
+}

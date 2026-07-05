@@ -20,6 +20,7 @@ const attachmentBase = require('./lib/process/attachment-base');
 
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const orphanSweep = require('./lib/tmux/orphan-sweep');
+const logTail = require('./lib/tmux/log-tail');
 const pollScheduler = require('./lib/tmux/poll-scheduler');
 
 const claudeBin = require('./lib/claude-bin');
@@ -37,7 +38,7 @@ module.exports = {
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle
-  createTmuxRunner, orphanSweep, pollScheduler,
+  createTmuxRunner, orphanSweep, pollScheduler, logTail,
   // claude binary pin+vendor
   claudeBin,
   // observability

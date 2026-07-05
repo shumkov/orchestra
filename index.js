@@ -9,7 +9,7 @@
 'use strict';
 
 const { Process, UnsupportedOperationError } = require('./lib/process/process');
-const { ProcessManager } = require('./lib/process/process-manager');
+const { ProcessManager, CALLBACK_TO_EVENT } = require('./lib/process/process-manager');
 const { CliProcess } = require('./lib/process/cli-process');
 const sdkProcess = require('./lib/process/sdk-process');
 const { SdkProcess, extractAssistantText, sumUsage, makeInputController } = sdkProcess;
@@ -37,7 +37,7 @@ const approvalsStore = require('./lib/approvals/store');
 
 module.exports = {
   // pool + driver
-  Process, UnsupportedOperationError, ProcessManager, CliProcess, SdkProcess, extractAssistantText, sumUsage, makeInputController, createProcessFactory, pickBackend,
+  Process, UnsupportedOperationError, ProcessManager, CALLBACK_TO_EVENT, CliProcess, SdkProcess, extractAssistantText, sumUsage, makeInputController, createProcessFactory, pickBackend,
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle

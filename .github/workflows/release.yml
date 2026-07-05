@@ -1,0 +1,67 @@
+name: Release
+
+# Fires on any tag matching `v*`. Flow:
+#   1. bump package.json to the new version, commit, push to main
+#   2. git tag v0.2.0 && git push origin v0.2.0
+#   3. this workflow: tests -> npm publish (OIDC trusted publishing) -> GitHub Release
+on:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Configure in repo Settings -> Environments -> release, and add orchestra as an
+    # npm trusted publisher (repo shumkov/orchestra, workflow release.yml, environment release).
+    environment: release
+    permissions:
+      id-token: write   # npm OIDC trusted publishing
+      contents: write   # gh release create
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          registry-url: 'https://registry.npmjs.org'   # required for OIDC to activate
+
+      - run: npm ci
+
+      - name: Test gate (strict)
+        run: npm test
+
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $PKG_VERSION"
+            exit 1
+          fi
+
+      # Trusted publishing needs npm >= 11.5.1 (Node 24 ships npm 10/11.x). Use a
+      # pinned npm@latest via npx for the publish step only. Do NOT set NODE_AUTH_TOKEN
+      # (even empty) — npm's OIDC path only activates when no auth token env is present.
+      # Pre-release tags (v0.2.0-rc.1) publish under `next`; stable under `latest`.
+      - name: Publish to npm (OIDC)
+        run: |
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          case "$PKG_VERSION" in
+            *-*) DIST_TAG="next" ;;
+            *)   DIST_TAG="latest" ;;
+          esac
+          echo "Publishing @shumkov/orchestra $PKG_VERSION under dist-tag $DIST_TAG"
+          npx -y npm@latest publish --access public --tag "$DIST_TAG"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes

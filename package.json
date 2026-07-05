@@ -39,5 +39,8 @@
   "repository": {
     "type": "git",
     "url": "git+https://github.com/shumkov/orchestra.git"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/claude-agent-sdk": "0.2.123"
   }
 }

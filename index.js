@@ -11,6 +11,7 @@
 const { Process, UnsupportedOperationError } = require('./lib/process/process');
 const { ProcessManager } = require('./lib/process/process-manager');
 const { CliProcess } = require('./lib/process/cli-process');
+const { SdkProcess, extractAssistantText } = require('./lib/process/sdk-process');
 const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { ChannelsBridgeServer } = require('./lib/process/channels-bridge-server');
 const bridgeProtocol = require('./lib/process/channels-bridge-protocol');
@@ -35,7 +36,7 @@ const approvalsStore = require('./lib/approvals/store');
 
 module.exports = {
   // pool + driver
-  Process, UnsupportedOperationError, ProcessManager, CliProcess, createProcessFactory, pickBackend,
+  Process, UnsupportedOperationError, ProcessManager, CliProcess, SdkProcess, extractAssistantText, createProcessFactory, pickBackend,
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle

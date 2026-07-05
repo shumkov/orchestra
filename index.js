@@ -11,11 +11,12 @@
 const { Process, UnsupportedOperationError } = require('./lib/process/process');
 const { ProcessManager } = require('./lib/process/process-manager');
 const { CliProcess } = require('./lib/process/cli-process');
-const { createProcessFactory } = require('./lib/process/factory');
+const { createProcessFactory, pickBackend } = require('./lib/process/factory');
 const { ChannelsBridgeServer } = require('./lib/process/channels-bridge-server');
 const bridgeProtocol = require('./lib/process/channels-bridge-protocol');
 const hookSettings = require('./lib/process/hook-settings');
 const hookEventTail = require('./lib/process/hook-event-tail');
+const startupGate = require('./lib/tmux/startup-gate');
 const attachmentBase = require('./lib/process/attachment-base');
 
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
@@ -34,11 +35,11 @@ const approvalsStore = require('./lib/approvals/store');
 
 module.exports = {
   // pool + driver
-  Process, UnsupportedOperationError, ProcessManager, CliProcess, createProcessFactory,
+  Process, UnsupportedOperationError, ProcessManager, CliProcess, createProcessFactory, pickBackend,
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle
-  createTmuxRunner, orphanSweep, pollScheduler, logTail,
+  createTmuxRunner, orphanSweep, pollScheduler, logTail, startupGate,
   // claude binary pin+vendor
   claudeBin,
   // observability

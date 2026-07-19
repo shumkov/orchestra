@@ -6,7 +6,7 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const { resolvePinnedClaudeBin, verifyPinnedClaudeBin } = require('../index').claudeBin;
+const { resolvePinnedClaudeBin, verifyPinnedClaudeBin, checkClaudeAuthHealth } = require('../index').claudeBin;
 
 const ORIGINAL_OVERRIDE = process.env.ORCHESTRA_CLAUDE_BIN;
 
@@ -175,5 +175,63 @@ describe('claude-bin — ensureVendoredClaudeBin', () => {
       assert.equal(r.path, ov);
       assert.equal(r.vendored, false);
     } finally { teardown(); }
+  });
+});
+
+describe('claude-bin — checkClaudeAuthHealth (free credentials-file check)', () => {
+  const DAY = 86_400_000;
+  const NOW = 1_800_000_000_000; // fixed reference for deterministic daysLeft
+
+  function withCreds(oauth) {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-auth-'));
+    fs.mkdirSync(path.join(home, '.claude'), { recursive: true });
+    if (oauth !== undefined) {
+      fs.writeFileSync(path.join(home, '.claude', '.credentials.json'),
+        JSON.stringify({ claudeAiOauth: oauth }));
+    }
+    return { home, cleanup: () => fs.rmSync(home, { recursive: true, force: true }) };
+  }
+
+  test('healthy — refresh token well in the future', () => {
+    const { home, cleanup } = withCreds({ refreshTokenExpiresAt: NOW + 28 * DAY });
+    try {
+      const r = checkClaudeAuthHealth({ home, now: NOW });
+      assert.equal(r.state, 'healthy');
+      assert.equal(r.daysLeft, 28);
+    } finally { cleanup(); }
+  });
+
+  test('expiring — refresh token within the warn window (default 3d)', () => {
+    const { home, cleanup } = withCreds({ refreshTokenExpiresAt: NOW + 2 * DAY });
+    try {
+      assert.equal(checkClaudeAuthHealth({ home, now: NOW }).state, 'expiring');
+    } finally { cleanup(); }
+  });
+
+  test('expired — refresh token in the past (the incident: silent wedge trigger)', () => {
+    const { home, cleanup } = withCreds({ refreshTokenExpiresAt: NOW - DAY });
+    try {
+      const r = checkClaudeAuthHealth({ home, now: NOW });
+      assert.equal(r.state, 'expired');
+      assert.ok(r.msLeft < 0);
+    } finally { cleanup(); }
+  });
+
+  test('unknown — credentials file missing (never hard-refuse on a read error)', () => {
+    const { home, cleanup } = withCreds(undefined); // no file written
+    try {
+      const r = checkClaudeAuthHealth({ home, now: NOW });
+      assert.equal(r.state, 'unknown');
+      assert.match(r.reason, /unreadable/);
+    } finally { cleanup(); }
+  });
+
+  test('unknown — file present but no refreshTokenExpiresAt field', () => {
+    const { home, cleanup } = withCreds({ accessToken: 'x', expiresAt: NOW + DAY });
+    try {
+      const r = checkClaudeAuthHealth({ home, now: NOW });
+      assert.equal(r.state, 'unknown');
+      assert.match(r.reason, /refreshTokenExpiresAt/);
+    } finally { cleanup(); }
   });
 });

@@ -204,6 +204,54 @@ test('tool call dispatches via toolDispatcher and ACKs', async () => {
   await cp.kill('test');
 });
 
+test('reply tool call carries the ledgered participantJid (quote author) to the dispatcher', async () => {
+  const dispatched = [];
+  const cp = makeCliProcess({ toolDispatcher: async (call) => { dispatched.push(call); return { ok: true }; } });
+  const bridge = await startWithFakeBridge(cp);
+
+  // A turn whose source message has both an id and an author JID (the WhatsApp participant).
+  const sendP = cp.send('hi', { context: { sourceMsgId: 'ABC', participantJid: '5@lid' } });
+  const um = await bridge.waitFor(m => m.kind === 'user_msg');
+
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'q1',
+    name: 'reply', args: { chat_id: cp.chatId, text: 'done', turn_id: um.turn_id },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack');
+  await sendP;
+
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].sourceMsgId, 'ABC', 'quote target reaches the dispatcher');
+  assert.equal(dispatched[0].participantJid, '5@lid', 'quote author reaches the dispatcher alongside it');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
+test('reply tool call: no ledgered participant → dispatcher gets participantJid null (never a half-built quote)', async () => {
+  const dispatched = [];
+  const cp = makeCliProcess({ toolDispatcher: async (call) => { dispatched.push(call); return { ok: true }; } });
+  const bridge = await startWithFakeBridge(cp);
+
+  // A caller (e.g. Telegram) that supplies a quote target but no participant.
+  const sendP = cp.send('hi', { context: { sourceMsgId: 'ABC' } });
+  const um = await bridge.waitFor(m => m.kind === 'user_msg');
+
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'q2',
+    name: 'reply', args: { chat_id: cp.chatId, text: 'done', turn_id: um.turn_id },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack');
+  await sendP;
+
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].sourceMsgId, 'ABC');
+  assert.equal(dispatched[0].participantJid, null, 'participant is null, not undefined/garbage');
+
+  bridge.close();
+  await cp.kill('test');
+});
+
 test('tool call with wrong chat_id is dropped (security guard)', async () => {
   const dispatched = [];
   const cp = makeCliProcess({

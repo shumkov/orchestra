@@ -35,6 +35,7 @@ function makeFakeRunner({ paneText = READY_BANNER } = {}) {
     killSession: async (name) => { calls.killSession.push(name); },
     sendControl: async (name, key) => { calls.sendControl.push({ name, key }); },
     captureWide: async (name) => { calls.captureWide.push(name); return paneText; },
+    sessionExists: async () => true,
   };
 }
 
@@ -103,6 +104,7 @@ function makeCliProcess({
   chatId = 'chat-1',
   toolDispatcher = async () => ({ ok: true }),
   paneText,
+  sessionLauncher = null,
 } = {}) {
   return new CliProcess({
     sessionKey: `sess-${chatId}`,
@@ -112,6 +114,7 @@ function makeCliProcess({
     tmuxRunner: makeFakeRunner({ paneText }),
     botName: 'testbot',
     claudeBin: '/usr/bin/true',         // never actually invoked because runner is fake
+    sessionLauncher,
     toolDispatcher,
     logger: quietLogger,
     handshakeTimeoutMs: 2000,
@@ -147,6 +150,19 @@ test('start() completes after fake bridge handshakes', async () => {
   // mode-bit check — must be 0600
   const mode = fs.statSync(cp.sockPath).mode & 0o777;
   assert.equal(mode, 0o600, `socket mode: got ${mode.toString(8)}`);
+  bridge.close();
+  await cp.kill('test');
+});
+
+test('launcher wraps the pinned Claude binary without changing its argv', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  const bridge = await startWithFakeBridge(cp);
+
+  const spawn = cp.runner.calls.spawn[0];
+  assert.equal(spawn.command, process.execPath);
+  assert.equal(spawn.args[0], '/usr/bin/true');
+  assert.ok(spawn.args.includes('--mcp-config'));
+
   bridge.close();
   await cp.kill('test');
 });
@@ -528,6 +544,34 @@ test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait
   assert.equal(cp.pendingTurns.size, 0);
   assert.equal(cp.inFlight, false);
 
+  await cp.kill('test');
+});
+
+test('contained session loss rejects pending turns with a non-resumable code', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionExists = async () => false;
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(sendP, err => err?.code === 'SESSION_PROCESS_LOST');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await rejection;
+  await cp.kill('test');
+});
+
+test('a live contained tmux session keeps the bridge-disconnected classification', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionExists = async () => true;
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(sendP, err => err?.code === 'BRIDGE_DISCONNECTED');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await rejection;
   await cp.kill('test');
 });
 

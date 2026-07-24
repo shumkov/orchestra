@@ -181,6 +181,25 @@ describe('runner.spawn', () => {
       assert.match(err.message, /duplicate session/);
     }
   });
+
+  test('requireExistingServer prefixes every tmux client invocation with -N', async () => {
+    const mockRun = makeMockRun();
+    const runner = createTmuxRunner({ runFn: mockRun, requireExistingServer: true });
+
+    await runner.spawn({ name: 'sess', cwd: '.', command: 'claude' });
+    await runner.sendControl('sess', 'Enter');
+    await runner.pasteText('sess', 'hello');
+    await runner.capturePane('sess');
+    await runner.sessionExists('sess');
+    await runner.killSession('sess');
+    await runner.listPolygramSessions();
+
+    assert.ok(mockRun.calls.length > 0);
+    for (const call of mockRun.calls) {
+      assert.equal(call.cmd, 'tmux');
+      assert.equal(call.args[0], '-N', `expected -N for tmux ${call.args.slice(1).join(' ')}`);
+    }
+  });
 });
 
 // ── sendControl ──────────────────────────────────────────────────────

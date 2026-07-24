@@ -195,6 +195,8 @@ test('tool call dispatches via toolDispatcher and ACKs', async () => {
   const ack = await bridge.waitFor(m => m.kind === 'tool_ack');
   assert.equal(ack.tool_call_id, 'call-1');
   assert.equal(ack.ok, true);
+  assert.equal(ack.attempt_id, 'call-1');
+  assert.equal(ack.delivery, 'sent');
   assert.equal(dispatched.length, 1);
   assert.equal(dispatched[0].text, 'hello world');
   assert.equal(dispatched[0].toolName, 'reply');
@@ -988,6 +990,8 @@ test('P1 #7: duplicate tool_call_id is re-ACKed without re-dispatching', async (
   });
   const ack1 = await bridge.waitFor(m => m.kind === 'tool_ack');
   assert.equal(ack1.ok, true);
+  assert.equal(ack1.delivery, 'sent');
+  assert.equal(ack1.attempt_id, 'dup-1');
   assert.equal(dispatchCount, 1);
 
   // Duplicate — should re-ACK without invoking dispatcher again
@@ -995,8 +999,11 @@ test('P1 #7: duplicate tool_call_id is re-ACKed without re-dispatching', async (
     kind: 'tool', session: cp.sessionKey, tool_call_id: 'dup-1',
     name: 'reply', args: { chat_id: 'chat-1', text: 'hi' },
   });
-  const ack2 = await bridge.waitFor(m => m.kind === 'tool_ack');
+  const ack2 = await bridge.waitFor(m => m.kind === 'tool_ack' && m.delivery === 'replayed');
   assert.equal(ack2.ok, true);
+  assert.equal(ack2.delivery, 'replayed');
+  assert.equal(ack2.attempt_id, 'dup-1');
+  assert.equal(ack2.replay_of, 'dup-1');
   assert.equal(dispatchCount, 1, 'dispatcher NOT invoked for duplicate tool_call_id');
 
   bridge.close();

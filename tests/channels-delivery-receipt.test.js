@@ -4,6 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 
 const {
+  formatToolAckResult,
   parseDaemonToBridgeMessage,
 } = require('../lib/process/channels-bridge-protocol');
 
@@ -34,13 +35,29 @@ test('tool acknowledgements distinguish direct sends from causal replays', () =>
   assert.equal(replay.msg.replay_of, 'attempt-1');
 });
 
-test('tool acknowledgement without an opaque attempt id is rejected', () => {
+test('0.4.2 tool acknowledgement remains wire-compatible without receipt metadata', () => {
   const parsed = parseDaemonToBridgeMessage({
     kind: 'tool_ack',
     tool_call_id: 'tool-1',
     ok: false,
     error: 'transport failed',
   });
-  assert.equal(parsed.ok, false);
-  assert.match(parsed.error, /attempt_id/);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.msg.attempt_id, undefined);
+});
+
+test('tool result formatter preserves timeout identity for transcript correlation', () => {
+  const error = new Error('daemon ack timeout');
+  error.code = 'TOOL_ACK_TIMEOUT';
+  const result = formatToolAckResult({
+    error,
+    toolCallId: 'timed-out-attempt',
+  });
+  assert.equal(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[0].text), {
+    ok: false,
+    error: 'daemon ack timeout',
+    timeout: true,
+    attempt_id: 'timed-out-attempt',
+  });
 });

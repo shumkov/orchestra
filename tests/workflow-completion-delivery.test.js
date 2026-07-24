@@ -390,6 +390,17 @@ test('ambiguous, forked, stale, and non-mainline transcript shapes fail closed',
     ['final mismatch', (fixture) => {
       fixture.finalText = 'A different final.';
     }],
+    ['later mainline row', (fixture) => {
+      const terminal = fixture.rows.at(-1);
+      fixture.rows.push({
+        type: 'user',
+        uuid: 'later-user',
+        parentUuid: terminal.uuid,
+        sessionId: fixture.sessionId,
+        isSidechain: false,
+        message: { role: 'user', content: 'Later activity.' },
+      });
+    }],
   ];
 
   for (const [name, mutate] of cases) {
@@ -569,6 +580,65 @@ test('only a causally linked same-branch replay proves delivery', async (t) => {
   }));
   assert.equal(unlinked.eligible, true);
   assert.equal(unlinked.deliveredFinal, false);
+});
+
+test('duplicate and forward-referenced replay attempts fail closed', async (t) => {
+  const input = { chat_id: 'chat-1', text: 'Delivered report.' };
+  const toolUse = (id) => ({
+    type: 'assistant',
+    requestId: `${id}-request`,
+    message: {
+      id: `${id}-message`,
+      stop_reason: 'tool_use',
+      content: [{ type: 'tool_use', id, name: 'mcp__orchestra-bridge__reply', input }],
+    },
+  });
+  const toolResult = (id, receipt) => ({
+    type: 'user',
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: id,
+        is_error: receipt.ok === false,
+        content: JSON.stringify(receipt),
+      }],
+    },
+  });
+
+  const duplicate = await correlateFixture(t, makeWorkflowRows({
+    branch: [
+      toolUse('reply-1'),
+      toolResult('reply-1', { ok: false, timeout: true, attempt_id: 'duplicate-attempt' }),
+      toolUse('reply-2'),
+      toolResult('reply-2', { ok: false, timeout: true, attempt_id: 'duplicate-attempt' }),
+      toolUse('reply-3'),
+      toolResult('reply-3', {
+        ok: true,
+        delivery: 'replayed',
+        attempt_id: 'replay-attempt',
+        replay_of: 'duplicate-attempt',
+      }),
+    ],
+  }));
+  assert.equal(duplicate.eligible, false);
+  assert.equal(duplicate.reason, 'delivery-attempt-ambiguous');
+
+  const forwardReference = await correlateFixture(t, makeWorkflowRows({
+    branch: [
+      toolUse('reply-1'),
+      toolResult('reply-1', {
+        ok: true,
+        delivery: 'replayed',
+        attempt_id: 'replay-attempt',
+        replay_of: 'later-attempt',
+      }),
+      toolUse('reply-2'),
+      toolResult('reply-2', { ok: false, timeout: true, attempt_id: 'later-attempt' }),
+    ],
+  }));
+  assert.equal(forwardReference.eligible, false);
+  assert.equal(forwardReference.reason, 'delivery-replay-order-invalid');
 });
 
 test('interim replies and progressive edits expose only normalized equality hashes', async (t) => {
@@ -807,6 +877,46 @@ test('teardown invalidates a deferred decision and late dispatcher settlement is
   assert.equal(emitted, false);
   assert.equal(cp.hasPendingDeliveryWork(), false);
   assert.equal(cp._deliveryAttempts.size, 0);
+});
+
+test('disconnect, kill, and reset invalidate deferred Workflow delivery decisions', async (t) => {
+  const teardowns = [
+    ['disconnect', async (cp) => cp._handleBridgeDisconnected('test-disconnect')],
+    ['kill', async (cp) => cp.kill('test-kill')],
+    ['reset', async (cp) => cp.resetSession({ reason: 'test-reset' })],
+  ];
+
+  for (const [name, teardown] of teardowns) {
+    const input = { chat_id: 'chat-1', text: 'Final report.' };
+    const fixture = makeTimeoutWorkflowRows({ input });
+    const { dir, transcriptPath } = writeTranscript(fixture.rows);
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    const cp = makeCliProcess();
+    cp.claudeSessionId = fixture.sessionId;
+    const attempt = cp._registerDeliveryAttempt(
+      'slow-attempt',
+      hashDeliveryArguments('reply', input),
+    );
+    let emitted = false;
+    cp.on('autonomous-assistant-message', () => { emitted = true; });
+
+    cp._handleHookEvent({
+      type: 'Stop',
+      sessionId: fixture.sessionId,
+      transcriptPath,
+      stopHookActive: false,
+      lastAssistantMessage: fixture.finalText,
+    });
+    await waitFor(() => cp.hasPendingDeliveryWork());
+    await teardown(cp);
+    cp._settleDeliveryAttempt(attempt, 'sent');
+    await new Promise(resolve => setTimeout(resolve, 30));
+
+    assert.equal(emitted, false, name);
+    assert.equal(cp.hasPendingDeliveryWork(), false, name);
+    assert.equal(cp._deliveryAttempts.size, 0, name);
+    assert.equal(cp._activeWorkflowDecisions.size, 0, name);
+  }
 });
 
 test('the recent delivery ledger is bounded and stores no plaintext arguments', () => {

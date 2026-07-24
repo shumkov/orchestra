@@ -66,13 +66,77 @@ function spawnBridge({
   const exitedP = new Promise(resolve => child.once('exit', (code, signal) => resolve({ code, signal })));
   const stderrBuf = [];
   child.stderr.on('data', chunk => stderrBuf.push(chunk));
+  const mcpInbox = [];
+  const mcpWaiters = [];
+  child.stdout.setEncoding('utf8');
+  let stdoutBuf = '';
+  child.stdout.on('data', chunk => {
+    stdoutBuf += chunk;
+    let nl;
+    while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+      const line = stdoutBuf.slice(0, nl);
+      stdoutBuf = stdoutBuf.slice(nl + 1);
+      if (!line.trim()) continue;
+      const message = JSON.parse(line);
+      const waiterIndex = mcpWaiters.findIndex(waiter => waiter.match(message));
+      if (waiterIndex >= 0) {
+        const [waiter] = mcpWaiters.splice(waiterIndex, 1);
+        waiter.resolve(message);
+      } else {
+        mcpInbox.push(message);
+      }
+    }
+  });
   return {
     child,
     exitedP,
     get stderr() { return Buffer.concat(stderrBuf).toString('utf8'); },
+    sendMcp: message => child.stdin.write(JSON.stringify(message) + '\n'),
+    waitForMcp(predicate, { timeoutMs = 3000 } = {}) {
+      const index = mcpInbox.findIndex(predicate);
+      if (index >= 0) return Promise.resolve(mcpInbox.splice(index, 1)[0]);
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('waitForMcp timeout')), timeoutMs);
+        mcpWaiters.push({
+          match: predicate,
+          resolve: message => {
+            clearTimeout(timer);
+            resolve(message);
+          },
+        });
+      });
+    },
     kill: (sig = 'SIGTERM') => { try { child.kill(sig); } catch {} },
     closeStdin: () => { try { child.stdin.end(); } catch {} },
   };
+}
+
+async function initializeMcp(bridge) {
+  bridge.sendMcp({
+    jsonrpc: '2.0',
+    id: 1,
+    method: 'initialize',
+    params: {
+      protocolVersion: '2025-03-26',
+      capabilities: {},
+      clientInfo: { name: 'orchestra-test', version: '1.0.0' },
+    },
+  });
+  const initialized = await bridge.waitForMcp(message => message.id === 1);
+  assert.ok(initialized.result);
+  bridge.sendMcp({
+    jsonrpc: '2.0',
+    method: 'notifications/initialized',
+    params: {},
+  });
+  bridge.sendMcp({
+    jsonrpc: '2.0',
+    id: 2,
+    method: 'tools/list',
+    params: {},
+  });
+  const listed = await bridge.waitForMcp(message => message.id === 2);
+  assert.ok(listed.result.tools.some(tool => tool.name === 'reply'));
 }
 
 /**
@@ -159,6 +223,84 @@ test('bridge sends hello + session_init on socket connect', async () => {
     assert.equal(sessionInit.claude_session_id, 'test-claude-sid');
     b.kill();
     await b.exitedP;
+  } finally {
+    await daemon.close();
+  }
+});
+
+test('bridge MCP reply serializes direct, replayed, and failed delivery receipts', async () => {
+  const sockPath = makeSockPath();
+  const daemon = await startFakeDaemonSocket(sockPath);
+  try {
+    const bridge = spawnBridge({ sockPath });
+    await daemon.awaitConnection();
+    await daemon.waitFor(message => message.kind === 'session_init');
+    daemon.sendTo({ kind: 'hello_ack' });
+    await initializeMcp(bridge);
+
+    const callReply = async (id, acknowledgement) => {
+      bridge.sendMcp({
+        jsonrpc: '2.0',
+        id,
+        method: 'tools/call',
+        params: {
+          name: 'reply',
+          arguments: { chat_id: 'chat-1', text: `reply-${id}` },
+        },
+      });
+      const tool = await daemon.waitFor(message => (
+        message.kind === 'tool' && message.args?.text === `reply-${id}`
+      ));
+      daemon.sendTo({
+        kind: 'tool_ack',
+        tool_call_id: tool.tool_call_id,
+        ...acknowledgement,
+      });
+      return bridge.waitForMcp(message => message.id === id);
+    };
+
+    const sent = await callReply(3, {
+      ok: true,
+      attempt_id: 'sent-attempt',
+      delivery: 'sent',
+      message_id: 41,
+    });
+    assert.deepEqual(JSON.parse(sent.result.content[0].text), {
+      ok: true,
+      message_id: 41,
+      attempt_id: 'sent-attempt',
+      delivery: 'sent',
+    });
+
+    const replayed = await callReply(4, {
+      ok: true,
+      attempt_id: 'replay-attempt',
+      delivery: 'replayed',
+      replay_of: 'sent-attempt',
+      message_id: 41,
+    });
+    assert.deepEqual(JSON.parse(replayed.result.content[0].text), {
+      ok: true,
+      message_id: 41,
+      attempt_id: 'replay-attempt',
+      delivery: 'replayed',
+      replay_of: 'sent-attempt',
+    });
+
+    const failed = await callReply(5, {
+      ok: false,
+      attempt_id: 'failed-attempt',
+      error: 'transport failed',
+    });
+    assert.equal(failed.result.isError, true);
+    assert.deepEqual(JSON.parse(failed.result.content[0].text), {
+      ok: false,
+      error: 'transport failed',
+      attempt_id: 'failed-attempt',
+    });
+
+    bridge.kill();
+    await bridge.exitedP;
   } finally {
     await daemon.close();
   }

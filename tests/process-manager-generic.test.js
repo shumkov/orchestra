@@ -339,6 +339,29 @@ describe('ProcessManager — eviction-pin for live background work (Policy C)', 
   });
 });
 
+describe('ProcessManager — delivery-work eviction pin', () => {
+  test('pending delivery work is not evicted and settlement wakes a parked waiter', async () => {
+    const pm = new ProcessManager({
+      processFactory: mockFactory({ cost: 1 }),
+      budget: 1,
+      lruWaitMs: 200,
+    });
+    const pinned = await pm.getOrSpawn('workflow');
+    let pending = true;
+    pinned.hasPendingDeliveryWork = () => pending;
+
+    assert.equal(pm._evictLRU(), false);
+    assert.deepEqual(pm._pinnedSessionKeys(), ['workflow']);
+
+    let woke = false;
+    const waiter = pm._awaitLruSlot().then(() => { woke = true; });
+    pending = false;
+    pinned.emit('delivery-work-settled');
+    await waiter;
+    assert.equal(woke, true);
+  });
+});
+
 describe('ProcessManager — kill / killChat / shutdown', () => {
   test('kill removes from map + calls Process.kill', async () => {
     const pm = new ProcessManager({ processFactory: mockFactory() });

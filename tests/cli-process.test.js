@@ -2,7 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
 const os = require('node:os');
+const path = require('node:path');
 
 const { CliProcess } = require('../index');
 const factory = require('../lib/process/factory');
@@ -244,7 +246,7 @@ test('factory forwards an executable session launcher to CliProcess', () => {
   assert.equal(proc.sessionLauncher, launcher);
 });
 
-test('CliProcess rejects relative, missing, and directory session launchers', () => {
+test('CliProcess rejects relative, missing, non-executable, and directory session launchers', () => {
   const common = {
     sessionKey: 'launcher-validation', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
     toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/echo',
@@ -262,6 +264,17 @@ test('CliProcess rejects relative, missing, and directory session launchers', ()
     () => new CliProcess({ ...common, sessionLauncher: os.tmpdir() }),
     err => err.code === 'SESSION_LAUNCHER_INVALID' && /executable file/.test(err.message),
   );
+
+  const nonExecutable = path.join(os.tmpdir(), `orchestra-launcher-${process.pid}`);
+  fs.writeFileSync(nonExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+  try {
+    assert.throws(
+      () => new CliProcess({ ...common, sessionLauncher: nonExecutable }),
+      err => err.code === 'SESSION_LAUNCHER_INVALID' && /executable/.test(err.message),
+    );
+  } finally {
+    fs.unlinkSync(nonExecutable);
+  }
 });
 
 // Review AC3: pickBackend warns + falls back on unknown pm value (typo path)

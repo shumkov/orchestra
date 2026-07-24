@@ -471,6 +471,29 @@ describe('runner.sessionExists', () => {
   });
 });
 
+describe('runner.sessionProcessAlive', () => {
+  test('requires at least one live pane process', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { stdout: '1 4321\n0 8765\n' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('mixed'), true);
+  });
+
+  test('returns false for retained dead panes', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { stdout: '1 4321\n' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('dead'), false);
+  });
+
+  test('returns false when the session disappears during the probe', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { error: "can't find session" });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('gone'), false);
+  });
+});
+
 describe('runner.killSession', () => {
   test('swallows kill errors (already-dead session)', async () => {
     const mockRun = makeMockRun();

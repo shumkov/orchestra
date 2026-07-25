@@ -181,6 +181,25 @@ describe('runner.spawn', () => {
       assert.match(err.message, /duplicate session/);
     }
   });
+
+  test('requireExistingServer prefixes every tmux client invocation with -N', async () => {
+    const mockRun = makeMockRun();
+    const runner = createTmuxRunner({ runFn: mockRun, requireExistingServer: true });
+
+    await runner.spawn({ name: 'sess', cwd: '.', command: 'claude' });
+    await runner.sendControl('sess', 'Enter');
+    await runner.pasteText('sess', 'hello');
+    await runner.capturePane('sess');
+    await runner.sessionExists('sess');
+    await runner.killSession('sess');
+    await runner.listPolygramSessions();
+
+    assert.ok(mockRun.calls.length > 0);
+    for (const call of mockRun.calls) {
+      assert.equal(call.cmd, 'tmux');
+      assert.equal(call.args[0], '-N', `expected -N for tmux ${call.args.slice(1).join(' ')}`);
+    }
+  });
 });
 
 // ── sendControl ──────────────────────────────────────────────────────
@@ -449,6 +468,29 @@ describe('runner.sessionExists', () => {
     mockRun.stub('tmux has-session', { error: "can't find session" });
     const runner = createTmuxRunner({ runFn: mockRun });
     assert.equal(await runner.sessionExists('gone'), false);
+  });
+});
+
+describe('runner.sessionProcessAlive', () => {
+  test('requires at least one live pane process', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { stdout: '1 4321\n0 8765\n' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('mixed'), true);
+  });
+
+  test('returns false for retained dead panes', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { stdout: '1 4321\n' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('dead'), false);
+  });
+
+  test('returns false when the session disappears during the probe', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-panes', { error: "can't find session" });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.equal(await runner.sessionProcessAlive('gone'), false);
   });
 });
 

@@ -35,6 +35,7 @@ function makeFakeRunner({ paneText = READY_BANNER } = {}) {
     killSession: async (name) => { calls.killSession.push(name); },
     sendControl: async (name, key) => { calls.sendControl.push({ name, key }); },
     captureWide: async (name) => { calls.captureWide.push(name); return paneText; },
+    sessionProcessAlive: async () => true,
   };
 }
 
@@ -103,6 +104,7 @@ function makeCliProcess({
   chatId = 'chat-1',
   toolDispatcher = async () => ({ ok: true }),
   paneText,
+  sessionLauncher = null,
 } = {}) {
   return new CliProcess({
     sessionKey: `sess-${chatId}`,
@@ -112,6 +114,7 @@ function makeCliProcess({
     tmuxRunner: makeFakeRunner({ paneText }),
     botName: 'testbot',
     claudeBin: '/usr/bin/true',         // never actually invoked because runner is fake
+    sessionLauncher,
     toolDispatcher,
     logger: quietLogger,
     handshakeTimeoutMs: 2000,
@@ -149,6 +152,39 @@ test('start() completes after fake bridge handshakes', async () => {
   assert.equal(mode, 0o600, `socket mode: got ${mode.toString(8)}`);
   bridge.close();
   await cp.kill('test');
+});
+
+test('launcher wraps the exact baseline command while preserving argv, cwd, and env', async t => {
+  const baseline = makeCliProcess();
+  const baselineBridge = await startWithFakeBridge(baseline);
+  const wrapped = makeCliProcess({ sessionLauncher: process.execPath });
+  const wrappedBridge = await startWithFakeBridge(wrapped);
+  t.after(async () => {
+    baselineBridge.close();
+    wrappedBridge.close();
+    await baseline.kill('test');
+    await wrapped.kill('test');
+  });
+
+  const directSpawn = baseline.runner.calls.spawn[0];
+  const wrappedSpawn = wrapped.runner.calls.spawn[0];
+  assert.equal(wrappedSpawn.command, process.execPath);
+  assert.equal(wrappedSpawn.args[0], directSpawn.command);
+
+  const normalizeGeneratedValues = args => {
+    const normalized = [...args];
+    for (const flag of ['--session-id', '--settings', '--mcp-config']) {
+      const index = normalized.indexOf(flag);
+      if (index >= 0) normalized[index + 1] = `<${flag.slice(2)}>`;
+    }
+    return normalized;
+  };
+  assert.deepEqual(
+    normalizeGeneratedValues(wrappedSpawn.args.slice(1)),
+    normalizeGeneratedValues(directSpawn.args),
+  );
+  assert.equal(wrappedSpawn.cwd, directSpawn.cwd);
+  assert.deepEqual(wrappedSpawn.env, directSpawn.env);
 });
 
 test('hello with wrong secret is rejected', async () => {
@@ -528,6 +564,129 @@ test('bridge disconnect drains pendingTurns immediately (no 10min hardTimer wait
   assert.equal(cp.pendingTurns.size, 0);
   assert.equal(cp.inFlight, false);
 
+  await cp.kill('test');
+});
+
+test('contained session loss rejects pending turns with a non-resumable code', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionProcessAlive = async () => false;
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(sendP, err => err?.code === 'SESSION_PROCESS_LOST');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await rejection;
+  await cp.kill('test');
+});
+
+test('a live contained process keeps the bridge-disconnected classification', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionProcessAlive = async () => true;
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(sendP, err => err?.code === 'BRIDGE_DISCONNECTED');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await rejection;
+  await cp.kill('test');
+});
+
+test('an existing tmux session with a dead process is non-resumable', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionExists = async () => true;
+  cp.runner.sessionProcessAlive = async () => false;
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(sendP, err => err?.code === 'SESSION_PROCESS_LOST');
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await rejection;
+  await cp.kill('test');
+});
+
+test('a deferred liveness probe cannot reuse the disconnecting process', async () => {
+  let resolveLiveness;
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionProcessAlive = () => new Promise(resolve => {
+    resolveLiveness = resolve;
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  const firstSend = cp.send('hello');
+  const firstRejection = assert.rejects(
+    firstSend,
+    err => err?.code === 'SESSION_PROCESS_LOST',
+  );
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  for (let i = 0; i < 50 && !cp._bridgeDisconnecting; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const secondRejection = assert.rejects(
+    cp.send('second'),
+    err => err?.code === 'SESSION_PROCESS_LOST',
+  );
+
+  resolveLiveness(false);
+  await Promise.all([firstRejection, secondRejection]);
+  await cp.kill('test');
+});
+
+test('a concurrent send shares the deferred live-process disconnect classification', async () => {
+  let resolveLiveness;
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionProcessAlive = () => new Promise(resolve => {
+    resolveLiveness = resolve;
+  });
+  const bridge = await startWithFakeBridge(cp);
+
+  const firstSend = cp.send('hello');
+  const firstRejection = assert.rejects(
+    firstSend,
+    err => err?.code === 'BRIDGE_DISCONNECTED',
+  );
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  for (let i = 0; i < 50 && !cp._bridgeDisconnecting; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+  const secondRejection = assert.rejects(
+    cp.send('second'),
+    err => err?.code === 'BRIDGE_DISCONNECTED',
+  );
+
+  resolveLiveness(true);
+  await Promise.all([firstRejection, secondRejection]);
+  await cp.kill('test');
+});
+
+test('an unresponsive liveness probe fails closed without stranding pending turns', async () => {
+  const cp = makeCliProcess({ sessionLauncher: process.execPath });
+  cp.runner.sessionProcessAlive = () => new Promise(() => {});
+  const bridge = await startWithFakeBridge(cp);
+
+  const sendP = cp.send('hello');
+  const rejection = assert.rejects(
+    sendP,
+    err => err?.code === 'SESSION_PROCESS_LOST',
+  );
+  await bridge.waitFor(m => m.kind === 'user_msg');
+  bridge.close();
+
+  await Promise.race([
+    rejection,
+    new Promise((_, reject) => {
+      setTimeout(() => reject(new Error('liveness timeout did not fail closed')), 500);
+    }),
+  ]);
   await cp.kill('test');
 });
 

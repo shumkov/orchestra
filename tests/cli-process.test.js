@@ -2,6 +2,9 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 
 const { CliProcess } = require('../index');
 const factory = require('../lib/process/factory');
@@ -225,6 +228,53 @@ test('factory constructs CliProcess when fully wired', () => {
   const proc = factory('sess-2', { chatId: '99' });
   assert.equal(proc.backend, 'cli');
   assert.equal(proc.cost, 3);
+});
+
+test('factory forwards an executable session launcher to CliProcess', () => {
+  const launcher = process.execPath;
+  const factory = createProcessFactory({
+    config: { bot: { pm: 'cli' } },
+    tmuxRunner: fakeRunner,
+    botName: 'testbot',
+    toolDispatcher: fakeDispatcher,
+    channelsClaudeBin: '/usr/bin/echo',
+    sessionLauncher: launcher,
+    logger: { warn: () => {}, error: () => {}, log: () => {} },
+  });
+
+  const proc = factory('launcher-session', { chatId: '99' });
+  assert.equal(proc.sessionLauncher, launcher);
+});
+
+test('CliProcess rejects relative, missing, non-executable, and directory session launchers', () => {
+  const common = {
+    sessionKey: 'launcher-validation', chatId: '1', tmuxRunner: fakeRunner, botName: 'b',
+    toolDispatcher: fakeDispatcher, claudeBin: '/usr/bin/echo',
+  };
+
+  assert.throws(
+    () => new CliProcess({ ...common, sessionLauncher: 'claude-session-scope' }),
+    err => err.code === 'SESSION_LAUNCHER_INVALID' && /absolute/.test(err.message),
+  );
+  assert.throws(
+    () => new CliProcess({ ...common, sessionLauncher: '/definitely/missing/launcher' }),
+    err => err.code === 'SESSION_LAUNCHER_INVALID' && /executable/.test(err.message),
+  );
+  assert.throws(
+    () => new CliProcess({ ...common, sessionLauncher: os.tmpdir() }),
+    err => err.code === 'SESSION_LAUNCHER_INVALID' && /executable file/.test(err.message),
+  );
+
+  const nonExecutable = path.join(os.tmpdir(), `orchestra-launcher-${process.pid}`);
+  fs.writeFileSync(nonExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+  try {
+    assert.throws(
+      () => new CliProcess({ ...common, sessionLauncher: nonExecutable }),
+      err => err.code === 'SESSION_LAUNCHER_INVALID' && /executable/.test(err.message),
+    );
+  } finally {
+    fs.unlinkSync(nonExecutable);
+  }
 });
 
 // Review AC3: pickBackend warns + falls back on unknown pm value (typo path)

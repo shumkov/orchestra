@@ -6,7 +6,12 @@ const os = require('os');
 const path = require('path');
 const fs = require('fs');
 
-const { resolvePinnedClaudeBin, verifyPinnedClaudeBin, checkClaudeAuthHealth } = require('../index').claudeBin;
+const {
+  CLAUDE_CLI_PINNED_VERSION,
+  checkClaudeAuthHealth,
+  resolvePinnedClaudeBin,
+  verifyPinnedClaudeBin,
+} = require('../index').claudeBin;
 
 const ORIGINAL_OVERRIDE = process.env.ORCHESTRA_CLAUDE_BIN;
 
@@ -16,6 +21,10 @@ afterEach(() => {
 });
 
 describe('claude-bin — resolvePinnedClaudeBin', () => {
+  test('defaults to the compatibility-gated Claude Code 2.1.220 pin', () => {
+    assert.equal(CLAUDE_CLI_PINNED_VERSION, '2.1.220');
+  });
+
   test('resolves to the standard claude-CLI versions path', () => {
     delete process.env.ORCHESTRA_CLAUDE_BIN;
     assert.equal(

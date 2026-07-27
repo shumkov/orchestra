@@ -8,6 +8,7 @@ const path = require('node:path');
 
 const { CliProcess } = require('../index');
 const {
+  MAX_WORKFLOW_TRANSCRIPT_BYTES,
   correlateWorkflowCompletionSnapshot,
   hashDeliveryArguments,
 } = require('../lib/process/workflow-completion-correlation');
@@ -187,6 +188,43 @@ function makeTimeoutWorkflowRows({
   });
 }
 
+function makeFailedWorkflowRows() {
+  return makeWorkflowRows({
+    branch: [
+      {
+        type: 'assistant',
+        requestId: 'reply-request',
+        message: {
+          id: 'reply-message',
+          stop_reason: 'tool_use',
+          content: [{
+            type: 'tool_use',
+            id: 'reply-tool',
+            name: 'mcp__orchestra-bridge__reply',
+            input: { chat_id: 'chat-1', text: 'Final report.' },
+          }],
+        },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'reply-tool',
+            is_error: true,
+            content: JSON.stringify({
+              ok: false,
+              error: 'transport failed',
+              attempt_id: 'failed-attempt',
+            }),
+          }],
+        },
+      },
+    ],
+  });
+}
+
 async function correlateFixture(t, fixture, { partial = false } = {}) {
   const { dir, transcriptPath } = writeTranscript(fixture.rows);
   t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
@@ -205,6 +243,35 @@ async function waitFor(predicate, timeoutMs = 500) {
     if (Date.now() >= deadline) throw new Error('waitFor timeout');
     await new Promise(resolve => setTimeout(resolve, 5));
   }
+}
+
+function makeLaggedWorkflowHarness(t) {
+  const fixture = makeFailedWorkflowRows();
+  const terminal = fixture.rows.pop();
+  const { dir, transcriptPath } = writeTranscript(fixture.rows);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const cp = makeCliProcess();
+  cp.claudeSessionId = fixture.sessionId;
+  const emitted = [];
+  cp.on('autonomous-assistant-message', event => { emitted.push(event); });
+  const stop = () => cp._handleHookEvent({
+    type: 'Stop',
+    sessionId: fixture.sessionId,
+    transcriptPath,
+    stopHookActive: false,
+    lastAssistantMessage: fixture.finalText,
+  });
+  return { fixture, terminal, transcriptPath, cp, emitted, stop };
+}
+
+function onceWithTimeout(emitter, eventName, message, timeoutMs = 1_500) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+    emitter.once(eventName, value => {
+      clearTimeout(timer);
+      resolve(value);
+    });
+  });
 }
 
 test('completed background Workflow with no pending turn delivers its final out of turn', async (t) => {
@@ -287,6 +354,313 @@ test('completed background Workflow with no pending turn delivers its final out 
     backend: 'cli',
     alreadyDelivered: false,
   });
+});
+
+test('production Workflow notification remains correlated across Stop system rows', async (t) => {
+  const fixture = makeWorkflowRows();
+  fixture.rows[2].parentUuid = 'turn-duration';
+  fixture.rows.splice(2, 0,
+    {
+      type: 'system',
+      subtype: 'stop_hook_summary',
+      uuid: 'stop-hook-summary',
+      parentUuid: 'workflow-launch',
+      sessionId: fixture.sessionId,
+      isSidechain: false,
+    },
+    {
+      type: 'system',
+      subtype: 'turn_duration',
+      uuid: 'turn-duration',
+      parentUuid: 'stop-hook-summary',
+      sessionId: fixture.sessionId,
+      isSidechain: false,
+    });
+
+  const correlation = await correlateFixture(t, fixture);
+  assert.equal(correlation.eligible, true);
+  assert.equal(correlation.reason, 'eligible');
+});
+
+test('an accepted Workflow boundary digest detects a same-size rewrite', async (t) => {
+  const fixture = makeWorkflowRows();
+  const { dir, transcriptPath } = writeTranscript(fixture.rows);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const byteSize = fs.statSync(transcriptPath).size;
+  const first = await correlateWorkflowCompletionSnapshot({
+    transcriptPath,
+    byteSize,
+    sessionId: fixture.sessionId,
+    finalText: fixture.finalText,
+  });
+  assert.equal(first.eligible, true);
+
+  const transcript = fs.readFileSync(transcriptPath, 'utf8');
+  const offset = transcript.lastIndexOf(fixture.finalText);
+  assert.notEqual(offset, -1);
+  const fd = fs.openSync(transcriptPath, 'r+');
+  try {
+    fs.writeSync(fd, 'X', offset, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  const changed = await correlateWorkflowCompletionSnapshot({
+    transcriptPath,
+    byteSize,
+    sessionId: fixture.sessionId,
+    finalText: fixture.finalText,
+    prefixByteSize: byteSize,
+    prefixHash: first.snapshotHash,
+  });
+
+  assert.equal(changed.eligible, false);
+  assert.equal(changed.reason, 'snapshot-prefix-changed');
+});
+
+test('Workflow fallback fails closed before reading an oversized transcript', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'orchestra-workflow-large-'));
+  const transcriptPath = path.join(dir, 'session.jsonl');
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  const byteSize = MAX_WORKFLOW_TRANSCRIPT_BYTES + 1;
+  fs.writeFileSync(transcriptPath, '');
+  fs.truncateSync(transcriptPath, byteSize);
+
+  const cp = makeCliProcess();
+  assert.equal(cp._captureWorkflowCompletionSnapshot({
+    transcriptPath,
+    sessionId: 'session-1',
+    lastAssistantMessage: 'Final report.',
+  }), null);
+
+  const correlation = await correlateWorkflowCompletionSnapshot({
+    transcriptPath,
+    byteSize,
+    sessionId: 'session-1',
+    finalText: 'Final report.',
+  });
+  assert.equal(correlation.eligible, false);
+  assert.equal(correlation.reason, 'snapshot-too-large');
+});
+
+test('Stop-time transcript lag does not lose a failed Workflow reply fallback', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const delivered = onceWithTimeout(
+    h.cp,
+    'autonomous-assistant-message',
+    'lagged Workflow terminal was not delivered',
+  );
+  h.stop();
+  setTimeout(() => {
+    fs.appendFileSync(h.transcriptPath, `${JSON.stringify(h.terminal)}\n`);
+  }, 20);
+
+  assert.deepEqual(await delivered, {
+    text: h.fixture.finalText,
+    sessionId: h.fixture.sessionId,
+    backend: 'cli',
+    alreadyDelivered: false,
+  });
+});
+
+test('Stop-time settlement tolerates a split terminal append', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const terminalLine = `${JSON.stringify(h.terminal)}\n`;
+  const splitAt = Math.floor(terminalLine.length / 2);
+  const delivered = onceWithTimeout(
+    h.cp,
+    'autonomous-assistant-message',
+    'split Workflow terminal was not delivered',
+  );
+  h.stop();
+  setTimeout(() => fs.appendFileSync(h.transcriptPath, terminalLine.slice(0, splitAt)), 20);
+  setTimeout(() => fs.appendFileSync(h.transcriptPath, terminalLine.slice(splitAt)), 50);
+
+  assert.equal((await delivered).text, h.fixture.finalText);
+});
+
+test('Stop-time settlement rejects rewritten transcript prefixes', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'rewritten transcript decision did not settle',
+  );
+  h.stop();
+  setTimeout(() => {
+    const transcript = fs.readFileSync(h.transcriptPath, 'utf8');
+    const offset = transcript.indexOf('Start research.');
+    assert.notEqual(offset, -1);
+    const fd = fs.openSync(h.transcriptPath, 'r+');
+    try {
+      fs.writeSync(fd, 'z', offset + 'Start researc'.length, 'utf8');
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.appendFileSync(h.transcriptPath, `${JSON.stringify(h.terminal)}\n`);
+  }, 20);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('Stop-time settlement rejects replaced and shrunken transcripts', async (t) => {
+  for (const mutation of ['replace', 'shrink']) {
+    await t.test(mutation, async (t) => {
+      const h = makeLaggedWorkflowHarness(t);
+      const settled = onceWithTimeout(
+        h.cp,
+        'delivery-work-settled',
+        `${mutation} transcript decision did not settle`,
+      );
+      h.stop();
+      setTimeout(() => {
+        if (mutation === 'replace') {
+          const original = fs.readFileSync(h.transcriptPath);
+          fs.renameSync(h.transcriptPath, `${h.transcriptPath}.replaced`);
+          fs.writeFileSync(
+            h.transcriptPath,
+            Buffer.concat([original, Buffer.from(`${JSON.stringify(h.terminal)}\n`)]),
+          );
+        } else {
+          fs.truncateSync(
+            h.transcriptPath,
+            fs.statSync(h.transcriptPath).size - 1,
+          );
+        }
+      }, 20);
+
+      await settled;
+      assert.equal(h.emitted.length, 0);
+    });
+  }
+});
+
+test('Stop-time settlement rejects replacement before its first transcript read', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'early-replacement transcript decision did not settle',
+  );
+
+  h.stop();
+  const targetSize = fs.statSync(h.transcriptPath).size;
+  const replacementRows = makeWorkflowRows({
+    finalText: h.fixture.finalText,
+  }).rows;
+  let replacement = `${replacementRows.map(row => JSON.stringify(row)).join('\n')}\n`;
+  assert.ok(Buffer.byteLength(replacement) < targetSize);
+  replacement += `${' '.repeat(targetSize - Buffer.byteLength(replacement) - 1)}\n`;
+  fs.renameSync(h.transcriptPath, `${h.transcriptPath}.replaced`);
+  fs.writeFileSync(h.transcriptPath, replacement);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('Stop-time settlement rejects an in-place rewrite before its first transcript read', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'early-rewrite transcript decision did not settle',
+  );
+
+  h.stop();
+  const transcript = fs.readFileSync(h.transcriptPath, 'utf8');
+  const offset = transcript.indexOf('Start research.');
+  assert.notEqual(offset, -1);
+  const fd = fs.openSync(h.transcriptPath, 'r+');
+  try {
+    fs.writeSync(fd, 'z', offset + 'Start researc'.length, 'utf8');
+  } finally {
+    fs.closeSync(fd);
+  }
+  fs.appendFileSync(h.transcriptPath, `${JSON.stringify(h.terminal)}\n`);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('Stop-time settlement rejects a complete malformed append', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'malformed transcript decision did not settle',
+  );
+  h.stop();
+  setTimeout(() => fs.appendFileSync(h.transcriptPath, '{"type":broken}\n'), 20);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('Stop-time settlement rejects a later user before the candidate terminal', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const laterUser = {
+    type: 'user',
+    uuid: 'later-user',
+    parentUuid: h.fixture.rows.at(-1).uuid,
+    sessionId: h.fixture.sessionId,
+    isSidechain: false,
+    promptSource: 'channel',
+    origin: { kind: 'channel' },
+    message: { role: 'user', content: 'A later user turn.' },
+  };
+  h.terminal.parentUuid = laterUser.uuid;
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'later-user transcript decision did not settle',
+  );
+  h.stop();
+  setTimeout(() => {
+    fs.appendFileSync(
+      h.transcriptPath,
+      `${JSON.stringify(laterUser)}\n${JSON.stringify(h.terminal)}\n`,
+    );
+  }, 20);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('Stop-time settlement permanently withdraws after intervening consumer work', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const settled = onceWithTimeout(
+    h.cp,
+    'delivery-work-settled',
+    'intervening-work decision did not settle',
+  );
+  h.stop();
+  setTimeout(() => {
+    h.cp.pendingTurns.set('intervening-turn', {});
+    h.cp._handleHookEvent({ type: 'UserPromptSubmit', prompt: '' });
+    h.cp.pendingTurns.clear();
+    fs.appendFileSync(h.transcriptPath, `${JSON.stringify(h.terminal)}\n`);
+  }, 20);
+
+  await settled;
+  assert.equal(h.emitted.length, 0);
+});
+
+test('a repeated Stop after transcript settlement cannot duplicate fallback', async (t) => {
+  const h = makeLaggedWorkflowHarness(t);
+  const firstDelivery = onceWithTimeout(
+    h.cp,
+    'autonomous-assistant-message',
+    'first fallback was not delivered',
+  );
+  h.stop();
+  setTimeout(() => {
+    fs.appendFileSync(h.transcriptPath, `${JSON.stringify(h.terminal)}\n`);
+  }, 20);
+  await firstDelivery;
+  h.stop();
+  await new Promise(resolve => setTimeout(resolve, 50));
+
+  assert.equal(h.emitted.length, 1);
 });
 
 test('Workflow qualification requires native provenance and the Workflow tool type', async (t) => {

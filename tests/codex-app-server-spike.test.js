@@ -19,7 +19,7 @@ const { spawn, spawnSync } = require('node:child_process');
 const test = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 const { pathToFileURL } = require('node:url');
-const { tmpdir } = require('node:os');
+const { homedir, tmpdir } = require('node:os');
 const path = require('node:path');
 
 const spikeUrl = pathToFileURL(
@@ -1507,7 +1507,10 @@ test('Codex U1a requires a controlled network probe executable', async (t) => {
     evaluateCommandProbe,
     resolveNetworkProbeBinary,
   } = await import(spikeUrl);
-  const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-net-test-'));
+  const scratch = mkdtempSync(path.join(
+    homedir(),
+    '.orchestra-codex-u1a-net-test-',
+  ));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   const probe = path.join(scratch, 'nc');
   writeFileSync(probe, '#!/bin/sh\nexit 0\n', { mode: 0o700 });

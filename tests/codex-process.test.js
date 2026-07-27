@@ -3045,7 +3045,7 @@ test('real U2 client checkpoints containment before closing on response durabili
     return;
   }
   const root = realpathSync(
-    mkdtempSync(path.join(os.tmpdir(), 'orchestra-u3-u2-ordering-')),
+    mkdtempSync(path.join(os.homedir(), '.orchestra-u3-u2-ordering-')),
   );
   const cwd = path.join(root, 'workspace');
   const codexHome = path.join(root, 'codex-home');

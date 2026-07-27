@@ -434,7 +434,7 @@ test('model and effort selection do not change the static spawn fingerprint', as
 
 test('preflight runs through the real U2 client without issuing a mutation', async (t) => {
   const root = realpathSync(
-    mkdtempSync(path.join(os.tmpdir(), 'orchestra-codex-preflight-')),
+    mkdtempSync(path.join(os.homedir(), '.orchestra-codex-preflight-')),
   );
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const cwd = path.join(root, 'workspace');

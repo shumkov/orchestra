@@ -89,7 +89,7 @@ async function rejectedWithinWithCode(
 
 function createHarness(t, scenario = {}) {
   const root = realpathSync(
-    mkdtempSync(path.join(os.tmpdir(), 'orchestra-u2-client-')),
+    mkdtempSync(path.join(os.homedir(), '.orchestra-u2-client-')),
   );
   const cwd = path.join(root, 'workspace');
   const codexHome = path.join(root, 'codex-home');

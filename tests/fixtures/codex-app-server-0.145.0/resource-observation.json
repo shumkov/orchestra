@@ -1,0 +1,83 @@
+{
+  "gate": "CONTINUE",
+  "host": {
+    "os": "macOS 26.5.1",
+    "architecture": "arm64",
+    "nodeVersion": "v24.4.0",
+    "launcherMode": "direct"
+  },
+  "method": {
+    "idle": "initialized app-server with one ephemeral thread",
+    "active": "local command/exec sleep proxy; not a hosted turn",
+    "sampleIntervalMs": 250,
+    "idleSampleCount": 10,
+    "activeSampleCount": 20,
+    "rss": "recursive summed RSS KiB; shared pages may be double-counted",
+    "activeRealAt10And25": "NOT_RUN_ONE_LIVE_NATIVE_BETA"
+  },
+  "points": [
+    {
+      "count": 1,
+      "initializedMedianMs": 71,
+      "threadReadyMedianMs": 838,
+      "warmRpc": {
+        "sampleCount": 19,
+        "p50Ms": 2,
+        "p95Ms": 13,
+        "maxMs": 13
+      },
+      "hostedActive": {
+        "rootRssKiBMedian": 122496,
+        "treeRssKiBMax": 125776,
+        "treeFdMedian": 38,
+        "descendantsMax": 1
+      },
+      "idle": {
+        "rootRssKiBMedian": 117272,
+        "treeRssKiBMax": 117296,
+        "treeFdMedian": 31,
+        "descendantsMax": 0
+      },
+      "active": {
+        "rootRssKiBMedian": 126608,
+        "treeRssKiBMax": 144928,
+        "treeFdMedian": 37.5,
+        "descendantsMax": 1
+      }
+    },
+    {
+      "count": 10,
+      "initializedMedianMs": 166,
+      "threadReadyMedianMs": 1119,
+      "idle": {
+        "rootRssKiBMedian": 1138112,
+        "treeRssKiBMax": 1192256,
+        "treeFdMedian": 315,
+        "descendantsMax": 0
+      },
+      "active": {
+        "rootRssKiBMedian": 1180952,
+        "treeRssKiBMax": 1205168,
+        "treeFdMedian": 360,
+        "descendantsMax": 10
+      }
+    },
+    {
+      "count": 25,
+      "initializedMedianMs": 345,
+      "threadReadyMedianMs": 1824,
+      "idle": {
+        "rootRssKiBMedian": 2870184,
+        "treeRssKiBMax": 2902096,
+        "treeFdMedian": 775,
+        "descendantsMax": 0
+      },
+      "active": {
+        "rootRssKiBMedian": 2861120,
+        "treeRssKiBMax": 2989760,
+        "treeFdMedian": 894,
+        "descendantsMax": 25
+      }
+    }
+  ]
+}

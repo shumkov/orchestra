@@ -21,4 +21,4 @@ jobs:
           cache: 'npm'
       - run: npm ci
       - name: Test
-        run: node --test --test-force-exit tests/*.test.js
+        run: npm test

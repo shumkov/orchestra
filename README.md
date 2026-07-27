@@ -1,8 +1,9 @@
 # @shumkov/orchestra
 
-The transport-agnostic **Claude Code CLI session engine**: spawn interactive `claude`
-sessions, inject messages via the MCP channels bridge, observe turns, and recover —
-independent of which chat network the messages came from.
+The transport-agnostic **agent session engine** for Claude Code and the native
+Codex app-server. It spawns provider sessions, injects or steers messages,
+observes turns, supervises lifecycle, and recovers independently of which chat
+network the messages came from.
 
 Extracted from [polygram](https://github.com/shumkov/polygram) after
 [water](https://github.com/shumkov/water) proved the copy works end-to-end against a
@@ -14,7 +15,14 @@ See [`docs/EXTRACTION.md`](docs/EXTRACTION.md) for the API and the extraction de
 ## Use
 
 ```js
-const { createProcessFactory, createTmuxRunner, ProcessManager, claudeBin } = require('@shumkov/orchestra');
+const {
+  CodexAppServerClient,
+  CodexProcess,
+  ProcessManager,
+  createProcessFactory,
+  createTmuxRunner,
+  claudeBin,
+} = require('@shumkov/orchestra');
 // inject your transport delivery (toolDispatcher), surface hint (displayHint),
 // and file cap (maxOutboundFileBytes); the engine stays chat-network-agnostic.
 ```

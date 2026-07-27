@@ -1,6 +1,6 @@
 # Claude Code 2.1.220 compatibility
 
-Orchestra 0.6.0 pins the channels backend to Claude Code 2.1.220. The pin is
+Orchestra 0.7.0 pins the channels backend to Claude Code 2.1.220. The pin is
 deliberate because the backend consumes private Claude Code TUI, hook, session,
 queue, and MCP-registration behavior.
 

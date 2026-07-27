@@ -31,6 +31,7 @@
 
 const { makeFakeQuery } = require('./fake-query');
 const { SdkProcess } = require('../../index');
+const { CodexProcess } = require('../../lib/process/codex-process');
 
 const SILENT = { warn: () => {}, error: () => {}, info: () => {}, debug: () => {}, log: () => {} };
 
@@ -135,6 +136,198 @@ function makeSdkBackend({ sessionKey = 'chat:100', chatId = '100', threadId = nu
         },
       });
       await new Promise((r) => setImmediate(r));
+    },
+  };
+
+  return { process: proc, driver };
+}
+
+// ─── Codex app-server driver ────────────────────────────────────────
+
+function makeCodexBackend({
+  sessionKey = 'chat:100',
+  chatId = '100',
+  threadId = null,
+} = {}) {
+  let onNotification;
+  let onFault;
+  let closed = false;
+  let nextTurn = 0;
+  const replyScripts = new Map();
+  const sentPrompts = [];
+
+  const client = {
+    async start() {},
+    async request(method, params, options = {}) {
+      if (closed) {
+        throw Object.assign(new Error('Codex app-server client closed'), {
+          code: 'CODEX_CLIENT_CLOSED',
+        });
+      }
+      if (options.onWriteAttempted) {
+        await options.onWriteAttempted({
+          id: nextTurn + 1,
+          method,
+          assertActive() {},
+        });
+      }
+      let result;
+      if (method === 'thread/start') {
+        result = {
+          cwd: '/tmp',
+          model: params.model,
+          modelProvider: 'openai',
+          reasoningEffort: 'high',
+          approvalPolicy: 'never',
+          approvalsReviewer: 'user',
+          sandbox: { type: 'workspaceWrite' },
+          activePermissionProfile: {
+            id: 'polygram-session',
+            extends: null,
+          },
+          thread: {
+            id: 'codex-contract-thread',
+            status: { type: 'idle' },
+            turns: [],
+          },
+        };
+      } else if (method === 'turn/start') {
+        nextTurn += 1;
+        const turnId = `codex-contract-turn-${nextTurn}`;
+        const prompt = params.input[0].text;
+        sentPrompts.push(prompt);
+        const reply = replyScripts.get(prompt);
+        if (reply !== undefined) replyScripts.delete(prompt);
+        result = {
+          turn: { id: turnId, status: 'inProgress', items: [], error: null },
+        };
+        if (reply !== undefined) {
+          setImmediate(async () => {
+            await onNotification({
+              method: 'turn/started',
+              params: {
+                threadId: 'codex-contract-thread',
+                turn: { id: turnId, status: 'inProgress' },
+              },
+            });
+            await onNotification({
+              method: 'item/agentMessage/delta',
+              params: {
+                threadId: 'codex-contract-thread',
+                turnId,
+                itemId: `item-${turnId}`,
+                delta: reply,
+              },
+            });
+            await onNotification({
+              method: 'item/completed',
+              params: {
+                threadId: 'codex-contract-thread',
+                turnId,
+                item: {
+                  id: `item-${turnId}`,
+                  type: 'agentMessage',
+                  text: reply,
+                },
+              },
+            });
+            await onNotification({
+              method: 'turn/completed',
+              params: {
+                threadId: 'codex-contract-thread',
+                turn: {
+                  id: turnId,
+                  status: 'completed',
+                  items: [],
+                  error: null,
+                },
+              },
+            });
+          });
+        }
+      } else if (method === 'thread/backgroundTerminals/list') {
+        result = { count: 0, nextCursor: null };
+      } else {
+        result = {};
+      }
+      if (options.onResponseObserved) {
+        await options.onResponseObserved({
+          id: nextTurn + 1,
+          method,
+          outcome: 'result',
+          assertActive() {},
+        });
+      }
+      return result;
+    },
+    async close() {
+      closed = true;
+    },
+    async waitForFault() {
+      return null;
+    },
+  };
+
+  const proc = new CodexProcess({
+    sessionKey,
+    chatId,
+    threadId,
+    label: 'codex-test',
+    cwd: '/tmp',
+    checkpointSink: async () => {},
+    hostIdentity: 'contract-host',
+    bootSessionIdentity: 'contract-boot',
+    expectedThreadPolicy: Object.freeze({
+      model: 'sonnet',
+      effort: 'high',
+      modelProvider: 'openai',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandbox: Object.freeze({ type: 'workspaceWrite' }),
+      permissionProfile: Object.freeze({
+        id: 'polygram-session',
+        extends: null,
+      }),
+    }),
+    clientFactory(callbacks) {
+      ({ onNotification, onFault } = callbacks);
+      return client;
+    },
+    logger: SILENT,
+  });
+
+  const driver = {
+    kind: 'codex',
+    async start() {},
+    replyTo(prompt, text) {
+      replyScripts.set(prompt, text);
+    },
+    assertPasted(text) {
+      if (!sentPrompts.includes(text)) {
+        throw new Error(
+          `codex driver: expected "${text}" in ${JSON.stringify(sentPrompts)}`,
+        );
+      }
+    },
+    async simulateClose() {
+      await onFault({
+        boundary: 'post-spawn',
+        containment: 'unverified',
+        cleanup: 'completed',
+        errorCode: 'CODEX_PROCESS_EXITED',
+      });
+    },
+    async simulateAutonomousMessage() {
+      return {
+        supported: false,
+        reason: 'app-server-U3-N/A: unowned turns fail closed',
+      };
+    },
+    async simulateCompactBoundary() {
+      return {
+        supported: false,
+        reason: 'app-server-U3-N/A: compact is separately deferred',
+      };
     },
   };
 
@@ -387,6 +580,7 @@ function makeChannelsBackend({ sessionKey = 'chat:100', chatId = '100', threadId
 
 function makeBackend(kind, opts) {
   if (kind === 'sdk') return makeSdkBackend(opts);
+  if (kind === 'codex') return makeCodexBackend(opts);
   // 0.12 Phase 4: 'tmux' kind removed alongside the deleted TmuxProcess.
   // Tests that need tmux-style contract testing should use 'cli' (which
   // covers the same Process abstraction with the channels bridge + hooks).

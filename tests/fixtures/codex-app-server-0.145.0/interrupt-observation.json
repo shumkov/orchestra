@@ -1,0 +1,27 @@
+{
+  "status": "tracked-terminal cleanup passed; complete process containment incomplete",
+  "ordinaryCompletedTurnStaleInterrupt": {
+    "rpcCode": -32600,
+    "rpcMessage": "no active turn to interrupt"
+  },
+  "trackedTerminalStop": {
+    "activeInterruptResponseEmpty": true,
+    "responseBeforeTerminal": true,
+    "terminalStatus": "interrupted",
+    "terminalErrorNull": true,
+    "listedAfterInterrupt": true,
+    "commandAliveAfterInterrupt": true,
+    "cleanAccepted": true,
+    "freshFirstPageEmpty": true,
+    "observedSyntheticPidDead": true
+  },
+  "crashLoss": {
+    "commandAliveAfterAppServerProcessGroupTermination": true,
+    "commandEscapedAppServerProcessGroupAndSession": true,
+    "resumedThreadCouldListOldTerminal": false,
+    "reconnectCleanKilledOldCommand": false,
+    "logicalProcessIdMatchedOsPid": false
+  },
+  "strongProcessTreeContainmentProved": false,
+  "provenance": "Content-free authenticated characterization of pinned Codex 0.145.0 using exact synthetic sleep commands; synthetic processes were cleaned up or observed exiting, and no PID, path, prompt, reply, identifier, account data, terminal metadata, or raw protocol line is retained."
+}

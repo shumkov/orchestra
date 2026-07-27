@@ -1,0 +1,16 @@
+{
+  "cliVersion": "codex-cli 0.145.0",
+  "binarySha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "schemaSha256": {
+    "stableClientRequest": "cc9f6e191a032bdfdc96d768f4ddaba4ced75408017af3ac0dbcc4d00c1faaa8",
+    "stableProtocol": "b6ec47c51bef8a6857dd9435f9919a43ba6616a5a9e3ab25087451cbc93d9f06",
+    "stableProtocolV2Canonical": "02d8bf6651cd504bff0335f566c011e51ba77c5cc0538cb64ca7ac57739a1597",
+    "experimentalClientRequest": "03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c",
+    "experimentalProtocol": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68",
+    "experimentalProtocolV2Canonical": "1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb"
+  },
+  "observations": {
+    "workspaceWriteReadOnlyAccessField": false
+  },
+  "provenance": "Generated locally from the pinned binary with app-server generate-json-schema under an empty dedicated CODEX_HOME; v2 bundle hashes use recursively key-sorted JSON because definition emission order is nondeterministic; contains no authentication or session data."
+}

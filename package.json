@@ -1,7 +1,7 @@
 {
   "name": "@shumkov/orchestra",
-  "version": "0.6.0",
-  "description": "Drive interactive Claude Code CLI sessions: spawn, inject messages via the MCP channels bridge, observe turns, recover. The transport-agnostic session engine extracted from polygram, shared by polygram (Telegram) and water (WhatsApp).",
+  "version": "0.7.0",
+  "description": "Transport-agnostic session engine for Claude Code and the native Codex app-server: spawn, steer, supervise, observe turns, and recover.",
   "type": "commonjs",
   "main": "index.js",
   "files": [
@@ -11,7 +11,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test --test-force-exit tests/*.test.js"
+    "test": "node --test --test-force-exit --test-concurrency=1 tests/*.test.js"
   },
   "publishConfig": {
     "access": "public"
@@ -27,6 +27,8 @@
     "claude",
     "claude-code",
     "claude-cli",
+    "codex",
+    "openai",
     "channels",
     "mcp",
     "session-pool",

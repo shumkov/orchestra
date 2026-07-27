@@ -1,0 +1,36 @@
+{
+  "title": "WorkspaceWriteSandboxPolicy",
+  "type": "object",
+  "required": [
+    "type"
+  ],
+  "properties": {
+    "excludeSlashTmp": {
+      "default": false,
+      "type": "boolean"
+    },
+    "excludeTmpdirEnvVar": {
+      "default": false,
+      "type": "boolean"
+    },
+    "networkAccess": {
+      "default": false,
+      "type": "boolean"
+    },
+    "type": {
+      "type": "string",
+      "enum": [
+        "workspaceWrite"
+      ],
+      "title": "WorkspaceWriteSandboxPolicyType"
+    },
+    "writableRoots": {
+      "default": [],
+      "type": "array",
+      "items": {
+        "$ref": "#/definitions/AbsolutePathBuf"
+      }
+    }
+  },
+  "observation": "The pinned schema has no readOnlyAccess or readableRoots property."
+}

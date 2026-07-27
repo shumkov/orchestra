@@ -1,0 +1,54 @@
+{
+  "status": "schema-derived and authenticated runtime-characterized; U1a passed under the accepted native-beta containment contract",
+  "messages": [
+    {
+      "direction": "client-to-server",
+      "method": "initialize",
+      "requiredCapability": "experimentalApi"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "model/list"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/start"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "turn/start"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "turn/steer",
+      "requiredFields": [
+        "expectedTurnId",
+        "input",
+        "threadId"
+      ]
+    },
+    {
+      "direction": "client-to-server",
+      "method": "turn/interrupt"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/settings/update",
+      "schemaOnly": true,
+      "productionAllowlisted": false
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/backgroundTerminals/list"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/backgroundTerminals/clean"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/resume"
+    }
+  ],
+  "redaction": "No prompts, replies, identifiers, paths, environment values, account data, or raw protocol lines are persisted."
+}

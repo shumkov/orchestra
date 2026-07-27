@@ -1,0 +1,90 @@
+{
+  "gate": "CONTINUE",
+  "retryOwnership": {
+    "provider": "disposable-loopback-responses",
+    "clientTurnStartsPerScenario": 1,
+    "scenarios": {
+      "retryableSuccess": {
+        "providerAttempts": 2,
+        "clientTurnStarts": 1,
+        "exactCorrelation": true,
+        "orderExact": true,
+        "retrySignals": [true],
+        "terminalStatus": "completed"
+      },
+      "retryableExhausted": {
+        "providerAttempts": 2,
+        "clientTurnStarts": 1,
+        "exactCorrelation": true,
+        "orderExact": true,
+        "retrySignals": [true, false],
+        "terminalStatus": "failed"
+      },
+      "nonRetryable": {
+        "providerAttempts": 1,
+        "clientTurnStarts": 1,
+        "exactCorrelation": true,
+        "orderExact": true,
+        "retrySignals": [false],
+        "terminalStatus": "failed"
+      },
+      "missingTerminal": {
+        "providerAttempts": 1,
+        "clientTurnStarts": 1,
+        "boundedTimeoutObserved": true,
+        "cleanupTerminalStatus": "interrupted"
+      }
+    }
+  },
+  "effectWindows": [
+    {
+      "boundary": "item-start",
+      "lossType": "transport",
+      "markerPresent": false,
+      "resumedStatus": "interrupted",
+      "effect": "unknown",
+      "replayAllowed": false
+    },
+    {
+      "boundary": "item-start",
+      "lossType": "app-server",
+      "markerPresent": false,
+      "resumedStatus": "interrupted",
+      "effect": "unknown",
+      "replayAllowed": false
+    },
+    {
+      "boundary": "first-output",
+      "lossType": "transport",
+      "markerPresent": true,
+      "resumedStatus": "interrupted",
+      "effect": "occurred",
+      "replayAllowed": false
+    },
+    {
+      "boundary": "first-output",
+      "lossType": "app-server",
+      "markerPresent": true,
+      "resumedStatus": "interrupted",
+      "effect": "occurred",
+      "replayAllowed": false
+    },
+    {
+      "boundary": "terminal-generated-not-observed",
+      "lossType": "transport",
+      "markerPresent": true,
+      "resumedStatus": "completed",
+      "effect": "occurred",
+      "replayAllowed": false
+    },
+    {
+      "boundary": "terminal-generated-not-observed",
+      "lossType": "app-server",
+      "markerPresent": true,
+      "resumedStatus": "completed",
+      "effect": "occurred",
+      "replayAllowed": false
+    }
+  ],
+  "resumeIsReplayTruth": false
+}

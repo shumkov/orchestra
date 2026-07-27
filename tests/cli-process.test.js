@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -19,6 +20,19 @@ const fakeRunner = {
   captureWide: async () => 'Listening for channel messages from: server:orchestra-bridge',
 };
 const fakeDispatcher = async () => ({ ok: true });
+
+function handshakeProcess(overrides = {}) {
+  return new CliProcess({
+    sessionKey: 'handshake',
+    chatId: '1',
+    tmuxRunner: fakeRunner,
+    botName: 'testbot',
+    claudeBin: '/usr/bin/echo',
+    toolDispatcher: fakeDispatcher,
+    logger: { warn: () => {}, error: () => {}, log: () => {} },
+    ...overrides,
+  });
+}
 
 test('CliProcess construction — required params', () => {
   assert.throws(
@@ -65,6 +79,151 @@ test('CliProcess construction — valid params', () => {
   assert.equal(p.closed, false);
   assert.equal(p.inFlight, false);
   assert.equal(p.bridgeReady, false);
+});
+
+test('Claude 2.1.220 MCP registration keeps a thirty-second readiness window', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const p = handshakeProcess();
+  p.bridgeReady = true;
+  p.bridgeServer = new EventEmitter();
+
+  assert.equal(p.mcpReadyTimeoutMs, 30_000);
+  const outcome = p._waitForBridgeHandshake().then(
+    () => 'resolved',
+    () => 'rejected',
+  );
+  t.mock.timers.tick(5_001);
+  p.mcpReady = true;
+  p.emit('mcp-ready');
+
+  assert.equal(await outcome, 'resolved');
+
+  const timedOut = handshakeProcess();
+  timedOut.bridgeReady = true;
+  timedOut.bridgeServer = new EventEmitter();
+  const timeout = timedOut._waitForBridgeHandshake();
+  t.mock.timers.tick(30_000);
+  await assert.rejects(
+    timeout,
+    (error) => error.code === 'CHANNELS_MCP_READY_TIMEOUT',
+  );
+  assert.equal(timedOut.listenerCount('mcp-ready'), 0);
+  assert.equal(timedOut.bridgeServer.listenerCount('bridge-disconnected'), 0);
+});
+
+test('startup ping keeps an authenticated bridge alive before MCP readiness', (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const p = handshakeProcess();
+  const writes = [];
+  p._writeToBridge = (message) => {
+    writes.push(message);
+    return true;
+  };
+
+  p._startStartupPingLoop();
+  assert.deepEqual(writes, [{ kind: 'ping' }]);
+  t.mock.timers.tick(10_000);
+  assert.deepEqual(writes, [{ kind: 'ping' }, { kind: 'ping' }]);
+
+  p._stopStartupPingLoop();
+  assert.equal(p.startupPingTimer, null);
+  t.mock.timers.tick(10_000);
+  assert.equal(writes.length, 2);
+});
+
+test('bridge disconnect rejects MCP readiness immediately and cleans listeners', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const p = handshakeProcess();
+  p.bridgeReady = true;
+  p.bridgeServer = new EventEmitter();
+  const pending = p._waitForBridgeHandshake();
+
+  p.bridgeServer.emit('bridge-disconnected');
+  t.mock.timers.tick(30_000);
+
+  await assert.rejects(
+    pending,
+    (error) => error.code === 'BRIDGE_DISCONNECTED',
+  );
+  assert.equal(p.listenerCount('bridge-ready'), 0);
+  assert.equal(p.listenerCount('mcp-ready'), 0);
+  assert.equal(p.bridgeServer.listenerCount('bridge-disconnected'), 0);
+
+  const alreadyLost = handshakeProcess();
+  alreadyLost.bridgeServer = new EventEmitter();
+  alreadyLost._bridgeDisconnecting = true;
+  let alreadyLostOutcome = null;
+  alreadyLost._waitForBridgeHandshake().then(
+    () => { alreadyLostOutcome = 'resolved'; },
+    () => { alreadyLostOutcome = 'rejected'; },
+  );
+  await Promise.resolve();
+  assert.equal(alreadyLostOutcome, 'rejected');
+});
+
+test('kill and reset cancel pending MCP readiness and detach its bridge listeners', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+
+  for (const lifecycle of ['kill', 'reset']) {
+    const p = handshakeProcess();
+    const bridge = new EventEmitter();
+    bridge.close = async () => {};
+    p.bridgeReady = true;
+    p.bridgeServer = bridge;
+    const pending = p._waitForBridgeHandshake();
+
+    if (lifecycle === 'kill') {
+      await p.kill('test shutdown');
+    } else {
+      await p.resetSession({ reason: 'test reset' });
+    }
+    t.mock.timers.tick(30_000);
+
+    await assert.rejects(
+      pending,
+      (error) => error.code === (lifecycle === 'kill' ? 'KILLED' : 'RESET'),
+    );
+    assert.equal(p.listenerCount('bridge-ready'), 0);
+    assert.equal(p.listenerCount('mcp-ready'), 0);
+    assert.equal(bridge.listenerCount('bridge-disconnected'), 0);
+  }
+});
+
+test('start retains kill and reset cancellation while Claude spawn is pending', async () => {
+  for (const lifecycle of ['kill', 'reset']) {
+    let releaseSpawn;
+    let markSpawnEntered;
+    const spawnEntered = new Promise((resolve) => {
+      markSpawnEntered = resolve;
+    });
+    const spawnGate = new Promise((resolve) => {
+      releaseSpawn = resolve;
+    });
+    const p = handshakeProcess({ mcpReadyTimeoutMs: 10 });
+    p._createSocketServer = async () => {
+      const bridge = new EventEmitter();
+      bridge.close = async () => {};
+      p.bridgeServer = bridge;
+    };
+    p._spawnTmuxClaude = async () => {
+      markSpawnEntered();
+      await spawnGate;
+    };
+
+    const started = p.start();
+    await spawnEntered;
+    if (lifecycle === 'kill') {
+      await p.kill('test shutdown during spawn');
+    } else {
+      await p.resetSession({ reason: 'test reset during spawn' });
+    }
+    releaseSpawn();
+
+    await assert.rejects(
+      started,
+      (error) => error.code === (lifecycle === 'kill' ? 'KILLED' : 'RESET'),
+    );
+  }
 });
 
 test('CliProcess.respondToPermission validates behavior arg', async () => {
@@ -323,7 +482,7 @@ test('CliProcess.start tmux session name uses polygram- prefix for orphan-sweep'
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
   // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
   // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
-  // would block until the 5s mcp-ready timeout.
+  // would block until the configured mcp-ready timeout.
   sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   assert.equal(calls.length, 1);
@@ -400,7 +559,7 @@ async function captureSpawnArgs(constructorOpts, startOpts) {
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
   // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
   // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
-  // would block until the 5s mcp-ready timeout.
+  // would block until the configured mcp-ready timeout.
   sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   sock.end();
@@ -608,7 +767,7 @@ test('channels backend defaults to bypassPermissions (rc.9: first-turn-dead-zone
     await new Promise(r => sock.once('connect', r));
     sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
     sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
-    // 0.12 Phase 1.6: synthesize mcp-ready so _waitForBridgeHandshake doesn't 5s-block.
+    // Synthesize mcp-ready so _waitForBridgeHandshake does not wait for its timeout.
     sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
     await startP;
     sock.end();
@@ -682,7 +841,7 @@ async function captureSpawnOpts(constructorOpts, startOpts) {
   sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
   // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
   // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
-  // would block until the 5s mcp-ready timeout.
+  // would block until the configured mcp-ready timeout.
   sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
   sock.end();

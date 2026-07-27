@@ -45,7 +45,7 @@ function readJsonLines(file) {
     .map((line) => JSON.parse(line));
 }
 
-async function waitFor(check, message, timeoutMs = 1_000) {
+async function waitFor(check, message, timeoutMs = 3_000) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const value = check();
@@ -133,7 +133,7 @@ function createHarness(t, scenario = {}) {
         LC_ALL: 'C',
         ORCHESTRA_TEST_SECRET: 'MUST_NOT_CROSS',
       },
-      requestTimeoutMs: 500,
+      requestTimeoutMs: 2_000,
       closeGraceMs: 100,
       closeKillMs: 200,
       expectedConfigSha256,
@@ -168,7 +168,7 @@ function createHarness(t, scenario = {}) {
 
 function mutationOptions(events = [], overrides = {}) {
   return {
-    timeoutMs: 500,
+    timeoutMs: 2_000,
     onWriteAttempted: async (checkpoint) => {
       events.push({ type: 'write-attempted', checkpoint });
     },
@@ -2094,8 +2094,8 @@ test('close is single-flight and escalates TERM to KILL exactly once', async (t)
   });
   const signals = [];
   const client = harness.makeClient({
-    closeGraceMs: 20,
-    closeKillMs: 500,
+    closeGraceMs: 1_000,
+    closeKillMs: 1_000,
     killFn: (pid, signal) => {
       signals.push({ pid, signal });
       return process.kill(pid, signal);

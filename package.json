@@ -1,6 +1,6 @@
 {
   "name": "@shumkov/orchestra",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "description": "Transport-agnostic session engine for Claude Code and the native Codex app-server: spawn, steer, supervise, observe turns, and recover.",
   "type": "commonjs",
   "main": "index.js",
@@ -11,7 +11,7 @@
     "README.md"
   ],
   "scripts": {
-    "test": "node --test --test-force-exit tests/*.test.js"
+    "test": "node --test --test-force-exit --test-concurrency=1 tests/*.test.js"
   },
   "publishConfig": {
     "access": "public"

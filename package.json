@@ -1,6 +1,6 @@
 {
   "name": "@shumkov/orchestra",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Drive interactive Claude Code CLI sessions: spawn, inject messages via the MCP channels bridge, observe turns, recover. The transport-agnostic session engine extracted from polygram, shared by polygram (Telegram) and water (WhatsApp).",
   "type": "commonjs",
   "main": "index.js",

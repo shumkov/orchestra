@@ -27,7 +27,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 const { makeBackend } = require('./_helpers/backend-driver');
 
-const BACKENDS = ['sdk', 'cli'];
+const BACKENDS = ['sdk', 'cli', 'codex'];
 
 // Channels backend skips scenarios that test transport-specific features
 // the Channels protocol intentionally doesn't expose. Channels-specific
@@ -52,8 +52,26 @@ const CHANNELS_SKIPS = new Set([
   // C13 (resetSession) + C28 (fireUserMessage) — now implemented in
   // CliProcess per review AC7 + AC8. No longer skipped.
 ]);
+const CODEX_SKIPS = new Set([
+  // Codex exposes true steering through the acknowledged async steerTurn
+  // capability. The legacy synchronous Claude injection APIs stay false.
+  'C10',
+  'C11',
+  'C23',
+  'C28',
+  // Provider-thread settings are immutable; reset/usage/compact are
+  // explicitly outside the first app-server lifecycle milestone.
+  'C13',
+  'C15',
+  'C16',
+  'C24',
+  'C26',
+]);
 function shouldSkip(kind, scenario) {
-  return kind === 'cli' && CHANNELS_SKIPS.has(scenario);
+  return (
+    (kind === 'cli' && CHANNELS_SKIPS.has(scenario))
+    || (kind === 'codex' && CODEX_SKIPS.has(scenario))
+  );
 }
 
 const CHAT_CONFIG = { model: 'sonnet', effort: 'high', cwd: '/tmp' };
@@ -259,7 +277,9 @@ for (const kind of BACKENDS) {
 
     // ── API parity (C13–C20) ─────────────────────────────────────────
 
-    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', async () => {
+    test('C13 resetSession returns shape {closed:boolean, drainedPendings:number}', {
+      skip: shouldSkip(kind, 'C13') ? `${kind}-capability N/A` : undefined,
+    }, async () => {
       // NOTE: `closed` differs across backends.
       // SDK: closes the Query (closed=true) so a fresh one spawns on next send.
       // Tmux: sends /new to the TUI (closed=false; same pty kept alive).
@@ -323,7 +343,15 @@ for (const kind of BACKENDS) {
           model: 'claude-haiku-4-5-20251001',
         };
       }
-      const usage = await proc.getContextUsage();
+      let usage;
+      try {
+        usage = await proc.getContextUsage();
+      } catch (error) {
+        assert.equal(error?.name, 'UnsupportedOperationError');
+        assert.equal(error?.code, 'UNSUPPORTED_OPERATION');
+        await proc.kill('cleanup');
+        return;
+      }
       assert.ok(usage && typeof usage === 'object', `${kind}: non-object usage`);
       assert.equal(typeof usage.percentage, 'number');
       assert.equal(typeof usage.totalTokens, 'number');
@@ -415,7 +443,9 @@ for (const kind of BACKENDS) {
       await proc.kill('cleanup');
     });
 
-    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', async () => {
+    test('C28 fireUserMessage returns true for valid content + delivers to underlying transport', {
+      skip: shouldSkip(kind, 'C28') ? `${kind}-capability N/A` : undefined,
+    }, async () => {
       // P0.3 / 0.10.0: both backends implement fireUserMessage as a
       // fire-and-forget user-message push regardless of inFlight state.
       // Polygram's /compact slash command depends on this working

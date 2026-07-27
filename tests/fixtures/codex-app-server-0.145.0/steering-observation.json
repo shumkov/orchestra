@@ -1,0 +1,15 @@
+{
+  "status": "passed",
+  "twoBackToBackRequestsAccepted": true,
+  "sameActiveTurnReturned": true,
+  "userMessageStartOrderPreserved": true,
+  "structuredFinalValueOrderPreserved": true,
+  "singleExpectedCommandObserved": true,
+  "unexpectedToolOrTurnErrorObserved": false,
+  "repeatableHeldTurnSetupProven": false,
+  "staleAfterTerminal": {
+    "rpcCode": -32600,
+    "rpcMessage": "no active turn to steer"
+  },
+  "provenance": "Content-free authenticated characterization of pinned Codex 0.145.0; no prompts, replies, identifiers, account data, or raw protocol lines retained."
+}

@@ -1,9 +1,10 @@
 {
-  "status": "schema-derived; runtime sequence not executed after the U1a stop condition",
+  "status": "schema-derived and authenticated runtime-characterized; U1a passed under the accepted native-beta containment contract",
   "messages": [
     {
       "direction": "client-to-server",
-      "method": "initialize"
+      "method": "initialize",
+      "requiredCapability": "experimentalApi"
     },
     {
       "direction": "client-to-server",
@@ -29,6 +30,20 @@
     {
       "direction": "client-to-server",
       "method": "turn/interrupt"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/settings/update",
+      "schemaOnly": true,
+      "productionAllowlisted": false
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/backgroundTerminals/list"
+    },
+    {
+      "direction": "client-to-server",
+      "method": "thread/backgroundTerminals/clean"
     },
     {
       "direction": "client-to-server",

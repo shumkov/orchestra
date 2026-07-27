@@ -1,0 +1,12 @@
+{
+  "surface": "response-extension",
+  "schemaDeclared": false,
+  "profile": {
+    "id": "polygram-session",
+    "extends": null
+  },
+  "freshExact": true,
+  "resumeExact": true,
+  "settingsNotificationObserved": false,
+  "provenance": "Content-free live characterization of pinned Codex 0.145.0; no thread, account, or credential data retained."
+}

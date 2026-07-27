@@ -1,0 +1,55 @@
+{
+  "gate": "CONTINUE",
+  "exitCode": 0,
+  "failedChecks": [],
+  "runtime": {
+    "cliVersion": "codex-cli 0.145.0"
+  },
+  "pairs": {
+    "baseline": {
+      "model": "gpt-5.6-sol",
+      "effort": "xhigh"
+    },
+    "alternate": {
+      "model": "gpt-5.6-sol",
+      "effort": "low"
+    }
+  },
+  "experimentalIdle": {
+    "changed": {
+      "responseClass": "empty-result",
+      "errorClass": null,
+      "notificationObserved": true
+    },
+    "noOp": {
+      "responseClass": "empty-result",
+      "errorClass": null,
+      "notificationObserved": false
+    }
+  },
+  "experimentalActive": {
+    "responseClass": "empty-result",
+    "errorClass": null,
+    "notificationObserved": true,
+    "setupClass": "started",
+    "originalTurnStartedOnce": true,
+    "originalTurnStatus": "completed"
+  },
+  "perTurnOverride": {
+    "turnCompleted": true,
+    "settingsNotificationObserved": true,
+    "notificationOrder": [
+      "turn-start-response",
+      "settings-updated",
+      "turn-started",
+      "turn-completed"
+    ]
+  },
+  "resume": {
+    "sameThread": true,
+    "modelAndEffortExact": true,
+    "laterTurnCompleted": true
+  },
+  "productionSettingsUpdateAllowlisted": false,
+  "redaction": "Only booleans, ordering labels, model and effort slugs, and runtime version are retained."
+}

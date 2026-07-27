@@ -1,0 +1,237 @@
+{
+  "cliVersion": "codex-cli 0.145.0",
+  "binarySha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "generatedProtocolV2CanonicalSha256": "1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb",
+  "requestIdTypes": [
+    "integer",
+    "string"
+  ],
+  "clientRequests": {
+    "initialize": {
+      "required": [
+        "clientInfo",
+        "capabilities"
+      ],
+      "optional": [],
+      "internal": true,
+      "stateChanging": false
+    },
+    "config/read": {
+      "required": [
+        "cwd",
+        "includeLayers"
+      ],
+      "optional": [],
+      "stateChanging": false
+    },
+    "configRequirements/read": {
+      "required": [],
+      "optional": [],
+      "params": "omitted",
+      "stateChanging": false
+    },
+    "permissionProfile/list": {
+      "required": [
+        "cwd"
+      ],
+      "optional": [
+        "cursor"
+      ],
+      "stateChanging": false
+    },
+    "account/read": {
+      "required": [
+        "refreshToken"
+      ],
+      "optional": [],
+      "stateChanging": false
+    },
+    "model/list": {
+      "required": [
+        "includeHidden",
+        "limit"
+      ],
+      "optional": [
+        "cursor"
+      ],
+      "stateChanging": false
+    },
+    "thread/start": {
+      "required": [
+        "cwd",
+        "model"
+      ],
+      "optional": [],
+      "stateChanging": true
+    },
+    "thread/resume": {
+      "required": [
+        "threadId"
+      ],
+      "optional": [],
+      "stateChanging": true
+    },
+    "turn/start": {
+      "required": [
+        "threadId",
+        "input"
+      ],
+      "optional": [
+        "clientUserMessageId",
+        "model",
+        "effort"
+      ],
+      "stateChanging": true
+    },
+    "turn/steer": {
+      "required": [
+        "threadId",
+        "expectedTurnId",
+        "input"
+      ],
+      "optional": [
+        "clientUserMessageId"
+      ],
+      "stateChanging": true
+    },
+    "turn/interrupt": {
+      "required": [
+        "threadId",
+        "turnId"
+      ],
+      "optional": [],
+      "stateChanging": true
+    },
+    "thread/backgroundTerminals/list": {
+      "required": [
+        "threadId"
+      ],
+      "optional": [
+        "cursor",
+        "limit"
+      ],
+      "experimental": true,
+      "stateChanging": false
+    },
+    "thread/backgroundTerminals/clean": {
+      "required": [
+        "threadId"
+      ],
+      "optional": [],
+      "experimental": true,
+      "stateChanging": true
+    }
+  },
+  "clientNotifications": [
+    "initialized"
+  ],
+  "deniedClientRequests": [
+    "command/exec"
+  ],
+  "deliveredServerNotifications": [
+    "error",
+    "thread/status/changed",
+    "thread/settings/updated",
+    "turn/started",
+    "turn/completed",
+    "item/started",
+    "item/completed",
+    "item/agentMessage/delta"
+  ],
+  "droppedServerNotifications": [
+    "thread/started",
+    "thread/tokenUsage/updated",
+    "thread/goal/updated",
+    "thread/goal/cleared",
+    "turn/diff/updated",
+    "turn/plan/updated",
+    "item/plan/delta",
+    "item/commandExecution/outputDelta",
+    "item/commandExecution/terminalInteraction",
+    "item/fileChange/outputDelta",
+    "item/fileChange/patchUpdated",
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/summaryPartAdded",
+    "item/reasoning/textDelta",
+    "warning",
+    "deprecationNotice",
+    "configWarning",
+    "account/rateLimits/updated",
+    "remoteControl/status/changed",
+    "mcpServer/startupStatus/updated"
+  ],
+  "deniedServerRequests": {
+    "item/commandExecution/requestApproval": {
+      "result": {
+        "decision": "cancel"
+      }
+    },
+    "item/fileChange/requestApproval": {
+      "result": {
+        "decision": "cancel"
+      }
+    },
+    "item/tool/requestUserInput": {
+      "result": {
+        "answers": {}
+      }
+    },
+    "mcpServer/elicitation/request": {
+      "result": {
+        "action": "cancel"
+      }
+    },
+    "item/permissions/requestApproval": {
+      "result": {
+        "permissions": {},
+        "scope": "turn"
+      }
+    },
+    "item/tool/call": {
+      "result": {
+        "contentItems": [],
+        "success": false
+      }
+    },
+    "account/chatgptAuthTokens/refresh": {
+      "error": {
+        "code": -32601,
+        "message": "server request disabled"
+      }
+    },
+    "attestation/generate": {
+      "error": {
+        "code": -32601,
+        "message": "server request disabled"
+      }
+    },
+    "currentTime/read": {
+      "error": {
+        "code": -32601,
+        "message": "server request disabled"
+      }
+    },
+    "applyPatchApproval": {
+      "result": {
+        "decision": "abort"
+      }
+    },
+    "execCommandApproval": {
+      "result": {
+        "decision": "abort"
+      }
+    }
+  },
+  "recognizedRpcErrors": {
+    "thread/resume": [
+      "thread not found"
+    ],
+    "turn/steer": [
+      "no active turn to steer"
+    ],
+    "turn/interrupt": [
+      "no active turn to interrupt"
+    ]
+  },
+  "provenance": "Curated positive production subset derived from the pinned experimental v2 schema; the canonical generated bundle hash is verified by the U1 compatibility gate."
+}

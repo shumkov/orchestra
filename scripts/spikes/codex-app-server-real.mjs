@@ -1310,6 +1310,79 @@ export function exactActiveProfile(value) {
   return isDeepStrictEqual(value, profileProvenanceFixture.profile);
 }
 
+function redactedRoots(roots) {
+  if (!Array.isArray(roots)) return null;
+  return {
+    count: roots.length,
+    sha256: roots
+      .map((root) => createHash('sha256').update(root).digest('hex'))
+      .sort(),
+  };
+}
+
+export function characterizeNamedProfilePolicy(
+  source,
+  cwd,
+  { attachment = false } = {},
+) {
+  const sandbox = source?.sandbox ?? source?.sandboxPolicy;
+  const runtimeWorkspaceRoots = attachment
+    ? redactedRoots(source?.runtimeWorkspaceRoots)
+    : null;
+  const legacyRoots = Array.isArray(sandbox?.writableRoots)
+    ? redactedRoots(sandbox.writableRoots)
+    : (
+        Number.isSafeInteger(sandbox?.writableRootCount)
+        && Array.isArray(sandbox?.writableRootSha256)
+          ? {
+              count: sandbox.writableRootCount,
+              sha256: [...sandbox.writableRootSha256].sort(),
+            }
+          : null
+      );
+  const legacySandbox = sandbox && legacyRoots && {
+    type: sandbox.type,
+    networkAccess: sandbox.networkAccess,
+    excludeSlashTmp: sandbox.excludeSlashTmp,
+    excludeTmpdirEnvVar: sandbox.excludeTmpdirEnvVar,
+    writableRootCount: legacyRoots.count,
+    writableRootSha256: legacyRoots.sha256,
+  };
+  const expectedRuntimeWorkspaceRoots = {
+    count: profileProvenanceFixture.attachmentRuntimeWorkspaceRoots.count,
+    sha256: [createHash('sha256').update(cwd).digest('hex')],
+  };
+  return {
+    exact: (
+      source?.modelProvider === 'openai'
+      && source?.approvalPolicy === 'never'
+      && source?.approvalsReviewer === 'user'
+      && exactActiveProfile(source?.activePermissionProfile)
+      && isDeepStrictEqual(
+        legacySandbox,
+        profileProvenanceFixture.legacySandbox,
+      )
+      && (
+        attachment
+          ? isDeepStrictEqual(
+              runtimeWorkspaceRoots,
+              expectedRuntimeWorkspaceRoots,
+            )
+          : (
+              profileProvenanceFixture.settingsIncludesRuntimeWorkspaceRoots
+                === Object.hasOwn(source ?? {}, 'runtimeWorkspaceRoots')
+            )
+      )
+    ),
+    runtimeWorkspaceRoots,
+    legacySandbox,
+    includesRuntimeWorkspaceRoots: Object.hasOwn(
+      source ?? {},
+      'runtimeWorkspaceRoots',
+    ),
+  };
+}
+
 export function evaluateProfileProvenance({ schemaDeclared, fresh, resume }) {
   const notificationPair = (
     fresh.settingsNotificationExact && resume.settingsNotificationExact
@@ -1327,9 +1400,9 @@ export function evaluateProfileProvenance({ schemaDeclared, fresh, resume }) {
   );
   return {
     accepted: Boolean(notificationPair || responsePair),
-    surface: notificationPair ? 'thread/settings/updated' : 'response-extension',
-    schemaDeclared: notificationPair ? true : schemaDeclared,
-    fragile: !notificationPair,
+    surface: responsePair ? 'response-extension' : 'thread/settings/updated',
+    schemaDeclared: responsePair ? false : true,
+    fragile: responsePair,
   };
 }
 
@@ -1346,6 +1419,29 @@ export async function characterizeThreadProfile(connection, method, params) {
       && message.params?.threadId === threadId
     ),
   );
+  const attachmentPolicy = characterizeNamedProfilePolicy(
+    result,
+    params.cwd ?? result.cwd,
+    { attachment: true },
+  );
+  if (!attachmentPolicy.exact) {
+    throw new Error(`${method} returned unexpected named-profile policy`);
+  }
+  const settingsPolicy = notification
+    ? characterizeNamedProfilePolicy(
+        notification.params.threadSettings,
+        params.cwd ?? result.cwd,
+    )
+    : null;
+  if (
+    profileProvenanceFixture.settingsNotificationObserved
+    && !settingsPolicy
+  ) {
+    throw new Error(`${method} omitted named-profile settings notification`);
+  }
+  if (settingsPolicy && !settingsPolicy.exact) {
+    throw new Error(`${method} emitted unexpected named-profile settings`);
+  }
   return {
     threadId,
     model: result.model,
@@ -1354,6 +1450,8 @@ export async function characterizeThreadProfile(connection, method, params) {
     settingsNotificationExact: exactActiveProfile(
       notification?.params?.threadSettings?.activePermissionProfile,
     ),
+    attachmentPolicy,
+    settingsPolicy,
   };
 }
 
@@ -2776,8 +2874,12 @@ async function main() {
       legacyWorkspaceWriteReadOnlyAccessField: hasRestrictedReadPolicy,
       freshProfileResponseExtensionExact: freshProfile.responseExtensionExact,
       freshProfileSettingsNotificationExact: freshProfile.settingsNotificationExact,
+      freshAttachmentPolicy: freshProfile.attachmentPolicy,
+      freshSettingsPolicy: freshProfile.settingsPolicy,
       resumeProfileResponseExtensionExact: resumeProfile.responseExtensionExact,
       resumeProfileSettingsNotificationExact: resumeProfile.settingsNotificationExact,
+      resumeAttachmentPolicy: resumeProfile.attachmentPolicy,
+      resumeSettingsPolicy: resumeProfile.settingsPolicy,
       provenanceSurface: provenance.surface,
       provenanceSchemaDeclared: provenance.schemaDeclared,
       provenanceFragile: provenance.fragile,

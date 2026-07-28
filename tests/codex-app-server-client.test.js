@@ -1149,8 +1149,10 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
               cwd: '__OWNED_CWD__',
               sandboxPolicy: {
                 type: 'workspaceWrite',
-                writableRoots: ['__OWNED_CWD__'],
+                writableRoots: [],
                 networkAccess: false,
+                excludeSlashTmp: true,
+                excludeTmpdirEnvVar: true,
               },
               activePermissionProfile: {
                 id: 'polygram-session',
@@ -1219,10 +1221,10 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
         sandboxPolicy: {
           type: 'workspaceWrite',
           networkAccess: false,
-          writableRootCount: 1,
-          writableRootSha256: [
-            createHash('sha256').update(harness.cwd).digest('hex'),
-          ],
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: true,
+          writableRootCount: 0,
+          writableRootSha256: [],
         },
         activePermissionProfile: {
           id: 'polygram-session',
@@ -1337,6 +1339,88 @@ test('state notifications must match the pinned generated schema', async (t) => 
       params: {
         threadId: 'thread-1',
         threadSettings: { model: 'gpt-5.6-sol' },
+      },
+    },
+  }, {
+    name: 'thread settings reject runtime workspace roots',
+    message: {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          modelProvider: 'openai',
+          approvalPolicy: 'never',
+          approvalsReviewer: 'user',
+          cwd: '__OWNED_CWD__',
+          runtimeWorkspaceRoots: ['__OWNED_CWD__'],
+          sandboxPolicy: {
+            type: 'workspaceWrite',
+            writableRoots: [],
+            networkAccess: false,
+            excludeSlashTmp: true,
+            excludeTmpdirEnvVar: true,
+          },
+          activePermissionProfile: {
+            id: 'polygram-session',
+            extends: null,
+          },
+        },
+      },
+    },
+  }, {
+    name: 'thread settings reject permission profile extras',
+    message: {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          modelProvider: 'openai',
+          approvalPolicy: 'never',
+          approvalsReviewer: 'user',
+          cwd: '__OWNED_CWD__',
+          sandboxPolicy: {
+            type: 'workspaceWrite',
+            writableRoots: [],
+            networkAccess: false,
+            excludeSlashTmp: true,
+            excludeTmpdirEnvVar: true,
+          },
+          activePermissionProfile: {
+            id: 'polygram-session',
+            extends: null,
+            extra: true,
+          },
+        },
+      },
+    },
+  }, {
+    name: 'thread settings require permission profile parent',
+    message: {
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          modelProvider: 'openai',
+          approvalPolicy: 'never',
+          approvalsReviewer: 'user',
+          cwd: '__OWNED_CWD__',
+          sandboxPolicy: {
+            type: 'workspaceWrite',
+            writableRoots: [],
+            networkAccess: false,
+            excludeSlashTmp: true,
+            excludeTmpdirEnvVar: true,
+          },
+          activePermissionProfile: {
+            id: 'polygram-session',
+          },
+        },
       },
     },
   }, {
@@ -1488,8 +1572,21 @@ test('method results expose bounded projections rather than raw config, account,
     descriptionSha256: createHash('sha256').update(secret).digest('hex'),
   });
   assert.equal(Object.hasOwn(thread.sandbox, 'writableRoots'), false);
-  assert.equal(thread.sandbox.writableRootCount, 1);
-  assert.deepEqual(thread.sandbox.writableRootSha256, [
+  assert.deepEqual(thread.runtimeWorkspaceRoots, {
+    count: 1,
+    sha256: [
+      createHash('sha256').update(harness.cwd).digest('hex'),
+    ],
+  });
+  assert.deepEqual(thread.sandbox, {
+    type: 'workspaceWrite',
+    networkAccess: false,
+    excludeSlashTmp: true,
+    excludeTmpdirEnvVar: true,
+    writableRootCount: 0,
+    writableRootSha256: [],
+  });
+  assert.deepEqual(thread.runtimeWorkspaceRoots.sha256, [
     createHash('sha256').update(harness.cwd).digest('hex'),
   ]);
   assert.deepEqual(terminals, { count: 1, nextCursor: null });
@@ -1497,6 +1594,83 @@ test('method results expose bounded projections rather than raw config, account,
     JSON.stringify({ config, account, profiles, thread, terminals }),
     new RegExp(secret),
   );
+});
+
+test('thread attachment runtime workspace roots fail closed on malformed shapes', async (t) => {
+  const cases = [
+    ['missing', (result) => delete result.runtimeWorkspaceRoots],
+    ['non-array', (result) => { result.runtimeWorkspaceRoots = result.cwd; }],
+    ['duplicated', (result) => {
+      result.runtimeWorkspaceRoots = [result.cwd, result.cwd];
+    }],
+    ['additional', (result) => {
+      result.runtimeWorkspaceRoots = [result.cwd, path.join(result.cwd, 'other')];
+    }],
+    ['outside workspace', (result) => {
+      result.runtimeWorkspaceRoots = [path.dirname(result.cwd)];
+    }],
+    ['nested runtime root', (result) => {
+      result.runtimeWorkspaceRoots = [path.join(result.cwd, 'nested')];
+    }],
+    ['non-canonical', (result) => {
+      result.runtimeWorkspaceRoots = [`${result.cwd}/../workspace`];
+    }],
+    ['permission profile extras', (result) => {
+      result.activePermissionProfile.extra = true;
+    }],
+    ['permission profile parent missing', (result) => {
+      delete result.activePermissionProfile.extends;
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async (t) => {
+      const harness = createHarness(t);
+      const result = {
+        thread: {
+          id: 'thread-1',
+          status: { type: 'idle' },
+          turns: [],
+        },
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        cwd: harness.cwd,
+        model: 'gpt-5.6-sol',
+        modelProvider: 'openai',
+        reasoningEffort: 'medium',
+        runtimeWorkspaceRoots: [harness.cwd],
+        sandbox: {
+          type: 'workspaceWrite',
+          writableRoots: [],
+          networkAccess: false,
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: true,
+        },
+        activePermissionProfile: {
+          id: 'polygram-session',
+          extends: null,
+        },
+      };
+      mutate(result);
+      writeFileSync(
+        path.join(harness.cwd, '.fake-codex-app-server.json'),
+        `${JSON.stringify({
+          methods: { 'thread/start': { result } },
+        })}\n`,
+      );
+      const client = harness.makeClient();
+      await client.start();
+
+      await rejectedWithCode(
+        client.request(
+          'thread/start',
+          methodParams('thread/start', harness.cwd),
+          mutationOptions(),
+        ),
+        'CODEX_RPC_OUTCOME_UNKNOWN',
+      );
+    });
+  }
 });
 
 test('ChatGPT account responses require generated email and plan fields', async (t) => {

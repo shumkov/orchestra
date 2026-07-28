@@ -16,6 +16,7 @@ const {
   writeFileSync,
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
+const { createHash } = require('node:crypto');
 const test = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 const { pathToFileURL } = require('node:url');
@@ -1092,6 +1093,7 @@ test('Codex U1a schema generation omits the unsupported strict-config flag', asy
 
 test('Codex U1a accepts only the fixture-pinned fresh and resume provenance pair', async () => {
   const {
+    characterizeNamedProfilePolicy,
     evaluateProfileProvenance,
     exactActiveProfile,
   } = await import(spikeUrl);
@@ -1105,6 +1107,99 @@ test('Codex U1a accepts only the fixture-pinned fresh and resume provenance pair
     extends: null,
     extra: true,
   }), false);
+  const cwd = '/srv/orchestra/workspace';
+  const attachmentPolicy = characterizeNamedProfilePolicy({
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+    runtimeWorkspaceRoots: [cwd],
+    sandbox: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRoots: [],
+    },
+  }, cwd, { attachment: true });
+  assert.equal(attachmentPolicy.exact, true);
+  assert.deepEqual(attachmentPolicy.runtimeWorkspaceRoots, {
+    count: 1,
+    sha256: [
+      createHash('sha256').update(cwd).digest('hex'),
+    ],
+  });
+  const settingsPolicy = characterizeNamedProfilePolicy({
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+    sandboxPolicy: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRoots: [],
+    },
+  }, cwd);
+  assert.equal(settingsPolicy.exact, true);
+  assert.equal(settingsPolicy.includesRuntimeWorkspaceRoots, false);
+  for (const [name, mutate] of [
+    ['provider', (source) => { source.modelProvider = 'other'; }],
+    ['approval policy', (source) => { source.approvalPolicy = 'on-request'; }],
+    ['reviewer', (source) => { source.approvalsReviewer = 'auto_review'; }],
+  ]) {
+    for (const attachment of [false, true]) {
+      const sandbox = {
+        type: 'workspaceWrite',
+        networkAccess: false,
+        excludeSlashTmp: true,
+        excludeTmpdirEnvVar: true,
+        writableRoots: [],
+      };
+      const source = {
+        modelProvider: 'openai',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        activePermissionProfile: {
+          id: 'polygram-session',
+          extends: null,
+        },
+        ...(attachment
+          ? { sandbox, runtimeWorkspaceRoots: [cwd] }
+          : { sandboxPolicy: sandbox }),
+      };
+      mutate(source);
+      assert.equal(
+        characterizeNamedProfilePolicy(source, cwd, { attachment }).exact,
+        false,
+        `${attachment ? 'attachment' : 'settings'} ${name}`,
+      );
+    }
+  }
+  assert.equal(characterizeNamedProfilePolicy({
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+    runtimeWorkspaceRoots: [cwd, `${cwd}/other`],
+    sandbox: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRoots: [],
+    },
+  }, cwd, { attachment: true }).exact, false);
 
   const accepted = evaluateProfileProvenance({
     schemaDeclared: false,
@@ -1112,6 +1207,17 @@ test('Codex U1a accepts only the fixture-pinned fresh and resume provenance pair
     resume: { responseExtensionExact: true, settingsNotificationExact: false },
   });
   assert.deepEqual(accepted, {
+    accepted: true,
+    surface: 'response-extension',
+    schemaDeclared: false,
+    fragile: true,
+  });
+  const bothExact = evaluateProfileProvenance({
+    schemaDeclared: false,
+    fresh: { responseExtensionExact: true, settingsNotificationExact: true },
+    resume: { responseExtensionExact: true, settingsNotificationExact: true },
+  });
+  assert.deepEqual(bothExact, {
     accepted: true,
     surface: 'response-extension',
     schemaDeclared: false,
@@ -2003,7 +2109,7 @@ test('Codex U1b retains retry ownership without retaining provider error text', 
   assert.doesNotMatch(JSON.stringify(connection.notifications), /SECRET_PROVIDER_ERROR/);
 });
 
-test('Codex U1b retains only effective model and effort from settings updates', async (t) => {
+test('Codex U1b retains the complete redacted static settings view', async (t) => {
   const { AppServerConnection } = await import(spikeUrl);
   const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1b-settings-'));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -2022,7 +2128,21 @@ test('Codex U1b retains only effective model and effort from settings updates', 
       '      threadSettings: {',
       "        model: 'gpt-5.6-sol',",
       "        effort: 'xhigh',",
+      "        modelProvider: 'openai',",
+      "        approvalPolicy: 'never',",
+      "        approvalsReviewer: 'user',",
       "        cwd: 'SECRET_CWD',",
+      '        sandboxPolicy: {',
+      "          type: 'workspaceWrite',",
+      '          networkAccess: false,',
+      '          excludeSlashTmp: true,',
+      '          excludeTmpdirEnvVar: true,',
+      "          writableRoots: ['/SECRET_ROOT'],",
+      '        },',
+      '        activePermissionProfile: {',
+      "          id: 'polygram-session',",
+      '          extends: null,',
+      '        },',
       '      },',
       '    },',
       '  })}\\n`);',
@@ -2052,10 +2172,214 @@ test('Codex U1b retains only effective model and effort from settings updates', 
       threadSettings: {
         model: 'gpt-5.6-sol',
         effort: 'xhigh',
+        modelProvider: 'openai',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandboxPolicy: {
+          type: 'workspaceWrite',
+          networkAccess: false,
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: true,
+          writableRootCount: 1,
+          writableRootSha256: [
+            createHash('sha256').update('/SECRET_ROOT').digest('hex'),
+          ],
+        },
+        activePermissionProfile: {
+          id: 'polygram-session',
+          extends: null,
+        },
       },
     },
   }]);
   assert.doesNotMatch(JSON.stringify(connection.notifications), /SECRET_CWD/);
+  assert.doesNotMatch(JSON.stringify(connection.notifications), /SECRET_ROOT/);
+});
+
+test('Codex U1b rejects missing, drifted, and root-bearing settings views', async (t) => {
+  const { AppServerConnection } = await import(spikeUrl);
+  const base = {
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    sandboxPolicy: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRoots: [],
+    },
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+  };
+  const cases = [
+    ['missing profile parent', (settings) => {
+      delete settings.activePermissionProfile.extends;
+    }],
+    ['missing profile id', (settings) => {
+      delete settings.activePermissionProfile.id;
+    }],
+    ['missing sandbox type', (settings) => {
+      delete settings.sandboxPolicy.type;
+    }],
+    ['drifted provider', (settings) => {
+      settings.modelProvider = 'other';
+    }],
+    ['runtime roots present', (settings) => {
+      settings.runtimeWorkspaceRoots = ['/workspace'];
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async (subtest) => {
+      const scratch = mkdtempSync(
+        path.join(tmpdir(), 'orchestra-codex-u1b-settings-invalid-'),
+      );
+      subtest.after(() => rmSync(scratch, { recursive: true, force: true }));
+      const settings = structuredClone(base);
+      mutate(settings);
+      const fakeServer = path.join(scratch, 'fake-app-server.mjs');
+      const notification = {
+        method: 'thread/settings/updated',
+        params: {
+          threadId: 'thread-1',
+          threadSettings: settings,
+        },
+      };
+      writeFileSync(
+        fakeServer,
+        [
+          "import readline from 'node:readline';",
+          'const lines = readline.createInterface({ input: process.stdin });',
+          "lines.once('line', (line) => {",
+          '  const request = JSON.parse(line);',
+          `  process.stdout.write(${JSON.stringify(`${JSON.stringify(notification)}\n`)});`,
+          '  process.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\\n`);',
+          '});',
+          '',
+        ].join('\n'),
+      );
+      const connection = new AppServerConnection(
+        {
+          binary: fakeServer,
+          launcher: process.execPath,
+          workspace: scratch,
+        },
+        { PATH: process.env.PATH ?? '' },
+      );
+      subtest.after(() => connection.close());
+
+      await assert.rejects(
+        connection.request('config/read', {
+          cwd: scratch,
+          includeLayers: true,
+        }, 1_000),
+      );
+    });
+  }
+});
+
+test('thread profile characterization requires the exact retained settings view', async (t) => {
+  const {
+    AppServerConnection,
+    characterizeThreadProfile,
+  } = await import(spikeUrl);
+  for (const mode of ['valid', 'missing', 'drifted']) {
+    await t.test(mode, async (subtest) => {
+      const scratch = mkdtempSync(
+        path.join(tmpdir(), 'orchestra-codex-profile-settings-'),
+      );
+      subtest.after(() => rmSync(scratch, { recursive: true, force: true }));
+      const fakeServer = path.join(scratch, 'fake-app-server.mjs');
+      const settings = {
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        modelProvider: mode === 'drifted' ? 'other' : 'openai',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        sandboxPolicy: {
+          type: 'workspaceWrite',
+          networkAccess: false,
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: true,
+          writableRoots: [],
+        },
+        activePermissionProfile: {
+          id: 'polygram-session',
+          extends: null,
+        },
+      };
+      const response = {
+        thread: { id: 'thread-1' },
+        cwd: scratch,
+        model: 'gpt-5.6-sol',
+        reasoningEffort: 'xhigh',
+        modelProvider: 'openai',
+        approvalPolicy: 'never',
+        approvalsReviewer: 'user',
+        runtimeWorkspaceRoots: [scratch],
+        sandbox: {
+          type: 'workspaceWrite',
+          networkAccess: false,
+          excludeSlashTmp: true,
+          excludeTmpdirEnvVar: true,
+          writableRoots: [],
+        },
+        activePermissionProfile: {
+          id: 'polygram-session',
+          extends: null,
+        },
+      };
+      const notification = {
+        method: 'thread/settings/updated',
+        params: {
+          threadId: 'thread-1',
+          threadSettings: settings,
+        },
+      };
+      writeFileSync(
+        fakeServer,
+        [
+          "import readline from 'node:readline';",
+          'const lines = readline.createInterface({ input: process.stdin });',
+          "lines.once('line', (line) => {",
+          '  const request = JSON.parse(line);',
+          ...(mode === 'missing'
+            ? []
+            : [
+                `  process.stdout.write(${JSON.stringify(`${JSON.stringify(notification)}\n`)});`,
+              ]),
+          `  process.stdout.write(${JSON.stringify(`${JSON.stringify({ id: 1, result: response })}\n`)});`,
+          '});',
+          '',
+        ].join('\n'),
+      );
+      const connection = new AppServerConnection(
+        {
+          binary: fakeServer,
+          launcher: process.execPath,
+          workspace: scratch,
+        },
+        { PATH: process.env.PATH ?? '' },
+      );
+      subtest.after(() => connection.close());
+
+      const characterized = characterizeThreadProfile(
+        connection,
+        'thread/start',
+        { cwd: scratch },
+      );
+      if (mode === 'valid') {
+        assert.equal((await characterized).settingsPolicy.exact, true);
+      } else {
+        await assert.rejects(characterized);
+      }
+    });
+  }
 });
 
 test('Codex U1b paginates the model catalog and rejects cursor loops', async () => {

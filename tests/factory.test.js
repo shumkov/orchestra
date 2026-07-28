@@ -337,11 +337,17 @@ test('runtime:codex constructs CodexProcess only from trusted factory profile in
     modelProvider: 'openai',
     approvalPolicy: 'never',
     approvalsReviewer: 'user',
+    runtimeWorkspaceRoots: {
+      count: 1,
+      sha256: [digest('/trusted/workspace')],
+    },
     sandbox: {
       type: 'workspaceWrite',
       networkAccess: false,
-      writableRootCount: 1,
-      writableRootSha256: [digest('/trusted/workspace')],
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRootCount: 0,
+      writableRootSha256: [],
     },
     permissionProfile: {
       id: 'polygram-session',
@@ -349,6 +355,8 @@ test('runtime:codex constructs CodexProcess only from trusted factory profile in
     },
   });
   assert.ok(Object.isFrozen(proc.expectedStaticPolicy));
+  assert.ok(Object.isFrozen(proc.expectedStaticPolicy.runtimeWorkspaceRoots));
+  assert.ok(Object.isFrozen(proc.expectedStaticPolicy.runtimeWorkspaceRoots.sha256));
   assert.ok(Object.isFrozen(proc.expectedStaticPolicy.sandbox));
   assert.ok(Object.isFrozen(proc.expectedStaticPolicy.sandbox.writableRootSha256));
   assert.ok(Object.isFrozen(proc.expectedStaticPolicy.permissionProfile));
@@ -400,6 +408,173 @@ test('runtime:codex constructs CodexProcess only from trusted factory profile in
       params: { cwd: profile.cwd },
     },
   ]);
+});
+
+test('factory-created named-profile threads reach turn/start with real runtime policy', async (t) => {
+  for (const existingSessionId of [null, 'thread-existing']) {
+    await t.test(existingSessionId ? 'resume' : 'fresh', async () => {
+      const spawnProfile = await codexSpawnProfile();
+      const profile = spawnProfile.expectedStaticProfile;
+      const calls = [];
+      let callbacks;
+      const fakeClient = {
+        start: async () => {},
+        request: async (method, params) => {
+          calls.push({ method, params });
+          if (method === 'config/read') {
+            return {
+              config: profile.expectedConfig,
+              layers: profile.expectedLayers,
+              originsSha256: profile.expectedOriginsSha256,
+            };
+          }
+          if (method === 'configRequirements/read') {
+            return { requirements: profile.expectedRequirements };
+          }
+          if (method === 'permissionProfile/list') {
+            return {
+              data: profile.expectedPermissionProfiles,
+              nextCursor: null,
+            };
+          }
+          if (method === 'thread/start' || method === 'thread/resume') {
+            const threadId = params.threadId ?? 'thread-fresh';
+            await callbacks.onNotification({
+              method: 'thread/settings/updated',
+              params: {
+                threadId,
+                threadSettings: {
+                  model: 'gpt-5.6-sol',
+                  effort: 'xhigh',
+                  modelProvider: 'openai',
+                  approvalPolicy: 'never',
+                  approvalsReviewer: 'user',
+                  sandboxPolicy: {
+                    type: 'workspaceWrite',
+                    networkAccess: false,
+                    excludeSlashTmp: true,
+                    excludeTmpdirEnvVar: true,
+                    writableRootCount: 0,
+                    writableRootSha256: [],
+                  },
+                  activePermissionProfile: {
+                    id: 'polygram-session',
+                    extends: null,
+                  },
+                },
+              },
+            });
+            return {
+              cwd: profile.cwd,
+              model: 'gpt-5.6-sol',
+              modelProvider: 'openai',
+              reasoningEffort: 'xhigh',
+              approvalPolicy: 'never',
+              approvalsReviewer: 'user',
+              runtimeWorkspaceRoots: {
+                count: 1,
+                sha256: [digest(profile.cwd)],
+              },
+              sandbox: {
+                type: 'workspaceWrite',
+                networkAccess: false,
+                excludeSlashTmp: true,
+                excludeTmpdirEnvVar: true,
+                writableRootCount: 0,
+                writableRootSha256: [],
+              },
+              activePermissionProfile: {
+                id: 'polygram-session',
+                extends: null,
+              },
+              thread: {
+                id: threadId,
+                status: { type: 'idle' },
+                turns: [],
+              },
+            };
+          }
+          if (method === 'turn/start') {
+            setImmediate(async () => {
+              await callbacks.onNotification({
+                method: 'turn/started',
+                params: {
+                  threadId: existingSessionId ?? 'thread-fresh',
+                  turn: {
+                    id: 'turn-1',
+                    status: 'inProgress',
+                    items: [],
+                    error: null,
+                  },
+                },
+              });
+              await callbacks.onNotification({
+                method: 'turn/completed',
+                params: {
+                  threadId: existingSessionId ?? 'thread-fresh',
+                  turn: {
+                    id: 'turn-1',
+                    status: 'completed',
+                    items: [],
+                    error: null,
+                  },
+                },
+              });
+            });
+            return {
+              turn: {
+                id: 'turn-1',
+                status: 'inProgress',
+                items: [],
+                error: null,
+              },
+            };
+          }
+          if (method === 'thread/backgroundTerminals/list') {
+            return { count: 0, nextCursor: null };
+          }
+          throw new Error(`unexpected request ${method}`);
+        },
+        close: async () => {},
+        waitForFault: () => new Promise(() => {}),
+      };
+      const factory = await makeCodexFactory({
+        codexSpawnProfile: spawnProfile,
+        codexExpectedStaticProfile: () => spawnProfile,
+        codexClientFactory: (options) => {
+          callbacks = options;
+          return fakeClient;
+        },
+      });
+      const proc = factory(`named-profile-${existingSessionId ?? 'fresh'}`, {
+        runtime: 'codex',
+        spawnProfileId: spawnProfile.spawnProfileId,
+        modelSettings: { model: 'gpt-5.6-sol', effort: 'xhigh' },
+        chatId: '123',
+        threadId: null,
+        label: 'named-profile',
+        existingSessionId,
+      });
+
+      try {
+        await proc.start(proc.spawnOptions);
+        await proc.send('first prompt');
+        assert.equal(
+          calls.filter(({ method }) => method === 'turn/start').length,
+          1,
+        );
+      } catch (error) {
+        if (error.code === 'CODEX_THREAD_POLICY_MISMATCH') {
+          assert.equal(
+            calls.some(({ method }) => method === 'turn/start'),
+            false,
+            'policy mismatch must reject before dispatching the prompt',
+          );
+        }
+        throw error;
+      }
+    });
+  }
 });
 
 test('runtime:codex keeps deployment model defaults separate from the selected thread model', async () => {

@@ -195,6 +195,29 @@ const MODEL_CATALOG = Object.freeze([{
   model: 'gpt-5.6-terra',
   supportedReasoningEfforts: Object.freeze(['medium', 'high']),
 }]);
+const NAMED_PROFILE_STATIC_POLICY = Object.freeze({
+  modelProvider: 'openai',
+  approvalPolicy: 'never',
+  approvalsReviewer: 'user',
+  runtimeWorkspaceRoots: Object.freeze({
+    count: 1,
+    sha256: Object.freeze([
+      createHash('sha256').update('/workspace').digest('hex'),
+    ]),
+  }),
+  sandbox: Object.freeze({
+    type: 'workspaceWrite',
+    networkAccess: false,
+    excludeSlashTmp: true,
+    excludeTmpdirEnvVar: true,
+    writableRootCount: 0,
+    writableRootSha256: Object.freeze([]),
+  }),
+  permissionProfile: Object.freeze({
+    id: 'polygram-session',
+    extends: null,
+  }),
+});
 
 function threadResult(
   threadId,
@@ -211,6 +234,39 @@ function threadResult(
     sandbox: { type: 'workspaceWrite' },
     activePermissionProfile: { id: 'polygram-session', extends: null },
     thread: { id: threadId, status, turns: [] },
+  };
+}
+
+function namedProfileThreadResult(threadId = 'codex-thread') {
+  return {
+    ...threadResult(threadId),
+    runtimeWorkspaceRoots: {
+      count: 1,
+      sha256: [
+        createHash('sha256').update('/workspace').digest('hex'),
+      ],
+    },
+    sandbox: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRootCount: 0,
+      writableRootSha256: [],
+    },
+  };
+}
+
+function namedProfileSettings() {
+  const result = namedProfileThreadResult();
+  return {
+    model: result.model,
+    effort: result.reasoningEffort,
+    modelProvider: result.modelProvider,
+    approvalPolicy: result.approvalPolicy,
+    approvalsReviewer: result.approvalsReviewer,
+    sandboxPolicy: result.sandbox,
+    activePermissionProfile: result.activePermissionProfile,
   };
 }
 
@@ -1664,6 +1720,149 @@ test('fresh thread policy requires every exact field and rejects every omission'
   }
 });
 
+test('named-profile attachment rejects every runtime and legacy policy drift before turn/start', async (t) => {
+  const cases = [
+    ['runtime roots missing', (result) => delete result.runtimeWorkspaceRoots],
+    ['runtime roots duplicated', (result) => {
+      result.runtimeWorkspaceRoots.count = 2;
+      result.runtimeWorkspaceRoots.sha256.push(
+        result.runtimeWorkspaceRoots.sha256[0],
+      );
+    }],
+    ['runtime root wrong', (result) => {
+      result.runtimeWorkspaceRoots.sha256[0] = createHash('sha256')
+        .update('/workspace/other')
+        .digest('hex');
+    }],
+    ['legacy root added', (result) => {
+      result.sandbox.writableRootCount = 1;
+      result.sandbox.writableRootSha256 = [
+        createHash('sha256').update('/workspace').digest('hex'),
+      ];
+    }],
+    ['network missing', (result) => delete result.sandbox.networkAccess],
+    ['network alternate form', (result) => {
+      result.sandbox.networkAccess = 'restricted';
+    }],
+    ['slash tmp enabled', (result) => {
+      result.sandbox.excludeSlashTmp = false;
+    }],
+    ['TMPDIR enabled', (result) => {
+      result.sandbox.excludeTmpdirEnvVar = false;
+    }],
+    ['sandbox type changed', (result) => {
+      result.sandbox.type = 'readOnly';
+    }],
+    ['profile missing', (result) => delete result.activePermissionProfile],
+    ['profile changed', (result) => {
+      result.activePermissionProfile.id = 'other-profile';
+    }],
+    ['profile parent changed', (result) => {
+      result.activePermissionProfile.extends = 'parent-profile';
+    }],
+    ['approval changed', (result) => {
+      result.approvalPolicy = 'on-request';
+    }],
+    ['reviewer changed', (result) => {
+      result.approvalsReviewer = 'auto_review';
+    }],
+    ['provider changed', (result) => {
+      result.modelProvider = 'other-provider';
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const fixture = makeProcess({
+        processOptions: {
+          expectedStaticPolicy: NAMED_PROFILE_STATIC_POLICY,
+        },
+        handlers: {
+          'thread/start': async () => {
+            const result = namedProfileThreadResult();
+            mutate(result);
+            return result;
+          },
+        },
+      });
+
+      await assert.rejects(
+        fixture.start(),
+        (error) => error.code === 'CODEX_THREAD_POLICY_MISMATCH',
+      );
+      assert.equal(
+        fixture.client.requests.some(({ method }) => method === 'turn/start'),
+        false,
+      );
+    });
+  }
+});
+
+test('named-profile settings drift quarantines without requiring runtime roots', async (t) => {
+  const cases = [
+    ['legacy root added', (settings) => {
+      settings.sandboxPolicy.writableRootCount = 1;
+      settings.sandboxPolicy.writableRootSha256 = [
+        createHash('sha256').update('/workspace').digest('hex'),
+      ];
+    }],
+    ['network missing', (settings) => {
+      delete settings.sandboxPolicy.networkAccess;
+    }],
+    ['network alternate form', (settings) => {
+      settings.sandboxPolicy.networkAccess = 'restricted';
+    }],
+    ['slash tmp enabled', (settings) => {
+      settings.sandboxPolicy.excludeSlashTmp = false;
+    }],
+    ['TMPDIR enabled', (settings) => {
+      settings.sandboxPolicy.excludeTmpdirEnvVar = false;
+    }],
+    ['sandbox type changed', (settings) => {
+      settings.sandboxPolicy.type = 'readOnly';
+    }],
+    ['profile changed', (settings) => {
+      settings.activePermissionProfile.id = 'other-profile';
+    }],
+    ['profile parent changed', (settings) => {
+      settings.activePermissionProfile.extends = 'parent-profile';
+    }],
+    ['approval changed', (settings) => {
+      settings.approvalPolicy = 'on-request';
+    }],
+    ['reviewer changed', (settings) => {
+      settings.approvalsReviewer = 'auto_review';
+    }],
+    ['provider changed', (settings) => {
+      settings.modelProvider = 'other-provider';
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const fixture = makeProcess({
+        processOptions: {
+          expectedStaticPolicy: NAMED_PROFILE_STATIC_POLICY,
+        },
+        handlers: {
+          'thread/start': async () => namedProfileThreadResult(),
+        },
+      });
+      await fixture.start();
+      const settings = namedProfileSettings();
+      mutate(settings);
+
+      await fixture.client.notify('thread/settings/updated', {
+        threadId: 'codex-thread',
+        threadSettings: settings,
+      });
+
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(fixture.proc.containmentReason, 'thread-settings-drift');
+    });
+  }
+});
+
 test('resume accepts an old dynamic pair while settings updates retain exact static attestation', async () => {
   const resume = makeProcess({
     existingSessionId: 'thread-existing',
@@ -2390,6 +2589,129 @@ test('stop during a prepared turn start durably cancels without dispatching the 
   await fixture.proc.kill();
 });
 
+test('settings drift contains a turn blocked at request-prepared without transport write', async () => {
+  const prepared = deferred();
+  const releasePrepared = deferred();
+  const containmentEntered = deferred();
+  const releaseContainment = deferred();
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (
+        checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        prepared.resolve();
+        await releasePrepared.promise;
+      }
+      if (checkpoint.kind === 'containment-entered') {
+        containmentEntered.resolve();
+        await releaseContainment.promise;
+      }
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('must remain local');
+  const rejected = assert.rejects(
+    send,
+    (error) => error.code === 'CODEX_CONTAINMENT_FAILED',
+  );
+  await prepared.promise;
+
+  const notification = fixture.client.notify('thread/settings/updated', {
+    threadId: 'codex-thread',
+    threadSettings: {
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      modelProvider: 'other-provider',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandboxPolicy: { type: 'workspaceWrite' },
+      activePermissionProfile: {
+        id: 'polygram-session',
+        extends: null,
+      },
+    },
+  });
+  await containmentEntered.promise;
+  releasePrepared.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseContainment.resolve();
+  await notification;
+  await rejected;
+
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.containmentReason, 'thread-settings-drift');
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+});
+
+test('settings drift during write checkpoint prevents turn/start transport write', async () => {
+  const writeAttempted = deferred();
+  const releaseWriteAttempted = deferred();
+  const containmentEntered = deferred();
+  const releaseContainment = deferred();
+  let turnStartHandled = false;
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (
+        checkpoint.kind === 'request-write-attempted'
+        && checkpoint.method === 'turn/start'
+      ) {
+        writeAttempted.resolve();
+        await releaseWriteAttempted.promise;
+      }
+      if (checkpoint.kind === 'containment-entered') {
+        containmentEntered.resolve();
+        await releaseContainment.promise;
+      }
+    },
+    handlers: {
+      'turn/start': async () => {
+        turnStartHandled = true;
+        return {
+          turn: {
+            id: 'turn-must-not-write',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('must remain local');
+  const rejected = assert.rejects(send);
+  await writeAttempted.promise;
+
+  const notification = fixture.client.notify('thread/settings/updated', {
+    threadId: 'codex-thread',
+    threadSettings: {
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      modelProvider: 'other-provider',
+      approvalPolicy: 'never',
+      approvalsReviewer: 'user',
+      sandboxPolicy: { type: 'workspaceWrite' },
+      activePermissionProfile: {
+        id: 'polygram-session',
+        extends: null,
+      },
+    },
+  });
+  await containmentEntered.promise;
+  releaseWriteAttempted.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  releaseContainment.resolve();
+  await notification;
+  await rejected;
+
+  assert.equal(turnStartHandled, false);
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+});
+
 test('stop cleanup failure contains the generation instead of releasing ownership', async () => {
   const fixture = makeProcess({
     handlers: {
@@ -2665,6 +2987,7 @@ test('stop waits for an in-progress turn-start write checkpoint disposition', as
       ) {
         writeEntered.resolve();
         await releaseWrite.promise;
+        checkpoint.markWriteCommitted();
       }
     },
     handlers: {
@@ -2702,7 +3025,8 @@ test('stop waits for an in-progress turn-start write checkpoint disposition', as
     },
   });
   await fixture.start();
-  const send = fixture.proc.send('cancel during write checkpoint');
+  const send = fixture.proc.send('cancel during write checkpoint')
+    .catch((error) => error);
   await writeEntered.promise;
   let stopSettled = false;
   const stop = fixture.proc.interrupt().finally(() => {
@@ -2714,11 +3038,11 @@ test('stop waits for an in-progress turn-start write checkpoint disposition', as
   assert.equal(cleanCalls, 0);
   releaseWrite.resolve();
   assert.equal(await stop, true);
-  assert.equal((await send).error, 'interrupted');
-  assert.equal(startCalls, 1);
+  assert.equal((await send).code, 'INTERRUPTED');
+  assert.equal(startCalls, 0);
   assert.equal(
     checkpoints.some(({ kind }) => kind === 'active-start-cancelled'),
-    false,
+    true,
   );
   assert.equal(cleanCalls, 1);
   await fixture.proc.kill();
@@ -3087,11 +3411,17 @@ test('real U2 client checkpoints containment before closing on response durabili
     modelProvider: 'openai',
     approvalPolicy: 'never',
     approvalsReviewer: 'user',
+    runtimeWorkspaceRoots: Object.freeze({
+      count: 1,
+      sha256: Object.freeze([writableRootSha256]),
+    }),
     sandbox: Object.freeze({
       type: 'workspaceWrite',
       networkAccess: false,
-      writableRootCount: 1,
-      writableRootSha256: Object.freeze([writableRootSha256]),
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRootCount: 0,
+      writableRootSha256: Object.freeze([]),
     }),
     permissionProfile: Object.freeze({
       id: 'polygram-session',

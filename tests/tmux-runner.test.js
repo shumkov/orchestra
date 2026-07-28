@@ -570,3 +570,112 @@ describe('run() execFile bounding (R7: a wedged tmux call must not hang)', () =>
     }
   });
 });
+
+// ── dedicated tmux socket (-L) ──────────────────────────────────────
+
+describe('createTmuxRunner socketName', () => {
+  // Orchestra shared the DEFAULT tmux socket with the operator's own sessions,
+  // so a single `tmux kill-server` — from a unit's ExecStop or from a human at a
+  // prompt — took out both bots, water and the admin session together. A
+  // dedicated socket per app is what stops one restart from being fleet-wide.
+  test('prepends -L to every invocation', async () => {
+    const runFn = makeMockRun();
+    const r = createTmuxRunner({ runFn, socketName: 'polygram' });
+    await r.sessionExists('anything');
+    await r.killSession('some-session');
+    assert.ok(runFn.calls.length >= 2);
+    for (const call of runFn.calls) {
+      assert.equal(call.cmd, 'tmux');
+      assert.deepEqual(call.args.slice(0, 2), ['-L', 'polygram'],
+        `expected -L first, got: ${call.args.join(' ')}`);
+    }
+  });
+
+  test('server flags precede the tmux command, and -L coexists with -N', async () => {
+    const runFn = makeMockRun();
+    const r = createTmuxRunner({ runFn, socketName: 'water', requireExistingServer: true });
+    await r.sessionExists('x');
+    const { args } = runFn.calls[0];
+    // tmux parses server options before the command word; a command appearing
+    // first would make tmux reject the flags.
+    assert.deepEqual(args.slice(0, 3), ['-L', 'water', '-N']);
+    assert.ok(!args.slice(0, 3).includes('has-session'));
+  });
+
+  test('omitting socketName keeps today’s default-socket behaviour', async () => {
+    const runFn = makeMockRun();
+    const r = createTmuxRunner({ runFn });
+    await r.sessionExists('x');
+    assert.ok(!runFn.calls[0].args.includes('-L'));
+  });
+
+  // The value becomes a bare CLI argument. execFile means no shell, but a value
+  // starting with '-' would be parsed by tmux as another flag, and a path
+  // separator would silently select a different socket directory.
+  test('rejects a socket name tmux could mis-parse', () => {
+    for (const bad of ['-N', '--', 'has/slash', 'has space', '', 'a'.repeat(200)]) {
+      assert.throws(
+        () => createTmuxRunner({ runFn: makeMockRun(), socketName: bad }),
+        /socketName/,
+        `expected rejection for ${JSON.stringify(bad)}`,
+      );
+    }
+  });
+
+  test('accepts ordinary names', () => {
+    for (const ok of ['polygram', 'water', 'polygram-test', 'a_b.c1']) {
+      assert.doesNotThrow(() => createTmuxRunner({ runFn: makeMockRun(), socketName: ok }));
+    }
+  });
+});
+
+describe('runner.listPolygramSessions strict mode', () => {
+  // Non-strict conflates "no sessions" with "couldn't ask", which is how a
+  // failed tmux server reads as a clean sweep. Callers that require a running
+  // server need to tell those two apart.
+  test('strict rethrows instead of reporting an empty host', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-sessions', { error: 'no server running' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    await assert.rejects(
+      () => runner.listPolygramSessions(null, { strict: true }),
+      (err) => err.code === 'TMUX_LIST_FAILED',
+    );
+  });
+
+  test('strict still returns sessions normally', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux list-sessions', { stdout: 'orchestra-shumabit-100-main\nmysess' });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    assert.deepEqual(
+      await runner.listPolygramSessions(null, { strict: true }),
+      ['orchestra-shumabit-100-main'],
+    );
+  });
+});
+
+describe('runner.killSession strict mode', () => {
+  // Teardown paths race a session's own exit, so the default must stay
+  // best-effort. But a caller that reports "swept" needs the failure.
+  test('non-strict swallows a refusal', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux kill-session', { error: "can't find session" });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    await assert.doesNotReject(() => runner.killSession('gone'));
+  });
+
+  test('strict surfaces it', async () => {
+    const mockRun = makeMockRun();
+    mockRun.stub('tmux kill-session', { error: "can't find session" });
+    const runner = createTmuxRunner({ runFn: mockRun });
+    await assert.rejects(
+      () => runner.killSession('gone', { strict: true }),
+      (err) => err.code === 'TMUX_KILL_FAILED',
+    );
+  });
+
+  test('strict resolves on success', async () => {
+    const runner = createTmuxRunner({ runFn: makeMockRun() });
+    await assert.doesNotReject(() => runner.killSession('live', { strict: true }));
+  });
+});

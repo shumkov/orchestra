@@ -506,3 +506,45 @@ test('factory threads toolDispatcherCapabilities into CliProcess', () => {
     build((chatId) => ({ stream: chatId === 'other' })).streamToolEnabled, false,
   );
 });
+
+// ─── turn identity for consumers ───────────────────────────────────
+
+test('the turn id is published on the caller\'s context object', async () => {
+  // A consumer holding per-turn state (a live preview) needs to know WHICH turn
+  // it is holding, so it can refuse a late tool call from an earlier one. The
+  // alternative — reading pendingQueue — is reaching into our internals.
+  const { p } = makeProc();
+  p.bridgeReady = true;
+  p.mcpReady = true;
+  p._writeToBridge = () => true;
+  const context = { streamer: {} };
+
+  p.send('hello', { context }).catch(() => {});
+  await new Promise(r => setImmediate(r));
+
+  assert.equal(typeof context.turnId, 'string');
+  assert.equal(context.turnId, p.pendingQueue[0].turnId,
+    'the published id must be the turn the engine actually created');
+});
+
+test('a reply dispatch carries the turn_id it named', async () => {
+  const calls = [];
+  const { p } = makeProc({ dispatcher: async (call) => { calls.push(call); return { ok: true, message_id: 5 }; } });
+  addTurn(p, 't-1');
+  await p._dispatchToolCall({
+    kind: 'tool', session: 's', tool_call_id: 'tc-r', name: 'reply',
+    args: { chat_id: '111', turn_id: 't-1', text: 'the answer' },
+  });
+  assert.equal(calls[0].turnId, 't-1');
+});
+
+test('a reply that named no turn_id carries null, not undefined', async () => {
+  const calls = [];
+  const { p } = makeProc({ dispatcher: async (call) => { calls.push(call); return { ok: true, message_id: 5 }; } });
+  addTurn(p, 't-1');
+  await p._dispatchToolCall({
+    kind: 'tool', session: 's', tool_call_id: 'tc-r2', name: 'reply',
+    args: { chat_id: '111', text: 'the answer' },
+  });
+  assert.equal(calls[0].turnId, null);
+});

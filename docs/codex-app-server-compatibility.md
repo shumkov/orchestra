@@ -195,8 +195,30 @@ direct-binary run; it does not clear the broader hosted-tool enforcement gate.
 Live pinned-runtime characterization found the exact profile at top-level
 `activePermissionProfile` in both `thread/start` and `thread/resume`
 responses. The value is fixture-pinned as `{id: "polygram-session",
-extends: null}`. The generated stable response schemas do not declare that
-field, and no matching `thread/settings/updated` notification was observed.
+extends: null}`. Both attachment responses also return exactly one concrete
+`runtimeWorkspaceRoots` entry equal to the owned cwd. Orchestra exposes that
+entry only as `{count: 1, sha256: [sha256(ownedCwd)]}`.
+
+Fresh, resume, and `thread/settings/updated` all return the same legacy
+compatibility envelope:
+
+```json
+{
+  "type": "workspaceWrite",
+  "networkAccess": false,
+  "excludeSlashTmp": true,
+  "excludeTmpdirEnvVar": true,
+  "writableRootCount": 0,
+  "writableRootSha256": []
+}
+```
+
+The zero count means there are no additional legacy writable roots; the
+concrete named-profile workspace grant is attested separately by
+`runtimeWorkspaceRoots`. Settings notifications do not include
+`runtimeWorkspaceRoots`, so Orchestra compares them against a distinct static
+view while retaining the admitted attachment as the concrete-root proof. The
+generated stable response schemas do not declare `activePermissionProfile`.
 
 The named-profile subgate accepts this only as a pinned fresh-plus-resume pair
 and reports:
@@ -205,8 +227,10 @@ and reports:
 - `provenanceSchemaDeclared: false`;
 - `provenanceFragile: true`.
 
-A missing, different, or one-sided value remains a stop. Every Codex pin change
-must regenerate the schema and rerun this live characterization.
+A missing, different, duplicated, additional, outside-workspace, or one-sided
+runtime root remains a stop. Any legacy network, temp-exclusion, type, or
+additional-root drift also remains a stop. Every Codex pin change must
+regenerate the schema and rerun this live characterization.
 
 ## Active-turn steering capability passed; smoke setup remains fragile
 

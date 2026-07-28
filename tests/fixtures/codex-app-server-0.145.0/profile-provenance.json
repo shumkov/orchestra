@@ -5,8 +5,23 @@
     "id": "polygram-session",
     "extends": null
   },
+  "attachmentRuntimeWorkspaceRoots": {
+    "count": 1,
+    "sha256": [
+      "sha256(owned-cwd)"
+    ]
+  },
+  "legacySandbox": {
+    "type": "workspaceWrite",
+    "networkAccess": false,
+    "excludeSlashTmp": true,
+    "excludeTmpdirEnvVar": true,
+    "writableRootCount": 0,
+    "writableRootSha256": []
+  },
+  "settingsIncludesRuntimeWorkspaceRoots": false,
   "freshExact": true,
   "resumeExact": true,
-  "settingsNotificationObserved": false,
+  "settingsNotificationObserved": true,
   "provenance": "Content-free live characterization of pinned Codex 0.145.0; no thread, account, or credential data retained."
 }

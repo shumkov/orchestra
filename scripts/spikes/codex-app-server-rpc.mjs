@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import readline from 'node:readline';
 
 const RPC_TIMEOUT_MS = 20_000;
@@ -149,6 +150,63 @@ function boundedString(value, label, maxBytes = 512) {
   return value;
 }
 
+function requiredBoundedString(value, label, maxBytes = 512) {
+  const bounded = boundedString(value, label, maxBytes);
+  if (bounded === undefined || bounded.length === 0) {
+    throw new Error(`app-server ${label} is required`);
+  }
+  return bounded;
+}
+
+function projectSettingsProfile(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('app-server thread settings omitted permission profile');
+  }
+  const keys = Object.keys(value).sort();
+  if (
+    keys.length !== 2
+    || keys[0] !== 'extends'
+    || keys[1] !== 'id'
+    || !Object.hasOwn(value, 'extends')
+  ) {
+    throw new Error('app-server thread settings permission profile is malformed');
+  }
+  return {
+    id: requiredBoundedString(value.id, 'permission profile id'),
+    extends: value.extends === null
+      ? null
+      : boundedString(value.extends, 'permission profile parent'),
+  };
+}
+
+function projectSettingsSandbox(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('app-server thread settings omitted sandbox policy');
+  }
+  if (
+    !Array.isArray(value.writableRoots)
+    || value.writableRoots.length > 64
+    || typeof value.networkAccess !== 'boolean'
+    || typeof value.excludeSlashTmp !== 'boolean'
+    || typeof value.excludeTmpdirEnvVar !== 'boolean'
+  ) {
+    throw new Error('app-server thread settings sandbox policy is malformed');
+  }
+  const roots = value.writableRoots.map((root) => (
+    boundedString(root, 'sandbox writable root', 4096)
+  ));
+  return {
+    type: requiredBoundedString(value.type, 'sandbox type'),
+    networkAccess: value.networkAccess,
+    excludeSlashTmp: value.excludeSlashTmp,
+    excludeTmpdirEnvVar: value.excludeTmpdirEnvVar,
+    writableRootCount: roots.length,
+    writableRootSha256: roots
+      .map((root) => createHash('sha256').update(root).digest('hex'))
+      .sort(),
+  };
+}
+
 function projectNotification(message) {
   const source = message.params ?? {};
   const params = {};
@@ -158,29 +216,53 @@ function projectNotification(message) {
   if (turnId !== undefined) params.turnId = turnId;
 
   if (message.method === 'thread/settings/updated') {
-    const profile = source.threadSettings?.activePermissionProfile;
+    const settings = source.threadSettings;
+    if (!settings || typeof settings !== 'object' || Array.isArray(settings)) {
+      throw new Error('app-server thread settings are malformed');
+    }
+    if (Object.hasOwn(settings, 'runtimeWorkspaceRoots')) {
+      throw new Error(
+        'app-server thread settings unexpectedly included runtime workspace roots',
+      );
+    }
     const model = boundedString(
-      source.threadSettings?.model,
+      settings.model,
       'thread settings model',
     );
     const effort = boundedString(
-      source.threadSettings?.effort,
+      settings.effort,
       'thread settings effort',
     );
-    if (model !== undefined || effort !== undefined) {
-      params.threadSettings = {};
-      if (model !== undefined) params.threadSettings.model = model;
-      if (effort !== undefined) params.threadSettings.effort = effort;
+    const modelProvider = boundedString(
+      settings.modelProvider,
+      'thread settings model provider',
+    );
+    const approvalPolicy = boundedString(
+      settings.approvalPolicy,
+      'thread settings approval policy',
+    );
+    const approvalsReviewer = boundedString(
+      settings.approvalsReviewer,
+      'thread settings approvals reviewer',
+    );
+    if (
+      modelProvider !== 'openai'
+      || approvalPolicy !== 'never'
+      || approvalsReviewer !== 'user'
+    ) {
+      throw new Error('app-server thread settings static policy drifted');
     }
-    if (profile != null) {
-      params.threadSettings ??= {};
-      params.threadSettings.activePermissionProfile = {
-        id: boundedString(profile.id, 'permission profile id'),
-        extends: profile.extends == null
-          ? null
-          : boundedString(profile.extends, 'permission profile parent'),
-      };
-    }
+    params.threadSettings = {
+      model,
+      effort,
+      modelProvider,
+      approvalPolicy,
+      approvalsReviewer,
+      sandboxPolicy: projectSettingsSandbox(settings.sandboxPolicy),
+      activePermissionProfile: projectSettingsProfile(
+        settings.activePermissionProfile,
+      ),
+    };
   }
 
   if (message.method === 'error') {

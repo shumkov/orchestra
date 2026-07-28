@@ -613,9 +613,6 @@ test('preflight runs through the real U2 client without issuing a mutation', asy
         attestPinnedCodexHome(home, hash, { temporaryRoots: [] })
       ),
     });
-    client._ownedGroupMembers = async () => (
-      client.child?.pid ? [client.child.pid] : []
-    );
     return client;
   };
   const result = await preflightCodexRuntime(profile, {

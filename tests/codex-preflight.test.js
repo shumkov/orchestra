@@ -20,6 +20,7 @@ const {
   buildCodexAppServerEnv,
   CodexAppServerClient,
   protocolSchema,
+  resolveCodexTargetPin,
 } = require('../lib/codex/app-server-client');
 const {
   createCodexSpawnProfile,
@@ -88,6 +89,7 @@ function model(overrides = {}) {
 }
 
 function expectedProfile(overrides = {}) {
+  const targetReceipt = resolveCodexTargetPin();
   const codexHome = '/srv/orchestra/codex-home';
   const env = {
     HOME: '/srv/orchestra',
@@ -101,8 +103,9 @@ function expectedProfile(overrides = {}) {
   return {
     runtime: 'codex',
     binary: '/opt/orchestra/codex-0.145.0',
-    binarySha256: protocolSchema.binarySha256,
-    cliVersion: protocolSchema.cliVersion,
+    target: targetReceipt.target,
+    binarySha256: targetReceipt.binarySha256,
+    cliVersion: targetReceipt.cliVersion,
     protocolSchemaSha256:
       protocolSchema.generatedProtocolV2CanonicalSha256,
     codexHome,
@@ -367,6 +370,7 @@ test('preflight attests static policy before auth/model and returns frozen redac
     isDefault: true,
   }]);
   assert.equal(result.attestation.layerCount, 1);
+  assert.equal(Object.hasOwn(result.attestation, 'target'), false);
   assert.equal(result.attestation.permissionProfile.allowed, true);
   assert.match(
     result.attestation.permissionProfile.idSha256,
@@ -604,10 +608,11 @@ test('preflight runs through the real U2 client without issuing a mutation', asy
       requestTimeoutMs: 1_000,
       closeGraceMs: 100,
       closeKillMs: 200,
-      attestBinaryFn: async (target) => ({
+      attestBinaryFn: async (target, targetReceipt) => ({
         path: target,
-        sha256: protocolSchema.binarySha256,
-        version: protocolSchema.cliVersion,
+        target: targetReceipt.target,
+        sha256: targetReceipt.binarySha256,
+        version: targetReceipt.cliVersion,
       }),
       attestCodexHomeFn: (home, hash) => (
         attestPinnedCodexHome(home, hash, { temporaryRoots: [] })
@@ -1068,8 +1073,13 @@ test('primary preflight failure remains primary when fault handoff also settles'
 });
 
 test('invalid expected profile and environment drift fail before client creation', async () => {
+  const currentTarget = resolveCodexTargetPin();
+  const oppositeTarget = currentTarget.target === 'aarch64-apple-darwin'
+    ? resolveCodexTargetPin('linux', 'x64')
+    : resolveCodexTargetPin('darwin', 'arm64');
   const cases = [
     expectedProfile({ runtime: 'sdk' }),
+    expectedProfile(oppositeTarget),
     expectedProfile({ binarySha256: digest('wrong binary') }),
     expectedProfile({ permissionProfileId: '' }),
     expectedProfile({ effort: null }),

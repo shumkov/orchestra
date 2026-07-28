@@ -17,6 +17,7 @@ const { createProcessFactory } = require('../lib/process/factory');
 const {
   buildCodexAppServerEnv,
   protocolSchema,
+  resolveCodexTargetPin,
 } = require('../lib/codex/app-server-client');
 
 // Minimal fakes so the 'cli' backend wiring is satisfied and the factory
@@ -52,6 +53,7 @@ function digest(value) {
 }
 
 function codexExpectedStaticProfile(overrides = {}) {
+  const targetReceipt = resolveCodexTargetPin();
   const codexHome = '/srv/orchestra/codex-home';
   const env = {
     HOME: '/srv/orchestra',
@@ -86,8 +88,9 @@ function codexExpectedStaticProfile(overrides = {}) {
   return {
     runtime: 'codex',
     binary: '/opt/orchestra/codex-0.145.0',
-    binarySha256: protocolSchema.binarySha256,
-    cliVersion: protocolSchema.cliVersion,
+    target: targetReceipt.target,
+    binarySha256: targetReceipt.binarySha256,
+    cliVersion: targetReceipt.cliVersion,
     protocolSchemaSha256:
       protocolSchema.generatedProtocolV2CanonicalSha256,
     codexHome,

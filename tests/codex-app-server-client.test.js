@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { spawn } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
 const { EventEmitter } = require('node:events');
 const {
@@ -27,6 +27,7 @@ const {
   attestPinnedCodexBinary,
   attestPinnedCodexHome,
   protocolSchema,
+  resolveCodexTargetPin,
 } = require('../lib/codex/app-server-client');
 
 const FIXTURE = path.resolve(__dirname, 'fixtures/fake-codex-app-server.mjs');
@@ -139,10 +140,11 @@ function createHarness(t, scenario = {}) {
       closeKillMs: 200,
       expectedConfigSha256,
       onFault: async () => {},
-      attestBinaryFn: async (binary) => ({
+      attestBinaryFn: async (binary, targetReceipt) => ({
         path: binary,
-        sha256: protocolSchema.binarySha256,
-        version: protocolSchema.cliVersion,
+        target: targetReceipt.target,
+        sha256: targetReceipt.binarySha256,
+        version: targetReceipt.cliVersion,
       }),
       attestCodexHomeFn: (home, expectedHash) => (
         attestPinnedCodexHome(home, expectedHash, { temporaryRoots: [] })
@@ -226,6 +228,73 @@ function methodParams(method, cwd) {
   }
 }
 
+test('Codex target pins resolve lazily to immutable reviewed receipts', () => {
+  const darwin = resolveCodexTargetPin('darwin', 'arm64');
+  const linux = resolveCodexTargetPin('linux', 'x64');
+
+  assert.deepEqual(darwin, {
+    target: 'aarch64-apple-darwin',
+    cliVersion: 'codex-cli 0.145.0',
+    binarySha256:
+      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+  });
+  assert.deepEqual(linux, {
+    target: 'x86_64-unknown-linux-musl',
+    cliVersion: 'codex-cli 0.145.0',
+    binarySha256:
+      'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+  });
+  assert.equal(Object.isFrozen(darwin), true);
+  assert.equal(Object.isFrozen(linux), true);
+  assert.equal(resolveCodexTargetPin('darwin', 'arm64'), darwin);
+  assert.equal(resolveCodexTargetPin('linux', 'x64'), linux);
+  assert.deepEqual(protocolSchema.binarySha256ByTarget, {
+    'aarch64-apple-darwin':
+      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+    'x86_64-unknown-linux-musl':
+      'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+  });
+  assert.equal(
+    protocolSchema.binarySha256,
+    protocolSchema.binarySha256ByTarget['aarch64-apple-darwin'],
+  );
+
+  for (const [platform, arch] of [
+    ['darwin', 'x64'],
+    ['linux', 'arm64'],
+    ['win32', 'x64'],
+    ['freebsd', 'x64'],
+  ]) {
+    assert.throws(
+      () => resolveCodexTargetPin(platform, arch),
+      { code: 'CODEX_UNSUPPORTED_PLATFORM' },
+    );
+  }
+});
+
+test('requiring Orchestra stays inert on an unsupported host until Codex is selected', () => {
+  const entry = path.resolve(__dirname, '..');
+  const child = spawnSync(process.execPath, ['-e', [
+    "Object.defineProperty(process, 'platform', { value: 'freebsd' });",
+    "Object.defineProperty(process, 'arch', { value: 'x64' });",
+    `const pkg = require(${JSON.stringify(entry)});`,
+    "if (typeof pkg.CodexProcess !== 'function') process.exit(2);",
+    'const factory = pkg.createProcessFactory({',
+    "config: { bot: { pm: 'sdk' } },",
+    'spawnFn: () => ({ query: {}, inputController: {} }),',
+    '});',
+    "const claude = factory('claude-only', { runtime: 'claude', chatId: '1' });",
+    "if (!(claude instanceof pkg.SdkProcess) || claude.backend !== 'sdk') process.exit(4);",
+    'try { pkg.resolveCodexTargetPin(); process.exit(3); }',
+    "catch (error) { if (error.code !== 'CODEX_UNSUPPORTED_PLATFORM') throw error; }",
+  ].join('')], {
+    encoding: 'utf8',
+    timeout: 5_000,
+  });
+
+  assert.equal(child.status, 0, child.stderr);
+});
+
 test('start is single-flight, spawns once, and initializes before readiness', async (t) => {
   const harness = createHarness(t, { initializeDelayMs: 50 });
   const spawnCalls = [];
@@ -304,13 +373,14 @@ test('binary attestation completes before spawn is attempted', async (t) => {
   let attestationEntered = false;
   const spawnCalls = [];
   const client = harness.makeClient({
-    attestBinaryFn: async (binary) => {
+    attestBinaryFn: async (binary, targetReceipt) => {
       attestationEntered = true;
       await attestationGate;
       return {
         path: binary,
-        sha256: protocolSchema.binarySha256,
-        version: protocolSchema.cliVersion,
+        target: targetReceipt.target,
+        sha256: targetReceipt.binarySha256,
+        version: targetReceipt.cliVersion,
       };
     },
     spawnFn: (...args) => {
@@ -364,6 +434,36 @@ test('binary pin mismatch prevents spawn', async (t) => {
     () => client.assertHealthy(),
     { code: 'CODEX_BINARY_MISMATCH' },
   );
+});
+
+test('opposite-target binary attestation prevents spawn', async (t) => {
+  const harness = createHarness(t);
+  const targetReceipt = resolveCodexTargetPin();
+  const oppositeTarget = targetReceipt.target === 'aarch64-apple-darwin'
+    ? 'x86_64-unknown-linux-musl'
+    : 'aarch64-apple-darwin';
+  let spawnCalls = 0;
+  const client = harness.makeClient({
+    attestBinaryFn: async (binary) => ({
+      path: binary,
+      target: oppositeTarget,
+      sha256: targetReceipt.binarySha256,
+      version: targetReceipt.cliVersion,
+    }),
+    attestCodexHomeFn: async (codexHome, expectedConfigSha256) => ({
+      path: codexHome,
+      configSha256: expectedConfigSha256,
+      configFingerprint: {},
+      authFingerprint: null,
+    }),
+    spawnFn: (...args) => {
+      spawnCalls += 1;
+      return spawn(...args);
+    },
+  });
+
+  await rejectedWithCode(client.start(), 'CODEX_BINARY_MISMATCH');
+  assert.equal(spawnCalls, 0);
 });
 
 test('production attesters reject unsafe binary and credential metadata', async (t) => {
@@ -467,13 +567,14 @@ test('close during binary attestation prevents a late spawn', async (t) => {
   });
   let spawnCalls = 0;
   const client = harness.makeClient({
-    attestBinaryFn: async (binary) => {
+    attestBinaryFn: async (binary, targetReceipt) => {
       attestationEntered = true;
       await gate;
       return {
         path: binary,
-        sha256: protocolSchema.binarySha256,
-        version: protocolSchema.cliVersion,
+        target: targetReceipt.target,
+        sha256: targetReceipt.binarySha256,
+        version: targetReceipt.cliVersion,
       };
     },
     spawnFn: (...args) => {

@@ -1,12 +1,32 @@
 {
   "cliVersion": "codex-cli 0.145.0",
   "binarySha256": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+  "binarySha256ByTarget": {
+    "aarch64-apple-darwin": "1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590",
+    "x86_64-unknown-linux-musl": "a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14"
+  },
+  "artifactProvenanceByTarget": {
+    "x86_64-unknown-linux-musl": {
+      "npmPackage": "@openai/codex@0.145.0-linux-x64",
+      "npmIntegrity": "sha512-u8w8LLv3DvsfrDCoswLIemZ0SoNEXyi511WsfFsSiYUazk9qMsB/NtU8N9vhAfN7mZAxLFoMex4v66JjHuZWwA=="
+    }
+  },
+  "schemaRawSha256ByTarget": {
+    "aarch64-apple-darwin": {
+      "stableClientRequest": "cc9f6e191a032bdfdc96d768f4ddaba4ced75408017af3ac0dbcc4d00c1faaa8",
+      "stableProtocol": "b6ec47c51bef8a6857dd9435f9919a43ba6616a5a9e3ab25087451cbc93d9f06",
+      "experimentalClientRequest": "03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c",
+      "experimentalProtocol": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68"
+    },
+    "x86_64-unknown-linux-musl": {
+      "stableClientRequest": "44615d6348466a48c05228d99eb555d1d655aaffc1474fb0abdd7f4945502e35",
+      "stableProtocol": "8a9694a5508a95ba4a48b1ba43551f88b704dbe6cd0c4f9f04f330d3166d2930",
+      "experimentalClientRequest": "03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c",
+      "experimentalProtocol": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68"
+    }
+  },
   "schemaSha256": {
-    "stableClientRequest": "cc9f6e191a032bdfdc96d768f4ddaba4ced75408017af3ac0dbcc4d00c1faaa8",
-    "stableProtocol": "b6ec47c51bef8a6857dd9435f9919a43ba6616a5a9e3ab25087451cbc93d9f06",
     "stableProtocolV2Canonical": "02d8bf6651cd504bff0335f566c011e51ba77c5cc0538cb64ca7ac57739a1597",
-    "experimentalClientRequest": "03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c",
-    "experimentalProtocol": "1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68",
     "experimentalProtocolV2Canonical": "1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb"
   },
   "observations": {

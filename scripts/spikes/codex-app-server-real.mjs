@@ -19,7 +19,7 @@ import {
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { createSocket } from 'node:dgram';
-import { createServer } from 'node:net';
+import { createServer, isIP } from 'node:net';
 import { tmpdir } from 'node:os';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
@@ -44,6 +44,7 @@ const require = createRequire(import.meta.url);
 const {
   attestPinnedCodexBinary: attestProductionCodexBinary,
   protocolSchema: productionProtocolSchema,
+  resolveCodexTargetPin,
 } = require('../../lib/codex/app-server-client.js');
 const fixtureDir = resolve(here, '../../tests/fixtures/codex-app-server-0.145.0');
 const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf8'));
@@ -63,7 +64,14 @@ const MAX_RESUME_EVIDENCE_ITEMS_PER_TURN = 1_000;
 const TRACKED_TERMINAL_SLEEP_SECONDS = 120;
 const PROCESS_CANARY_LIFETIME_MS = 90_000;
 const SIDE_CHANNEL_TIMEOUT_MS = 10_000;
+const DATAGRAM_SETTLE_MS = 1_500;
+const LINUX_PROBE_HELPER_FAILURE_EXIT_CODE = 47;
+const LINUX_PID_NAMESPACE_DENIAL_EXIT_CODE = 48;
+const LINUX_PROBE_HELPER_INPUT = 'orchestra-u1a';
+const LINUX_PROBE_HELPER_SHA256 =
+  '1c7d76214677a0a580766b8faf64b8b2468c657f8ba5d92dc90c02ffc9e19c23';
 const DARWIN_UNIX_SOCKET_PATH_MAX_BYTES = 103;
+const LINUX_UNIX_SOCKET_PATH_MAX_BYTES = 107;
 const PROFILE_ID = 'polygram-session';
 const CONTROLLED_PATH = '/usr/bin:/bin';
 const DAEMON_SECRET_PROBE = '.orchestra-codex-u1a-deny-probe';
@@ -80,6 +88,11 @@ function parseArgs(argv) {
     launcher: process.env.ORCHESTRA_SESSION_LAUNCHER ?? '',
     codexHome: process.env.ORCHESTRA_CODEX_HOME ?? '',
     workspace: process.env.ORCHESTRA_CODEX_WORKSPACE ?? '',
+    tmpdir: process.env.ORCHESTRA_CODEX_TMPDIR ?? '',
+    externalNetworkHost:
+      process.env.ORCHESTRA_CODEX_EXTERNAL_NETWORK_HOST ?? '',
+    externalNetworkPort:
+      process.env.ORCHESTRA_CODEX_EXTERNAL_NETWORK_PORT ?? '',
     daemonSecretRoots: [],
   };
   let explicitDaemonRoots = false;
@@ -90,6 +103,13 @@ function parseArgs(argv) {
     else if (arg === '--launcher') options.launcher = argv[++index] ?? '';
     else if (arg === '--codex-home') options.codexHome = argv[++index] ?? '';
     else if (arg === '--workspace') options.workspace = argv[++index] ?? '';
+    else if (arg === '--tmpdir') options.tmpdir = argv[++index] ?? '';
+    else if (arg === '--external-network-host') {
+      options.externalNetworkHost = argv[++index] ?? '';
+    }
+    else if (arg === '--external-network-port') {
+      options.externalNetworkPort = argv[++index] ?? '';
+    }
     else if (arg === '--daemon-secret-root') {
       if (!explicitDaemonRoots) {
         options.daemonSecretRoots = [];
@@ -105,6 +125,42 @@ function parseArgs(argv) {
     ).split(delimiter).filter(Boolean);
   }
   return options;
+}
+
+function validateExternalNetworkProbe(options, target) {
+  if (target !== 'x86_64-unknown-linux-musl') return;
+  const port = Number(options.externalNetworkPort);
+  if (
+    !isPublicIpv4Address(options.externalNetworkHost)
+    || !Number.isSafeInteger(port)
+    || port < 1
+    || port > 65_535
+  ) {
+    throw new Error(
+      'pass a valid public IPv4 external network probe with '
+      + '--external-network-host and --external-network-port',
+    );
+  }
+  options.externalNetworkPort = port;
+}
+
+function isPublicIpv4Address(address) {
+  if (typeof address !== 'string' || isIP(address) !== 4) return false;
+  const [first, second] = address.split('.').map(Number);
+  return !(
+    first === 0
+    || first === 10
+    || first === 127
+    || first >= 224
+    || (first === 100 && second >= 64 && second <= 127)
+    || (first === 169 && second === 254)
+    || (first === 172 && second >= 16 && second <= 31)
+    || (first === 192 && second === 0)
+    || (first === 192 && second === 168)
+    || (first === 198 && (second === 18 || second === 19))
+    || (first === 198 && second === 51)
+    || (first === 203 && second === 0)
+  );
 }
 
 function sha256(path) {
@@ -148,13 +204,51 @@ function validateExecutable(path, label) {
 }
 
 export async function attestPinnedCodexBinary(options) {
+  const targetReceipt = resolveCodexTargetPin();
   if (
-    productionProtocolSchema.binarySha256 !== manifest.binarySha256
-    || productionProtocolSchema.cliVersion !== manifest.cliVersion
+    !isDeepStrictEqual(
+      productionProtocolSchema.binarySha256ByTarget,
+      manifest.binarySha256ByTarget,
+    )
+    || targetReceipt.binarySha256
+      !== manifest.binarySha256ByTarget[targetReceipt.target]
+    || targetReceipt.cliVersion !== manifest.cliVersion
   ) throw new Error('production Codex binary pin differs from the U1 fixture');
-  await attestProductionCodexBinary(options.binary);
+  await attestProductionCodexBinary(options.binary, targetReceipt);
   if (options.launcher) validateExecutable(options.launcher, 'session launcher');
   return true;
+}
+
+const RAW_SCHEMA_HASH_KEYS = [
+  'experimentalClientRequest',
+  'experimentalProtocol',
+  'stableClientRequest',
+  'stableProtocol',
+];
+
+export function selectRawSchemaHashes(target) {
+  const byTarget = manifest.schemaRawSha256ByTarget;
+  const targets = Object.keys(byTarget ?? {}).sort();
+  const expectedTargets = Object.keys(
+    manifest.binarySha256ByTarget ?? {},
+  ).sort();
+  if (
+    !isDeepStrictEqual(targets, expectedTargets)
+    || targets.some((candidate) => {
+      const hashes = byTarget[candidate];
+      return (
+        !hashes
+        || !isDeepStrictEqual(Object.keys(hashes).sort(), RAW_SCHEMA_HASH_KEYS)
+        || Object.values(hashes).some(
+          (hash) => !/^[a-f0-9]{64}$/.test(hash),
+        )
+      );
+    })
+    || !Object.hasOwn(byTarget, target)
+  ) {
+    throw new Error('target raw schema provenance is incomplete');
+  }
+  return byTarget[target];
 }
 
 function isWithin(root, candidate) {
@@ -267,6 +361,41 @@ export function validateDaemonSecretRoots(paths, codexHome, workspace) {
     }
   }
   return roots;
+}
+
+export function validateChildTmpdir(
+  path,
+  codexHome,
+  workspace,
+  daemonSecretRoots,
+  target,
+) {
+  if (target !== 'x86_64-unknown-linux-musl') return undefined;
+  if (!path) throw new Error('pass --tmpdir or ORCHESTRA_CODEX_TMPDIR');
+  const canonical = canonicalExistingPath(path, 'child TMPDIR');
+  const link = lstatSync(canonical);
+  const directory = statSync(canonical);
+  if (link.isSymbolicLink() || !directory.isDirectory()) {
+    throw new Error('child TMPDIR must be a real directory');
+  }
+  if ((directory.mode & 0o777) !== 0o700) {
+    throw new Error('child TMPDIR permissions must be 0700');
+  }
+  if (directory.uid !== process.getuid?.()) {
+    throw new Error('child TMPDIR must be owned by the service user');
+  }
+  if (
+    isWithin(canonical, codexHome)
+    || isWithin(codexHome, canonical)
+    || isWithin(canonical, workspace)
+    || isWithin(workspace, canonical)
+  ) {
+    throw new Error('child TMPDIR must be separate from CODEX_HOME and workspace');
+  }
+  if (!daemonSecretRoots.includes(canonical)) {
+    throw new Error('child TMPDIR must also be a supplied daemon secret root');
+  }
+  return canonical;
 }
 
 function ownedProfileConfig(codexHome, workspace, daemonSecretRoots) {
@@ -558,28 +687,24 @@ export function evaluateSteeringGate(evidence) {
   };
 }
 
-const SAME_USER_SIDE_CHANNEL_CHECKS = [
+const SAME_USER_SIDE_CHANNEL_PROCESS_CHECKS = [
   ['processHostControl', (evidence) => evidence.processHostControl === true],
   [
     'processArgvDenied',
     (evidence) => evidence.processArgvInspectionExitCode === 0,
   ],
-  ['debuggerHostControl', (evidence) => evidence.debuggerHostControl === true],
-  [
-    'debuggerDenied',
-    (evidence) => (
-      Number.isSafeInteger(evidence.debuggerExitCode)
-      && evidence.debuggerExitCode !== 0
-    ),
-  ],
-  ['keychainHostControl', (evidence) => evidence.keychainHostControl === true],
-  ['keychainDenied', (evidence) => evidence.keychainExitCode === 0],
+];
+const SAME_USER_SIDE_CHANNEL_NETWORK_AND_CLEANUP_CHECKS = [
   ['tcpHostControl', (evidence) => evidence.tcpHostControl === true],
   [
     'tcpDenied',
     (evidence) => (
       Number.isSafeInteger(evidence.tcpExitCode)
       && evidence.tcpExitCode !== 0
+      && (
+        evidence.platform !== 'linux'
+        || evidence.tcpExitCode !== LINUX_PROBE_HELPER_FAILURE_EXIT_CODE
+      )
       && evidence.tcpCanaryReached === false
     ),
   ],
@@ -588,6 +713,11 @@ const SAME_USER_SIDE_CHANNEL_CHECKS = [
     'udpDenied',
     (evidence) => (
       Number.isSafeInteger(evidence.udpCommandExitCode)
+      && (
+        evidence.platform !== 'linux'
+        || evidence.udpCommandExitCode
+          !== LINUX_PROBE_HELPER_FAILURE_EXIT_CODE
+      )
       && evidence.udpCanaryReached === false
     ),
   ],
@@ -596,6 +726,11 @@ const SAME_USER_SIDE_CHANNEL_CHECKS = [
     'dnsProtocolDenied',
     (evidence) => (
       Number.isSafeInteger(evidence.dnsCommandExitCode)
+      && (
+        evidence.platform !== 'linux'
+        || evidence.dnsCommandExitCode
+          !== LINUX_PROBE_HELPER_FAILURE_EXIT_CODE
+      )
       && evidence.dnsCanaryReached === false
     ),
   ],
@@ -608,6 +743,11 @@ const SAME_USER_SIDE_CHANNEL_CHECKS = [
     (evidence) => (
       Number.isSafeInteger(evidence.unixSocketExitCode)
       && evidence.unixSocketExitCode !== 0
+      && (
+        evidence.platform !== 'linux'
+        || evidence.unixSocketExitCode
+          !== LINUX_PROBE_HELPER_FAILURE_EXIT_CODE
+      )
       && evidence.unixSocketCanaryReached === false
     ),
   ],
@@ -623,11 +763,87 @@ const SAME_USER_SIDE_CHANNEL_CHECKS = [
     'processCanaryCleanup',
     (evidence) => evidence.processCanaryCleanup === true,
   ],
-  ['keychainCleanup', (evidence) => evidence.keychainCleanup === true],
 ];
 
 export function evaluateSameUserSideChannelProbe(evidence) {
-  const failedChecks = SAME_USER_SIDE_CHANNEL_CHECKS
+  const checks = evidence?.platform === 'darwin'
+    ? [
+        ...SAME_USER_SIDE_CHANNEL_PROCESS_CHECKS,
+        ['debuggerHostControl', (value) => value.debuggerHostControl === true],
+        [
+          'debuggerDenied',
+          (value) => (
+            Number.isSafeInteger(value.debuggerExitCode)
+            && value.debuggerExitCode !== 0
+          ),
+        ],
+        ['keychainHostControl', (value) => (
+          value.keychainApplicable === true
+          && value.keychainHostControl === true
+        )],
+        ['keychainDenied', (value) => value.keychainExitCode === 0],
+        ...SAME_USER_SIDE_CHANNEL_NETWORK_AND_CLEANUP_CHECKS,
+        ['keychainCleanup', (value) => value.keychainCleanup === true],
+      ]
+    : evidence?.platform === 'linux'
+      ? [
+          ...SAME_USER_SIDE_CHANNEL_PROCESS_CHECKS,
+          [
+            'procEnvironmentHostControl',
+            (value) => value.procEnvironmentHostControl === true,
+          ],
+          [
+            'procEnvironmentDenied',
+            (value) => value.procEnvironmentExitCode === 0,
+          ],
+          [
+            'procFileDescriptorHostControl',
+            (value) => value.procFileDescriptorHostControl === true,
+          ],
+          [
+            'procFileDescriptorDenied',
+            (value) => value.procFileDescriptorExitCode === 0,
+          ],
+          ['debuggerHostControl', (value) => (
+            value.debuggerHostControl === true
+          )],
+          ['processHostControlAfter', (value) => (
+            value.processHostControlAfter === true
+          )],
+          ['debuggerHostControlAfter', (value) => (
+            value.debuggerHostControlAfter === true
+          )],
+          ['debuggerDenied', (value) => (
+            value.debuggerExitCode === 0
+            || (
+              value.debuggerExitCode
+                === LINUX_PID_NAMESPACE_DENIAL_EXIT_CODE
+              && value.processHostControl === true
+              && value.debuggerHostControl === true
+              && value.processHostControlAfter === true
+              && value.debuggerHostControlAfter === true
+            )
+          )],
+          ['keychainInapplicable', (value) => (
+            value.keychainApplicable === false
+            && value.keychainInapplicable === true
+          )],
+          ['externalNetworkHostControlBefore', (value) => (
+            value.externalNetworkHostControlBefore === true
+          )],
+          ['externalNetworkHostControlAfter', (value) => (
+            value.externalNetworkHostControlAfter === true
+          )],
+          ['externalNetworkDenied', (value) => (
+            Number.isSafeInteger(value.externalNetworkExitCode)
+            && value.externalNetworkExitCode !== 0
+            && value.externalNetworkExitCode
+              !== LINUX_PROBE_HELPER_FAILURE_EXIT_CODE
+          )],
+          ...SAME_USER_SIDE_CHANNEL_NETWORK_AND_CLEANUP_CHECKS,
+        ]
+      : [['platformSupported', () => false]];
+  const failedChecks = checks
     .filter(([, passed]) => !passed(evidence))
     .map(([name]) => name);
   return {
@@ -679,6 +895,32 @@ export function runCommand(
     timeout: timeoutMs,
     killSignal: 'SIGKILL',
   });
+}
+
+export function buildSandboxSelfTestArgs(
+  permissionProfileId = PROFILE_ID,
+  command = ['/bin/true'],
+) {
+  if (
+    typeof permissionProfileId !== 'string'
+    || permissionProfileId.length === 0
+    || !Array.isArray(command)
+    || command.length === 0
+    || command.some((value) => typeof value !== 'string' || value.length === 0)
+  ) {
+    throw new Error('sandbox self-test arguments are invalid');
+  }
+  return [
+    'sandbox',
+    '--permission-profile',
+    permissionProfileId,
+    '--',
+    ...command,
+  ];
+}
+
+export function shouldRunSandboxSelfTest(target) {
+  return target === 'x86_64-unknown-linux-musl';
 }
 
 export function buildSchemaGenerationArgs(out, experimental = false) {
@@ -900,14 +1142,66 @@ function requireSuccess(result, operation) {
   if (result.status !== 0) throw new Error(`${operation} exited ${result.status}`);
 }
 
-function assertHash(path, expected, label) {
-  const actual = sha256(path);
-  if (actual !== expected) throw new Error(`${label} schema hash mismatch`);
+export function assertGeneratedRawSchemaHashes(
+  stableDirectory,
+  experimentalDirectory,
+  target,
+  hashFile = sha256,
+) {
+  const expected = selectRawSchemaHashes(target);
+  const checks = [
+    [
+      join(stableDirectory, 'ClientRequest.json'),
+      expected.stableClientRequest,
+      'stable ClientRequest',
+    ],
+    [
+      join(stableDirectory, 'codex_app_server_protocol.schemas.json'),
+      expected.stableProtocol,
+      'stable protocol',
+    ],
+    [
+      join(experimentalDirectory, 'ClientRequest.json'),
+      expected.experimentalClientRequest,
+      'experimental ClientRequest',
+    ],
+    [
+      join(experimentalDirectory, 'codex_app_server_protocol.schemas.json'),
+      expected.experimentalProtocol,
+      'experimental protocol',
+    ],
+  ];
+  for (const [path, expectedHash, label] of checks) {
+    if (hashFile(path) !== expectedHash) {
+      throw new Error(`${label} schema hash mismatch`);
+    }
+  }
+  return true;
 }
 
-function assertCanonicalHash(value, expected, label) {
-  const actual = canonicalJsonSha256(value);
-  if (actual !== expected) throw new Error(`${label} canonical schema hash mismatch`);
+export function assertGeneratedV2CanonicalHashes(
+  stableSchema,
+  experimentalSchema,
+  hashValue = canonicalJsonSha256,
+) {
+  const checks = [
+    [
+      stableSchema,
+      manifest.schemaSha256.stableProtocolV2Canonical,
+      'stable v2 protocol',
+    ],
+    [
+      experimentalSchema,
+      manifest.schemaSha256.experimentalProtocolV2Canonical,
+      'experimental v2 protocol',
+    ],
+  ];
+  for (const [schema, expectedHash, label] of checks) {
+    if (hashValue(schema) !== expectedHash) {
+      throw new Error(`${label} canonical schema hash mismatch`);
+    }
+  }
+  return true;
 }
 
 function assertStableProfileSurfaces(clientRequestSchema, protocolSchema) {
@@ -947,7 +1241,7 @@ export function sanitizedAppServerEnv(options) {
     Object.entries({
       HOME: process.env.HOME,
       PATH: CONTROLLED_PATH,
-      TMPDIR: process.env.TMPDIR,
+      TMPDIR: options.childTmpdir ?? process.env.TMPDIR,
       LANG: process.env.LANG,
       LC_ALL: process.env.LC_ALL,
       CODEX_HOME: options.codexHome,
@@ -1805,19 +2099,59 @@ function assertCanaryHash(hash) {
   }
 }
 
-export function buildProcessArgvInspectionCommand(pid, canaryHash) {
+export function buildProcessArgvInspectionCommand(
+  pid,
+  canaryHash,
+  platform = 'darwin',
+) {
   if (!Number.isSafeInteger(pid) || pid < 2) {
     throw new Error('process canary identifier is invalid');
   }
   assertCanaryHash(canaryHash);
+  const readCommand = platform === 'linux'
+    ? '/usr/bin/tr "\\000" "\\n" < "/proc/$1/cmdline" 2>/dev/null'
+    : '/bin/ps -ww -p "$1" -o command= 2>/dev/null | /usr/bin/tr " " "\\n"';
+  const hashCommand = platform === 'linux'
+    ? '/usr/bin/sha256sum'
+    : '/usr/bin/shasum -a 256';
+  if (!['darwin', 'linux'].includes(platform)) {
+    throw new Error('process canary platform is invalid');
+  }
+  if (platform === 'linux') {
+    return [
+      '/bin/sh',
+      '-c',
+      [
+        `helper=$(printf %s "${LINUX_PROBE_HELPER_INPUT}"`,
+        '| /usr/bin/sha256sum 2>/dev/null) || exit 47;',
+        `[ "\${helper%% *}" = "${LINUX_PROBE_HELPER_SHA256}" ] || exit 47;`,
+        'translated=$(printf "orchestra\\000" |',
+        '/usr/bin/tr "\\000" "\\n" 2>/dev/null) || exit 47;',
+        '[ "$translated" = "orchestra" ] || exit 47;',
+        'content=$(/usr/bin/tr "\\000" "\\n" < "/proc/$1/cmdline"',
+        '2>/dev/null) || exit 0;',
+        'printf "%s\\n" "$content" | while IFS= read -r word; do',
+        'hash=$(printf %s "$word" | /usr/bin/sha256sum 2>/dev/null)',
+        '|| exit 47;',
+        '[ "${hash%% *}" = "$2" ] && exit 41;',
+        'done;',
+        'status=$?;',
+        '[ "$status" -eq 41 ] && exit 41;',
+        '[ "$status" -eq 47 ] && exit 47;',
+        'exit 0',
+      ].join(' '),
+      'orchestra-u1a',
+      String(pid),
+      canaryHash,
+    ];
+  }
   return [
     '/bin/sh',
     '-c',
     [
-      '/bin/ps -ww -p "$1" -o command= 2>/dev/null',
-      '| /usr/bin/tr " " "\\n"',
+      readCommand,
       '| while IFS= read -r word; do',
-      'printf %s "$word" | /usr/bin/shasum -a 256 | /usr/bin/cut -d " " -f 1;',
+      `printf %s "$word" | ${hashCommand} | /usr/bin/cut -d " " -f 1;`,
       'done',
       '| /usr/bin/grep -F -x "$2" >/dev/null',
       '&& exit 41;',
@@ -1829,7 +2163,47 @@ export function buildProcessArgvInspectionCommand(pid, canaryHash) {
   ];
 }
 
-export function buildInheritedDescriptorProbeCommand(descriptor, canaryHash) {
+export function buildProcEnvironmentInspectionCommand(pid, canaryHash) {
+  if (!Number.isSafeInteger(pid) || pid < 2) {
+    throw new Error('process canary identifier is invalid');
+  }
+  assertCanaryHash(canaryHash);
+  return [
+    '/bin/sh',
+    '-c',
+    [
+      `helper=$(printf %s "${LINUX_PROBE_HELPER_INPUT}"`,
+      '| /usr/bin/sha256sum 2>/dev/null) || exit 47;',
+      `[ "\${helper%% *}" = "${LINUX_PROBE_HELPER_SHA256}" ] || exit 47;`,
+      'translated=$(printf "orchestra\\000" |',
+      '/usr/bin/tr "\\000" "\\n" 2>/dev/null) || exit 47;',
+      '[ "$translated" = "orchestra" ] || exit 47;',
+      'content=$(/usr/bin/tr "\\000" "\\n" < "/proc/$1/environ"',
+      '2>/dev/null) || exit 0;',
+      'printf "%s\\n" "$content" | while IFS= read -r entry; do',
+      'hash=$(printf %s "$entry" | /usr/bin/sha256sum 2>/dev/null)',
+      '|| exit 47;',
+      '[ "${hash%% *}" = "$2" ] && exit 44;',
+      'done;',
+      'status=$?;',
+      '[ "$status" -eq 44 ] && exit 44;',
+      '[ "$status" -eq 47 ] && exit 47;',
+      'exit 0',
+    ].join(' '),
+    'orchestra-u1a',
+    String(pid),
+    canaryHash,
+  ];
+}
+
+export function buildProcFileDescriptorInspectionCommand(
+  pid,
+  descriptor,
+  canaryHash,
+) {
+  if (!Number.isSafeInteger(pid) || pid < 2) {
+    throw new Error('process canary identifier is invalid');
+  }
   if (!Number.isSafeInteger(descriptor) || descriptor < 3) {
     throw new Error('descriptor canary identifier is invalid');
   }
@@ -1838,8 +2212,65 @@ export function buildInheritedDescriptorProbeCommand(descriptor, canaryHash) {
     '/bin/sh',
     '-c',
     [
-      'if [ -f "/dev/fd/$1" ]; then',
-      'hash=$(/usr/bin/shasum -a 256 "/dev/fd/$1" 2>/dev/null',
+      `helper=$(printf %s "${LINUX_PROBE_HELPER_INPUT}"`,
+      '| /usr/bin/sha256sum 2>/dev/null) || exit 47;',
+      `[ "\${helper%% *}" = "${LINUX_PROBE_HELPER_SHA256}" ] || exit 47;`,
+      'hash=$(/usr/bin/sha256sum "/proc/$1/fd/$2" 2>/dev/null)',
+      '|| exit 0;',
+      '[ "${hash%% *}" = "$3" ] && exit 45;',
+      'exit 0',
+    ].join(' '),
+    'orchestra-u1a',
+    String(pid),
+    String(descriptor),
+    canaryHash,
+  ];
+}
+
+export function buildInheritedDescriptorProbeCommand(
+  descriptor,
+  canaryHash,
+  platform = 'darwin',
+) {
+  if (!Number.isSafeInteger(descriptor) || descriptor < 3) {
+    throw new Error('descriptor canary identifier is invalid');
+  }
+  assertCanaryHash(canaryHash);
+  if (!['darwin', 'linux'].includes(platform)) {
+    throw new Error('descriptor canary platform is invalid');
+  }
+  const descriptorPath = platform === 'linux'
+    ? '/proc/self/fd/$1'
+    : '/dev/fd/$1';
+  const hashCommand = platform === 'linux'
+    ? '/usr/bin/sha256sum'
+    : '/usr/bin/shasum -a 256';
+  if (platform === 'linux') {
+    return [
+      '/bin/sh',
+      '-c',
+      [
+        `helper=$(printf %s "${LINUX_PROBE_HELPER_INPUT}"`,
+        '| /usr/bin/sha256sum 2>/dev/null) || exit 47;',
+        `[ "\${helper%% *}" = "${LINUX_PROBE_HELPER_SHA256}" ] || exit 47;`,
+        'if [ -f "/proc/self/fd/$1" ]; then',
+        'hash=$(/usr/bin/sha256sum "/proc/self/fd/$1" 2>/dev/null)',
+        '|| exit 0;',
+        '[ "${hash%% *}" = "$2" ] && exit 43;',
+        'fi;',
+        'exit 0',
+      ].join(' '),
+      'orchestra-u1a',
+      String(descriptor),
+      canaryHash,
+    ];
+  }
+  return [
+    '/bin/sh',
+    '-c',
+    [
+      `if [ -f "${descriptorPath}" ]; then`,
+      `hash=$(${hashCommand} "${descriptorPath}" 2>/dev/null`,
       '| /usr/bin/cut -d " " -f 1);',
       '[ "$hash" = "$2" ] && exit 43;',
       'fi;',
@@ -1892,29 +2323,170 @@ function createInheritedDescriptorCanary(daemonSecretRoot) {
   }
 }
 
-function resolveSideChannelUtility(path, label) {
+export function resolveSideChannelUtility(
+  path,
+  label,
+  { resolveSymlink = false } = {},
+) {
   try {
-    validateExecutable(path, label);
-    return realpathSync(path);
+    const candidate = resolveSymlink ? realpathSync(path) : path;
+    validateExecutable(candidate, label);
+    return realpathSync(candidate);
   } catch {
     throw new Error(`required side-channel ${label} is unavailable`);
   }
 }
 
-function resolveSideChannelUtilities() {
-  if (process.platform !== 'darwin') {
-    throw new Error('same-user side-channel probe is not implemented for this platform');
+function resolveSideChannelUtilities(platform = process.platform) {
+  if (platform === 'darwin') {
+    return {
+      dig: resolveSideChannelUtility('/usr/bin/dig', 'DNS probe'),
+      ps: resolveSideChannelUtility('/bin/ps', 'process probe'),
+      sample: resolveSideChannelUtility('/usr/bin/sample', 'debugger probe'),
+      security: resolveSideChannelUtility('/usr/bin/security', 'Keychain probe'),
+    };
   }
-  return {
-    dig: resolveSideChannelUtility('/usr/bin/dig', 'DNS probe'),
-    ps: resolveSideChannelUtility('/bin/ps', 'process probe'),
-    sample: resolveSideChannelUtility('/usr/bin/sample', 'debugger probe'),
-    security: resolveSideChannelUtility('/usr/bin/security', 'Keychain probe'),
-  };
+  if (platform === 'linux') {
+    return {
+      dig: resolveSideChannelUtility('/usr/bin/dig', 'DNS probe'),
+      python: resolveSideChannelUtility(
+        '/usr/bin/python3',
+        'process canary',
+        { resolveSymlink: true },
+      ),
+      strace: resolveSideChannelUtility('/usr/bin/strace', 'debugger probe'),
+    };
+  }
+  throw new Error('same-user side-channel probe is not implemented for this platform');
 }
 
-function startSingleProcessCanary() {
+export function buildDebuggerInspectionCommand(
+  debuggerBinary,
+  pid,
+  platform = 'darwin',
+  diagnosticDirectory,
+) {
+  if (
+    typeof debuggerBinary !== 'string'
+    || debuggerBinary.length === 0
+    || !Number.isSafeInteger(pid)
+    || pid < 2
+  ) {
+    throw new Error('debugger probe arguments are invalid');
+  }
+  if (platform === 'darwin') {
+    return [
+      debuggerBinary,
+      String(pid),
+      '1',
+      '10',
+      '-file',
+      '/dev/null',
+    ];
+  }
+  if (platform === 'linux') {
+    if (
+      typeof diagnosticDirectory !== 'string'
+      || !isAbsolute(diagnosticDirectory)
+    ) {
+      throw new Error('debugger diagnostic directory is invalid');
+    }
+    return [
+      '/bin/sh',
+      '-c',
+      [
+        'error_file=$(/usr/bin/mktemp',
+        '"$3/.orchestra-strace.XXXXXX") || exit 47;',
+        'trap \'/bin/rm -f "$error_file"\' EXIT;',
+        'LC_ALL=C "$1" -qq -e trace=none -p "$2" -o /dev/null',
+        '>/dev/null 2>"$error_file" & tracer=$!;',
+        '/bin/sleep 1;',
+        'result=47;',
+        'if /bin/kill -0 "$tracer" 2>/dev/null; then',
+        '/bin/kill "$tracer" 2>/dev/null;',
+        'wait "$tracer" 2>/dev/null;',
+        'result=46;',
+        'else',
+        'wait "$tracer" 2>/dev/null; status=$?;',
+        'if [ "$status" -eq 1 ]',
+        '&& /usr/bin/grep -Eq',
+        '"Operation not permitted|Permission denied" "$error_file"; then',
+        'result=0;',
+        'elif [ "$status" -eq 1 ]',
+        '&& /usr/bin/grep -Eq',
+        "'(^|: )(ESRCH|No such process)$' \"$error_file\"; then",
+        `result=${LINUX_PID_NAMESPACE_DENIAL_EXIT_CODE};`,
+        'fi;',
+        'fi;',
+        '/bin/rm -f "$error_file" || exit 47;',
+        '[ ! -e "$error_file" ] || exit 47;',
+        'trap - EXIT;',
+        'exit "$result"',
+      ].join(' '),
+      'orchestra-u1a',
+      debuggerBinary,
+      String(pid),
+      diagnosticDirectory,
+    ];
+  }
+  throw new Error('debugger probe platform is invalid');
+}
+
+function startSingleProcessCanary(
+  platform = process.platform,
+  inheritedDescriptor,
+  pythonBinary,
+) {
   const canary = randomUUID();
+  if (platform === 'linux') {
+    if (
+      !inheritedDescriptor
+      || !Number.isSafeInteger(inheritedDescriptor.descriptor)
+      || typeof pythonBinary !== 'string'
+    ) {
+      throw new Error('Linux process canary inputs are invalid');
+    }
+    const environmentCanary = randomUUID();
+    const child = spawn(
+      pythonBinary,
+      [
+        '-c',
+        [
+          'import ctypes, signal, sys, time',
+          'libc = ctypes.CDLL(None, use_errno=True)',
+          'if libc.prctl(0x59616d61, -1, 0, 0, 0) != 0: sys.exit(71)',
+          'signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))',
+          'time.sleep(float(sys.argv[1]))',
+        ].join('\n'),
+        String(PROCESS_CANARY_LIFETIME_MS / 1_000),
+        canary,
+      ],
+      {
+        env: {
+          PATH: CONTROLLED_PATH,
+          ORCHESTRA_PROCESS_CANARY: environmentCanary,
+        },
+        stdio: [
+          'ignore',
+          'ignore',
+          'ignore',
+          inheritedDescriptor.descriptor,
+        ],
+      },
+    );
+    return {
+      child,
+      descriptor: 3,
+      environmentHash: createHash('sha256')
+        .update(`ORCHESTRA_PROCESS_CANARY=${environmentCanary}`)
+        .digest('hex'),
+      hash: createHash('sha256').update(canary).digest('hex'),
+      value: canary,
+    };
+  }
+  if (platform !== 'darwin') {
+    throw new Error('process canary platform is invalid');
+  }
   const child = spawn(
     process.execPath,
     [
@@ -1998,14 +2570,33 @@ function waitForStreamConnection(server, timeoutMs = 1_500) {
   });
 }
 
-function waitForDatagram(server, timeoutMs = 1_500) {
-  return new Promise((resolvePromise) => {
-    const timeout = setTimeout(() => resolvePromise(false), timeoutMs);
-    server.once('message', () => {
-      clearTimeout(timeout);
-      resolvePromise(true);
-    });
-  });
+export async function observeDatagramThroughCommand(
+  server,
+  runCommand,
+  settleMs = DATAGRAM_SETTLE_MS,
+) {
+  if (
+    !server
+    || typeof server.on !== 'function'
+    || typeof server.off !== 'function'
+    || typeof runCommand !== 'function'
+    || !Number.isSafeInteger(settleMs)
+    || settleMs < 0
+  ) {
+    throw new Error('datagram observer inputs are invalid');
+  }
+  let reached = false;
+  const observe = () => {
+    reached = true;
+  };
+  server.on('message', observe);
+  try {
+    const result = await runCommand();
+    await delay(settleMs);
+    return { result, reached };
+  } finally {
+    server.off('message', observe);
+  }
 }
 
 function closeStreamCanary(server) {
@@ -2083,14 +2674,49 @@ export function runHostSideChannelCommandAsync(command) {
   });
 }
 
-export function buildUnixSocketProbeCommand(networkProbeBinary, socketPath) {
+function buildCheckedNetworkProbeCommand(command) {
   if (
-    typeof socketPath !== 'string'
-    || Buffer.byteLength(socketPath) > DARWIN_UNIX_SOCKET_PATH_MAX_BYTES
+    !Array.isArray(command)
+    || command.length === 0
+    || command.some((value) => typeof value !== 'string' || value.length === 0)
   ) {
-    throw new Error('Unix-socket canary path exceeds the macOS limit');
+    throw new Error('network probe command is invalid');
   }
   return [
+    '/bin/sh',
+    '-c',
+    [
+      '"$@" >/dev/null 2>&1;',
+      'status=$?;',
+      'if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then',
+      'exit 47;',
+      'fi;',
+      'exit "$status"',
+    ].join(' '),
+    'orchestra-u1a',
+    ...command,
+  ];
+}
+
+export function buildUnixSocketProbeCommand(
+  networkProbeBinary,
+  socketPath,
+  platform = 'darwin',
+) {
+  const pathLimit = platform === 'linux'
+    ? LINUX_UNIX_SOCKET_PATH_MAX_BYTES
+    : DARWIN_UNIX_SOCKET_PATH_MAX_BYTES;
+  if (
+    !['darwin', 'linux'].includes(platform)
+    || typeof networkProbeBinary !== 'string'
+    || networkProbeBinary.length === 0
+    || typeof socketPath !== 'string'
+    || Buffer.byteLength(socketPath) > pathLimit
+  ) {
+    const label = platform === 'linux' ? 'Linux' : 'macOS';
+    throw new Error(`Unix-socket canary path exceeds the ${label} limit`);
+  }
+  const command = [
     networkProbeBinary,
     '-z',
     '-U',
@@ -2098,6 +2724,34 @@ export function buildUnixSocketProbeCommand(networkProbeBinary, socketPath) {
     '1',
     socketPath,
   ];
+  return platform === 'linux'
+    ? buildCheckedNetworkProbeCommand(command)
+    : command;
+}
+
+export function buildExternalNetworkProbeCommand(
+  networkProbeBinary,
+  host,
+  port,
+) {
+  if (
+    typeof networkProbeBinary !== 'string'
+    || networkProbeBinary.length === 0
+    || !isPublicIpv4Address(host)
+    || !Number.isSafeInteger(port)
+    || port < 1
+    || port > 65_535
+  ) {
+    throw new Error('external network probe arguments are invalid');
+  }
+  return buildCheckedNetworkProbeCommand([
+    networkProbeBinary,
+    '-z',
+    '-w',
+    '2',
+    host,
+    String(port),
+  ]);
 }
 
 export function cleanupKeychainCanary(
@@ -2139,11 +2793,16 @@ async function runSameUserSideChannelProbeUnsafe(
   options,
   inheritedDescriptor,
 ) {
-  const utilities = resolveSideChannelUtilities();
+  const platform = process.platform;
+  const utilities = resolveSideChannelUtilities(platform);
   const fixture = mkdtempSync(join(tmpdir(), 'orchestra-u1a-side-'));
   chmodSync(fixture, 0o700);
   const unixSocketPath = join(fixture, 'local.sock');
-  const processCanary = startSingleProcessCanary();
+  const processCanary = startSingleProcessCanary(
+    platform,
+    inheritedDescriptor,
+    utilities.python,
+  );
   const keychainId = `orchestra-u1a-${randomUUID()}`;
   const keychainSecret = randomUUID();
   let keychainCreated = false;
@@ -2151,6 +2810,7 @@ async function runSameUserSideChannelProbeUnsafe(
   let udp;
   let dns;
   let unixSocket;
+  let debuggerDiagnosticDirectory;
   let processCanaryCleanup = false;
   let keychainCleanup = false;
   let observation;
@@ -2161,64 +2821,111 @@ async function runSameUserSideChannelProbeUnsafe(
     udp = await startDatagramCanary();
     dns = await startDatagramCanary();
     unixSocket = await startStreamCanary(unixSocketPath);
+    if (platform === 'linux') {
+      debuggerDiagnosticDirectory = mkdtempSync(
+        join(options.workspace, '.orchestra-strace-'),
+      );
+      chmodSync(debuggerDiagnosticDirectory, 0o700);
+    }
     await delay(50);
 
     const processProbeCommand = buildProcessArgvInspectionCommand(
       processCanary.child.pid,
       processCanary.hash,
+      platform,
     );
     const processHost = runHostSideChannelCommand(processProbeCommand);
     const processHostControl = processHost.status === 41;
 
-    const debuggerHost = spawnSync(utilities.sample, [
-      String(processCanary.child.pid),
-      '1',
-      '10',
-      '-file',
-      '/dev/null',
-    ], {
-      stdio: 'ignore',
-      timeout: 5_000,
-    });
-    const debuggerHostControl = debuggerHost.status === 0;
+    let procEnvironmentProbeCommand;
+    let procEnvironmentHostControl;
+    let procFileDescriptorProbeCommand;
+    let procFileDescriptorHostControl;
+    if (platform === 'linux') {
+      procEnvironmentProbeCommand = buildProcEnvironmentInspectionCommand(
+        processCanary.child.pid,
+        processCanary.environmentHash,
+      );
+      procEnvironmentHostControl = runHostSideChannelCommand(
+        procEnvironmentProbeCommand,
+      ).status === 44;
+      procFileDescriptorProbeCommand =
+        buildProcFileDescriptorInspectionCommand(
+          processCanary.child.pid,
+          processCanary.descriptor,
+          inheritedDescriptor.hash,
+        );
+      procFileDescriptorHostControl = runHostSideChannelCommand(
+        procFileDescriptorProbeCommand,
+      ).status === 45;
+    }
 
-    const keychainAdd = spawnSync(utilities.security, [
-      'add-generic-password',
-      '-a',
-      keychainId,
-      '-s',
-      keychainId,
-      '-w',
-      keychainSecret,
-    ], {
-      stdio: 'ignore',
-      timeout: 5_000,
-    });
-    keychainCreated = keychainAdd.status === 0;
-    const keychainProbeCommand = [
-      '/bin/sh',
-      '-c',
-      [
-        '/usr/bin/security find-generic-password',
-        '-a "$1" -s "$2" -w >/dev/null 2>&1',
-        '&& exit 42;',
-        'exit 0',
-      ].join(' '),
-      'orchestra-u1a',
-      keychainId,
-      keychainId,
-    ];
-    const keychainHost = runHostSideChannelCommand(keychainProbeCommand);
-    const keychainHostControl = (
-      keychainCreated
-      && keychainHost.status === 42
+    const debuggerProbeCommand = buildDebuggerInspectionCommand(
+      platform === 'darwin' ? utilities.sample : utilities.strace,
+      processCanary.child.pid,
+      platform,
+      debuggerDiagnosticDirectory,
     );
+    const debuggerHost = runHostSideChannelCommand(debuggerProbeCommand);
+    const debuggerHostControl = debuggerHost.status === (
+      platform === 'darwin' ? 0 : 46
+    );
+
+    let keychainProbeCommand;
+    let keychainHostControl;
+    if (platform === 'darwin') {
+      const keychainAdd = spawnSync(utilities.security, [
+        'add-generic-password',
+        '-a',
+        keychainId,
+        '-s',
+        keychainId,
+        '-w',
+        keychainSecret,
+      ], {
+        stdio: 'ignore',
+        timeout: 5_000,
+      });
+      keychainCreated = keychainAdd.status === 0;
+      keychainProbeCommand = [
+        '/bin/sh',
+        '-c',
+        [
+          '/usr/bin/security find-generic-password',
+          '-a "$1" -s "$2" -w >/dev/null 2>&1',
+          '&& exit 42;',
+          'exit 0',
+        ].join(' '),
+        'orchestra-u1a',
+        keychainId,
+        keychainId,
+      ];
+      const keychainHost = runHostSideChannelCommand(keychainProbeCommand);
+      keychainHostControl = (
+        keychainCreated
+        && keychainHost.status === 42
+      );
+    }
+
+    let externalNetworkProbeCommand;
+    let externalNetworkHostControlBefore;
+    if (platform === 'linux') {
+      externalNetworkProbeCommand = buildExternalNetworkProbeCommand(
+        options.networkProbeBinary,
+        options.externalNetworkHost,
+        options.externalNetworkPort,
+      );
+      externalNetworkHostControlBefore = (
+        runHostSideChannelCommand(externalNetworkProbeCommand).status === 0
+      );
+    }
 
     const inheritedDescriptorHost = spawnSync(
       '/bin/sh',
       buildInheritedDescriptorProbeCommand(
         3,
         inheritedDescriptor.hash,
+        platform,
       ).slice(1),
       {
         stdio: ['ignore', 'ignore', 'ignore', inheritedDescriptor.descriptor],
@@ -2229,7 +2936,7 @@ async function runSameUserSideChannelProbeUnsafe(
       inheritedDescriptorHost.status === 43
     );
 
-    const tcpProbeCommand = [
+    const tcpHostCommand = [
       options.networkProbeBinary,
       '-z',
       '-w',
@@ -2237,8 +2944,11 @@ async function runSameUserSideChannelProbeUnsafe(
       '127.0.0.1',
       String(tcp.address().port),
     ];
+    const tcpProbeCommand = platform === 'linux'
+      ? buildCheckedNetworkProbeCommand(tcpHostCommand)
+      : tcpHostCommand;
     const tcpHostObserved = waitForStreamConnection(tcp);
-    const tcpHost = runHostSideChannelCommand(tcpProbeCommand);
+    const tcpHost = runHostSideChannelCommand(tcpHostCommand);
     const tcpHostControl = (
       tcpHost.status === 0
       && await tcpHostObserved
@@ -2247,6 +2957,7 @@ async function runSameUserSideChannelProbeUnsafe(
     const unixSocketProbeCommand = buildUnixSocketProbeCommand(
       options.networkProbeBinary,
       unixSocketPath,
+      platform,
     );
     const unixHostObserved = waitForStreamConnection(unixSocket, 5_000);
     const unixHost = await runHostSideChannelCommandAsync(
@@ -2260,16 +2971,30 @@ async function runSameUserSideChannelProbeUnsafe(
     const udpProbeCommand = [
       '/bin/sh',
       '-c',
-      'printf x | "$1" -u -w 1 127.0.0.1 "$2"',
+      platform === 'linux'
+        ? [
+            'printf x | "$1" -u -w 1 127.0.0.1 "$2";',
+            'status=$?;',
+            'if [ "$status" -eq 126 ] || [ "$status" -eq 127 ]; then',
+            'exit 47;',
+            'fi;',
+            'exit "$status"',
+          ].join(' ')
+        : 'printf x | "$1" -u -w 1 127.0.0.1 "$2"',
       'orchestra-u1a',
       options.networkProbeBinary,
       String(udp.address().port),
     ];
-    const udpHostObserved = waitForDatagram(udp);
-    const udpHost = runHostSideChannelCommand(udpProbeCommand);
+    const {
+      result: udpHost,
+      reached: udpHostReached,
+    } = await observeDatagramThroughCommand(
+      udp,
+      () => runHostSideChannelCommand(udpProbeCommand),
+    );
     const udpHostControl = (
       udpHost.status === 0
-      && await udpHostObserved
+      && udpHostReached
     );
 
     const dnsArgs = [
@@ -2281,38 +3006,72 @@ async function runSameUserSideChannelProbeUnsafe(
       '+time=1',
       '+tries=1',
     ];
-    const dnsHostObserved = waitForDatagram(dns);
-    const dnsHost = spawnSync(utilities.dig, dnsArgs, {
-      stdio: 'ignore',
-      timeout: 5_000,
-    });
+    const {
+      result: dnsHost,
+      reached: dnsHostReached,
+    } = await observeDatagramThroughCommand(
+      dns,
+      () => spawnSync(utilities.dig, dnsArgs, {
+        stdio: 'ignore',
+        timeout: 5_000,
+      }),
+    );
     const dnsHostControl = (
       Number.isSafeInteger(dnsHost.status)
-      && await dnsHostObserved
+      && dnsHostReached
     );
+    const dnsProbeCommand = platform === 'linux'
+      ? buildCheckedNetworkProbeCommand([utilities.dig, ...dnsArgs])
+      : [utilities.dig, ...dnsArgs];
 
     const processResult = await sideChannelCommand(
       connection,
       options.workspace,
       processProbeCommand,
     );
+    const procEnvironmentResult = platform === 'linux'
+      ? await sideChannelCommand(
+          connection,
+          options.workspace,
+          procEnvironmentProbeCommand,
+        )
+      : null;
+    const procFileDescriptorResult = platform === 'linux'
+      ? await sideChannelCommand(
+          connection,
+          options.workspace,
+          procFileDescriptorProbeCommand,
+        )
+      : null;
     const debuggerResult = await sideChannelCommand(
       connection,
       options.workspace,
-      [
-        utilities.sample,
-        String(processCanary.child.pid),
-        '1',
-        '10',
-        '-file',
-        '/dev/null',
-      ],
+      debuggerProbeCommand,
     );
-    const keychainResult = await sideChannelCommand(
-      connection,
-      options.workspace,
-      keychainProbeCommand,
-    );
+    let processHostControlAfter;
+    let debuggerHostControlAfter;
+    if (platform === 'linux') {
+      processHostControlAfter = (
+        runHostSideChannelCommand(processProbeCommand).status === 41
+      );
+      debuggerHostControlAfter = (
+        runHostSideChannelCommand(debuggerProbeCommand).status === 46
+      );
+    }
+    const keychainResult = platform === 'darwin'
+      ? await sideChannelCommand(
+          connection,
+          options.workspace,
+          keychainProbeCommand,
+        )
+      : null;
+    const externalNetworkResult = platform === 'linux'
+      ? await sideChannelCommand(
+          connection,
+          options.workspace,
+          externalNetworkProbeCommand,
+        )
+      : null;
 
     const tcpObserved = waitForStreamConnection(tcp);
     const tcpResult = await sideChannelCommand(
@@ -2322,21 +3081,29 @@ async function runSameUserSideChannelProbeUnsafe(
     );
     const tcpCanaryReached = await tcpObserved;
 
-    const udpObserved = waitForDatagram(udp);
-    const udpResult = await sideChannelCommand(
-      connection,
-      options.workspace,
-      udpProbeCommand,
+    const {
+      result: udpResult,
+      reached: udpCanaryReached,
+    } = await observeDatagramThroughCommand(
+      udp,
+      () => sideChannelCommand(
+        connection,
+        options.workspace,
+        udpProbeCommand,
+      ),
     );
-    const udpCanaryReached = await udpObserved;
 
-    const dnsObserved = waitForDatagram(dns);
-    const dnsResult = await sideChannelCommand(
-      connection,
-      options.workspace,
-      [utilities.dig, ...dnsArgs],
+    const {
+      result: dnsResult,
+      reached: dnsCanaryReached,
+    } = await observeDatagramThroughCommand(
+      dns,
+      () => sideChannelCommand(
+        connection,
+        options.workspace,
+        dnsProbeCommand,
+      ),
     );
-    const dnsCanaryReached = await dnsObserved;
 
     const unixObserved = waitForStreamConnection(unixSocket);
     const unixSocketResult = await sideChannelCommand(
@@ -2352,19 +3119,56 @@ async function runSameUserSideChannelProbeUnsafe(
       buildInheritedDescriptorProbeCommand(
         inheritedDescriptor.descriptor,
         inheritedDescriptor.hash,
+        platform,
       ),
     );
+    const externalNetworkHostControlAfter = platform === 'linux'
+      ? runHostSideChannelCommand(externalNetworkProbeCommand).status === 0
+      : undefined;
 
     observation = {
+      platform,
       processHostControl,
       processArgvInspectionExitCode: probeExitCode(
         processResult,
         'process inspection probe',
       ),
+      ...(platform === 'linux'
+        ? {
+            procEnvironmentHostControl,
+            procEnvironmentExitCode: probeExitCode(
+              procEnvironmentResult,
+              'proc environment probe',
+            ),
+            procFileDescriptorHostControl,
+            procFileDescriptorExitCode: probeExitCode(
+              procFileDescriptorResult,
+              'proc file-descriptor probe',
+            ),
+            processHostControlAfter,
+            debuggerHostControlAfter,
+          }
+        : {}),
       debuggerHostControl,
       debuggerExitCode: probeExitCode(debuggerResult, 'debugger probe'),
-      keychainHostControl,
-      keychainExitCode: probeExitCode(keychainResult, 'Keychain probe'),
+      keychainApplicable: platform === 'darwin',
+      ...(platform === 'darwin'
+        ? {
+            keychainHostControl,
+            keychainExitCode: probeExitCode(
+              keychainResult,
+              'Keychain probe',
+            ),
+          }
+        : {
+            keychainInapplicable: true,
+            externalNetworkHostControlBefore,
+            externalNetworkHostControlAfter,
+            externalNetworkExitCode: probeExitCode(
+              externalNetworkResult,
+              'external network probe',
+            ),
+          }),
       tcpHostControl,
       tcpExitCode: probeExitCode(tcpResult, 'TCP probe'),
       tcpCanaryReached,
@@ -2398,14 +3202,26 @@ async function runSameUserSideChannelProbeUnsafe(
     } catch {
       cleanupFailures.push('process');
     }
-    try {
-      keychainCleanup = cleanupKeychainCanary(
-        utilities.security,
-        keychainId,
-      );
-      if (!keychainCleanup) cleanupFailures.push('Keychain');
-    } catch {
-      cleanupFailures.push('Keychain');
+    if (platform === 'darwin') {
+      try {
+        keychainCleanup = cleanupKeychainCanary(
+          utilities.security,
+          keychainId,
+        );
+        if (!keychainCleanup) cleanupFailures.push('Keychain');
+      } catch {
+        cleanupFailures.push('Keychain');
+      }
+    }
+    if (debuggerDiagnosticDirectory) {
+      try {
+        rmSync(debuggerDiagnosticDirectory, {
+          recursive: true,
+          force: true,
+        });
+      } catch {
+        cleanupFailures.push('debugger diagnostic');
+      }
     }
     const resourceResults = await Promise.allSettled([
         closeStreamCanary(tcp),
@@ -2430,7 +3246,7 @@ async function runSameUserSideChannelProbeUnsafe(
   return {
     ...observation,
     processCanaryCleanup,
-    keychainCleanup,
+    ...(platform === 'darwin' ? { keychainCleanup } : {}),
   };
 }
 
@@ -2473,9 +3289,17 @@ async function main() {
     throw new Error('Codex binary must already be the resolved versioned path');
   }
   if (options.launcher) validateExecutable(options.launcher, 'session launcher');
-  if (await sha256File(options.binary) !== manifest.binarySha256) {
+  const targetReceipt = resolveCodexTargetPin();
+  if (
+    !isDeepStrictEqual(
+      productionProtocolSchema.binarySha256ByTarget,
+      manifest.binarySha256ByTarget,
+    )
+    || await sha256File(options.binary) !== targetReceipt.binarySha256
+  ) {
     throw new Error('Codex binary hash mismatch');
   }
+  validateExternalNetworkProbe(options, targetReceipt.target);
 
   options.codexHome = validateCodexHome(options.codexHome);
   options.workspace = validateWorkspace(options.workspace, options.codexHome);
@@ -2484,13 +3308,30 @@ async function main() {
     options.codexHome,
     options.workspace,
   );
+  options.childTmpdir = validateChildTmpdir(
+    options.tmpdir,
+    options.codexHome,
+    options.workspace,
+    options.daemonSecretRoots,
+    targetReceipt.target,
+  );
   options.networkProbeBinary = resolveNetworkProbeBinary();
   const initialConfigSha256 = sha256(join(options.codexHome, 'config.toml'));
   const env = sanitizedAppServerEnv(options);
 
   const version = runCommand(options, ['--version'], { env });
   requireSuccess(version, 'version check');
-  if (version.stdout.trim() !== manifest.cliVersion) throw new Error('Codex binary version mismatch');
+  if (version.stdout.trim() !== targetReceipt.cliVersion) {
+    throw new Error('Codex binary version mismatch');
+  }
+  if (shouldRunSandboxSelfTest(targetReceipt.target)) {
+    const sandboxSelfTest = runCommand(
+      options,
+      buildSandboxSelfTestArgs(),
+      { env },
+    );
+    requireSuccess(sandboxSelfTest, 'permission-profile sandbox self-test');
+  }
 
   const inheritedDescriptor = createInheritedDescriptorCanary(
     options.daemonSecretRoots[0],
@@ -2518,50 +3359,45 @@ async function main() {
     requireSuccess(experimentalResult, 'experimental schema generation');
 
     const stableClientRequestPath = join(stable, 'ClientRequest.json');
-    assertHash(
-      stableClientRequestPath,
-      manifest.schemaSha256.stableClientRequest,
-      'stable ClientRequest',
+    const stableProtocolV2Path = join(
+      stable,
+      'codex_app_server_protocol.v2.schemas.json',
     );
-    assertHash(
-      join(stable, 'codex_app_server_protocol.schemas.json'),
-      manifest.schemaSha256.stableProtocol,
-      'stable protocol',
+    const experimentalClientRequestPath = join(
+      experimental,
+      'ClientRequest.json',
+    );
+    const experimentalProtocolPath = join(
+      experimental,
+      'codex_app_server_protocol.schemas.json',
+    );
+    const experimentalProtocolV2Path = join(
+      experimental,
+      'codex_app_server_protocol.v2.schemas.json',
+    );
+    assertGeneratedRawSchemaHashes(
+      stable,
+      experimental,
+      targetReceipt.target,
     );
     const schema = JSON.parse(
-      readFileSync(join(stable, 'codex_app_server_protocol.v2.schemas.json'), 'utf8'),
+      readFileSync(stableProtocolV2Path, 'utf8'),
     );
     const experimentalV2Schema = JSON.parse(
-      readFileSync(join(experimental, 'codex_app_server_protocol.v2.schemas.json'), 'utf8'),
+      readFileSync(experimentalProtocolV2Path, 'utf8'),
     );
-    assertCanonicalHash(
+    assertGeneratedV2CanonicalHashes(
       schema,
-      manifest.schemaSha256.stableProtocolV2Canonical,
-      'stable v2 protocol',
-    );
-    assertHash(
-      join(experimental, 'ClientRequest.json'),
-      manifest.schemaSha256.experimentalClientRequest,
-      'experimental ClientRequest',
-    );
-    assertHash(
-      join(experimental, 'codex_app_server_protocol.schemas.json'),
-      manifest.schemaSha256.experimentalProtocol,
-      'experimental protocol',
-    );
-    assertCanonicalHash(
       experimentalV2Schema,
-      manifest.schemaSha256.experimentalProtocolV2Canonical,
-      'experimental v2 protocol',
     );
     const experimentalClientRequest = JSON.parse(
-      readFileSync(join(experimental, 'ClientRequest.json'), 'utf8'),
+      readFileSync(experimentalClientRequestPath, 'utf8'),
     );
     const terminalSurfaces = assertExperimentalTerminalSurfaces(
       experimentalClientRequest,
       JSON.parse(
         readFileSync(
-          join(experimental, 'codex_app_server_protocol.schemas.json'),
+          experimentalProtocolPath,
           'utf8',
         ),
       ),
@@ -2822,8 +3658,9 @@ async function main() {
     });
     const result = {
       ...overallU1aGate,
-      cliVersion: manifest.cliVersion,
-      binarySha256: manifest.binarySha256,
+      target: targetReceipt.target,
+      cliVersion: targetReceipt.cliVersion,
+      binarySha256: targetReceipt.binarySha256,
       launcherMode: options.launcher ? 'configured-wrapper' : 'direct',
       activeTurnTargeting: 'expectedTurnId required',
       profileId: PROFILE_ID,

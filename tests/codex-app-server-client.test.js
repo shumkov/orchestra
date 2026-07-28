@@ -1127,6 +1127,7 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
       'config/read': {
         beforeResponseMessages: [{
           method: 'thread/settings/updated',
+          emittedAtMs: 1_785_226_000_000,
           params: {
             threadId: 'thread-1',
             command: secret,
@@ -1182,8 +1183,9 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
             },
           },
         }, {
-          method: 'item/commandExecution/outputDelta',
-          params: { delta: secret, command: secret, cwd: secret },
+          method: 'remoteControl/status/changed',
+          emittedAtMs: 1_785_226_000_000,
+          params: { status: secret, command: secret, cwd: secret },
         }],
       },
     },
@@ -1249,6 +1251,73 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
     },
   }]);
   assert.doesNotMatch(JSON.stringify(notifications), new RegExp(secret));
+});
+
+test('notification envelope rejects malformed timestamps and unknown fields', async (t) => {
+  const cases = [{
+    name: 'string timestamp',
+    message: {
+      method: 'remoteControl/status/changed',
+      emittedAtMs: '1785226000000',
+      params: {},
+    },
+  }, {
+    name: 'fractional timestamp',
+    message: {
+      method: 'remoteControl/status/changed',
+      emittedAtMs: 1.5,
+      params: {},
+    },
+  }, {
+    name: 'negative timestamp',
+    message: {
+      method: 'remoteControl/status/changed',
+      emittedAtMs: -1,
+      params: {},
+    },
+  }, {
+    name: 'unsafe timestamp',
+    message: {
+      method: 'remoteControl/status/changed',
+      emittedAtMs: Number.MAX_SAFE_INTEGER + 1,
+      params: {},
+    },
+  }, {
+    name: 'unknown envelope field',
+    message: {
+      method: 'remoteControl/status/changed',
+      emittedAtMs: 1_785_226_000_000,
+      secret: 'MUST_NOT_BE_ACCEPTED',
+      params: {},
+    },
+  }];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const harness = createHarness(subtest, {
+        methods: {
+          'config/read': {
+            beforeResponseMessages: [entry.message],
+            hold: true,
+          },
+        },
+      });
+      const client = harness.makeClient();
+      await client.start();
+
+      await rejectedWithCode(
+        client.request('config/read', {
+          cwd: harness.cwd,
+          includeLayers: true,
+        }),
+        'CODEX_PROTOCOL_ERROR',
+      );
+      assert.throws(
+        () => client.assertHealthy(),
+        { code: 'CODEX_PROTOCOL_ERROR' },
+      );
+    });
+  }
 });
 
 test('state notifications must match the pinned generated schema', async (t) => {

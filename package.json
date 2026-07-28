@@ -1,6 +1,6 @@
 {
   "name": "@shumkov/orchestra",
-  "version": "0.7.3",
+  "version": "0.7.4",
   "description": "Transport-agnostic session engine for Claude Code and the native Codex app-server: spawn, steer, supervise, observe turns, and recover.",
   "type": "commonjs",
   "main": "index.js",

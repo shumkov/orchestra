@@ -1223,6 +1223,12 @@ test('Codex U1a accepts only the fixture-pinned fresh and resume provenance pair
     schemaDeclared: false,
     fragile: true,
   });
+  const notificationOnly = evaluateProfileProvenance({
+    schemaDeclared: false,
+    fresh: { responseExtensionExact: false, settingsNotificationExact: true },
+    resume: { responseExtensionExact: false, settingsNotificationExact: true },
+  });
+  assert.equal(notificationOnly.accepted, false);
 
   const missingResume = evaluateProfileProvenance({
     schemaDeclared: false,
@@ -2182,7 +2188,7 @@ test('Codex U1b retains the complete redacted static settings view', async (t) =
       '          networkAccess: false,',
       '          excludeSlashTmp: true,',
       '          excludeTmpdirEnvVar: true,',
-      "          writableRoots: ['/SECRET_ROOT'],",
+      '          writableRoots: [],',
       '        },',
       '        activePermissionProfile: {',
       "          id: 'polygram-session',",
@@ -2225,10 +2231,8 @@ test('Codex U1b retains the complete redacted static settings view', async (t) =
           networkAccess: false,
           excludeSlashTmp: true,
           excludeTmpdirEnvVar: true,
-          writableRootCount: 1,
-          writableRootSha256: [
-            createHash('sha256').update('/SECRET_ROOT').digest('hex'),
-          ],
+          writableRootCount: 0,
+          writableRootSha256: [],
         },
         activePermissionProfile: {
           id: 'polygram-session',
@@ -2270,6 +2274,27 @@ test('Codex U1b rejects missing, drifted, and root-bearing settings views', asyn
     }],
     ['missing sandbox type', (settings) => {
       delete settings.sandboxPolicy.type;
+    }],
+    ['drifted profile id', (settings) => {
+      settings.activePermissionProfile.id = 'other';
+    }],
+    ['drifted profile parent', (settings) => {
+      settings.activePermissionProfile.extends = 'other';
+    }],
+    ['drifted sandbox type', (settings) => {
+      settings.sandboxPolicy.type = 'readOnly';
+    }],
+    ['drifted sandbox network', (settings) => {
+      settings.sandboxPolicy.networkAccess = true;
+    }],
+    ['drifted slash tmp exclusion', (settings) => {
+      settings.sandboxPolicy.excludeSlashTmp = false;
+    }],
+    ['drifted TMPDIR exclusion', (settings) => {
+      settings.sandboxPolicy.excludeTmpdirEnvVar = false;
+    }],
+    ['legacy writable root present', (settings) => {
+      settings.sandboxPolicy.writableRoots = ['/workspace'];
     }],
     ['drifted provider', (settings) => {
       settings.modelProvider = 'other';
@@ -2333,7 +2358,7 @@ test('thread profile characterization requires the exact retained settings view'
     AppServerConnection,
     characterizeThreadProfile,
   } = await import(spikeUrl);
-  for (const mode of ['valid', 'missing', 'drifted']) {
+  for (const mode of ['valid', 'missing', 'drifted', 'delayed-drifted']) {
     await t.test(mode, async (subtest) => {
       const scratch = mkdtempSync(
         path.join(tmpdir(), 'orchestra-codex-profile-settings-'),
@@ -2393,12 +2418,29 @@ test('thread profile characterization requires the exact retained settings view'
           'const lines = readline.createInterface({ input: process.stdin });',
           "lines.once('line', (line) => {",
           '  const request = JSON.parse(line);',
-          ...(mode === 'missing'
+          ...(mode === 'missing' || mode === 'delayed-drifted'
             ? []
             : [
                 `  process.stdout.write(${JSON.stringify(`${JSON.stringify(notification)}\n`)});`,
               ]),
           `  process.stdout.write(${JSON.stringify(`${JSON.stringify({ id: 1, result: response })}\n`)});`,
+          ...(mode === 'delayed-drifted'
+            ? [
+                `  setTimeout(() => process.stdout.write(${JSON.stringify(`${JSON.stringify({
+                  ...notification,
+                  params: {
+                    ...notification.params,
+                    threadSettings: {
+                      ...settings,
+                      sandboxPolicy: {
+                        ...settings.sandboxPolicy,
+                        writableRoots: ['/workspace'],
+                      },
+                    },
+                  },
+                })}\n`)}), 800);`,
+              ]
+            : []),
           '});',
           '',
         ].join('\n'),
@@ -2418,10 +2460,22 @@ test('thread profile characterization requires the exact retained settings view'
         'thread/start',
         { cwd: scratch },
       );
-      if (mode === 'valid') {
-        assert.equal((await characterized).settingsPolicy.exact, true);
-      } else {
+      if (mode === 'drifted') {
         await assert.rejects(characterized);
+      } else {
+        const result = await characterized;
+        assert.equal(result.attachmentPolicy.exact, true);
+        assert.equal(
+          result.settingsPolicy?.exact ?? null,
+          mode === 'valid' ? true : null,
+        );
+        if (mode === 'delayed-drifted') {
+          await delay(150);
+          assert.throws(
+            () => connection.assertProtocolHealthy(),
+            /thread settings/,
+          );
+        }
       }
     });
   }

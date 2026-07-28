@@ -1386,9 +1386,6 @@ export function characterizeNamedProfilePolicy(
 }
 
 export function evaluateProfileProvenance({ schemaDeclared, fresh, resume }) {
-  const notificationPair = (
-    fresh.settingsNotificationExact && resume.settingsNotificationExact
-  );
   const responsePair = (
     profileProvenanceFixture.surface === 'response-extension'
     && profileProvenanceFixture.schemaDeclared === false
@@ -1401,7 +1398,7 @@ export function evaluateProfileProvenance({ schemaDeclared, fresh, resume }) {
     && resume.responseExtensionExact
   );
   return {
-    accepted: Boolean(notificationPair || responsePair),
+    accepted: Boolean(responsePair),
     surface: responsePair ? 'response-extension' : 'thread/settings/updated',
     schemaDeclared: responsePair ? false : true,
     fragile: responsePair,
@@ -1435,12 +1432,6 @@ export async function characterizeThreadProfile(connection, method, params) {
         params.cwd ?? result.cwd,
     )
     : null;
-  if (
-    profileProvenanceFixture.settingsNotificationObserved
-    && !settingsPolicy
-  ) {
-    throw new Error(`${method} omitted named-profile settings notification`);
-  }
   if (settingsPolicy && !settingsPolicy.exact) {
     throw new Error(`${method} emitted unexpected named-profile settings`);
   }

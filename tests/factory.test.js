@@ -81,7 +81,7 @@ function codexExpectedStaticProfile(overrides = {}) {
     }],
     mcpServers: { count: 0, keySha256: [] },
     plugins: { count: 0, keySha256: [] },
-    modelProviders: { count: 1, keySha256: [digest('openai')] },
+    modelProviders: { count: 0, keySha256: [] },
   };
   return {
     runtime: 'codex',

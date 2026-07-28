@@ -69,7 +69,7 @@ function projectedConfig() {
     }],
     mcpServers: { count: 0, keySha256: [] },
     plugins: { count: 0, keySha256: [] },
-    modelProviders: { count: 1, keySha256: [digest('openai')] },
+    modelProviders: { count: 0, keySha256: [] },
   };
 }
 
@@ -479,7 +479,7 @@ test('preflight runs through the real U2 client without issuing a mutation', asy
     },
     mcp_servers: {},
     plugins: {},
-    model_providers: { openai: {} },
+    model_providers: {},
   };
   const rawLayerConfig = { default_permissions: 'polygram-session' };
   const rawOrigins = { default_permissions: 'user' };
@@ -579,7 +579,7 @@ test('preflight runs through the real U2 client without issuing a mutation', asy
       }],
       mcpServers: { count: 0, keySha256: [] },
       plugins: { count: 0, keySha256: [] },
-      modelProviders: { count: 1, keySha256: [digest('openai')] },
+      modelProviders: { count: 0, keySha256: [] },
     },
     expectedLayers: [{
       type: 'user',
@@ -702,8 +702,16 @@ test('expected policy pins OpenAI, user review, and one effective config digest'
     expectedConfig: {
       ...projectedConfig(),
       modelProviders: {
-        count: 2,
-        keySha256: [digest('openai'), digest('other-provider')],
+        count: 1,
+        keySha256: [digest('openai')],
+      },
+    },
+  }, {
+    expectedConfig: {
+      ...projectedConfig(),
+      modelProviders: {
+        count: 0,
+        keySha256: [digest('openai')],
       },
     },
   }, {

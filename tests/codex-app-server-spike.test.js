@@ -1247,6 +1247,7 @@ test('Codex U1a attests the complete owned profile and rejects source drift', as
     profile: null,
   };
   const ownedConfig = {
+    model_provider: 'openai',
     cli_auth_credentials_store: 'file',
     default_permissions: 'polygram-session',
     approval_policy: 'never',
@@ -1328,6 +1329,7 @@ test('Codex U1a attests the complete owned profile and rejects source drift', as
     ],
     origins: Object.fromEntries(
       [
+        'model_provider',
         'cli_auth_credentials_store',
         'default_permissions',
         'approval_policy',
@@ -1421,6 +1423,49 @@ test('Codex U1a attests the complete owned profile and rejects source drift', as
       rawConfigSha256: 'fixture-raw-sha256',
     }),
     /owned user config does not exactly match polygram-session/,
+  );
+
+  const changedProvider = structuredClone(configRead);
+  changedProvider.layers[0].config.model_provider = 'attacker';
+  changedProvider.config.model_provider = 'attacker';
+  assert.throws(
+    () => attestNamedProfileConfig({
+      configRead: changedProvider,
+      requirements: null,
+      codexHome,
+      workspace,
+      daemonSecretRoots: [daemonSecretRoot],
+      rawConfigSha256: 'fixture-raw-sha256',
+    }),
+    /owned user config does not exactly match polygram-session/,
+  );
+
+  const changedEffectiveProvider = structuredClone(configRead);
+  changedEffectiveProvider.config.model_provider = 'attacker';
+  assert.throws(
+    () => attestNamedProfileConfig({
+      configRead: changedEffectiveProvider,
+      requirements: null,
+      codexHome,
+      workspace,
+      daemonSecretRoots: [daemonSecretRoot],
+      rawConfigSha256: 'fixture-raw-sha256',
+    }),
+    /effective config differs at model_provider/,
+  );
+
+  const missingProviderOrigin = structuredClone(configRead);
+  delete missingProviderOrigin.origins.model_provider;
+  assert.throws(
+    () => attestNamedProfileConfig({
+      configRead: missingProviderOrigin,
+      requirements: null,
+      codexHome,
+      workspace,
+      daemonSecretRoots: [daemonSecretRoot],
+      rawConfigSha256: 'fixture-raw-sha256',
+    }),
+    /effective config origin missing for model_provider/,
   );
 
   const prefixedOrigin = structuredClone(configRead);

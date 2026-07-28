@@ -278,6 +278,7 @@ function ownedProfileConfig(codexHome, workspace, daemonSecretRoots) {
   filesystem[':workspace_roots'] = { '.': 'write' };
 
   return {
+    model_provider: 'openai',
     cli_auth_credentials_store: 'file',
     default_permissions: PROFILE_ID,
     approval_policy: 'never',
@@ -420,6 +421,7 @@ export function attestNamedProfileConfig({
   }
   const originKeys = origins.map(([key]) => key);
   const requiredOriginKeys = [
+    'model_provider',
     'cli_auth_credentials_store',
     'default_permissions',
     'approval_policy',

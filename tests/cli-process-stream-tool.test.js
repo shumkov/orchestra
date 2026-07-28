@@ -83,18 +83,35 @@ test('protocol still rejects an unknown tool name', () => {
 
 // ─── env gate ──────────────────────────────────────────────────────
 
-test('env gate: ORCHESTRA_STREAM_TOOL is set only with the capability', () => {
+test('env gate: the var is always WRITTEN, so an ambient value cannot leak in', () => {
+  // Omitting the var would let an ORCHESTRA_STREAM_TOOL=1 inherited from
+  // anywhere up the daemon → tmux → claude → MCP-child chain switch the tool on
+  // for a consumer that never opted in. Omission is not a decision; '' is.
   const { p: on } = makeProc({ capabilities: { stream: true } });
   const { p: off } = makeProc({ capabilities: null });
   assert.equal(on._bridgeEnv().ORCHESTRA_STREAM_TOOL, '1');
-  assert.equal('ORCHESTRA_STREAM_TOOL' in off._bridgeEnv(), false,
-    'a consumer that never opted in must not get the env var at all');
+  assert.equal('ORCHESTRA_STREAM_TOOL' in off._bridgeEnv(), true,
+    'the var must be present-and-empty, not absent');
+  assert.equal(off._bridgeEnv().ORCHESTRA_STREAM_TOOL, '');
 });
 
 test('env gate: {stream:false} is not opting in', () => {
   const { p } = makeProc({ capabilities: { stream: false } });
   assert.equal(p.streamToolEnabled, false);
-  assert.equal('ORCHESTRA_STREAM_TOOL' in p._bridgeEnv(), false);
+  assert.equal(p._bridgeEnv().ORCHESTRA_STREAM_TOOL, '');
+});
+
+test('daemon-side gate: a stream call is refused when the consumer never opted in', async () => {
+  // Defense in depth. The bridge decides what to REGISTER from its environment,
+  // which is not entirely ours to control; the daemon decides what to HONOR.
+  const { p, acks, chunks, events } = makeProc({ capabilities: null });
+  addTurn(p, 't-1');
+  await p._dispatchToolCall(streamCall('t-1', 'text from a bridge we did not enable'));
+  assert.deepEqual(chunks, [],
+    'never emit stream-chunk at a consumer with nothing wired to receive it');
+  assert.equal(acks[0].ok, false);
+  assert.match(acks[0].error, /not enabled/);
+  assert.equal(events.filter(e => e.kind === 'stream-tool-not-enabled').length, 1);
 });
 
 test('bridge registers the stream tool + accepts the call ONLY under the env gate', () => {
@@ -297,6 +314,39 @@ test('cap: the ack stays ok after the cap trips (a preview never fails a turn)',
   addTurn(p, 't-1');
   for (let i = 0; i < 202; i++) await p._dispatchToolCall(streamCall('t-1', `d${i}`));
   assert.equal(acks.at(-1).ok, true);
+});
+
+test('cap: a flood of invented turn_ids cannot reset the live turn\'s count', async () => {
+  // The escape this closes: when the count lived in a bounded map keyed by the
+  // caller-supplied turn_id, a burst of invented ids evicted the live turn's
+  // entry and the cap started over — indefinitely. `stream` skips the reply
+  // token bucket, so this cap is the only bound there is.
+  const { p, chunks, events } = makeProc();
+  addTurn(p, 't-live');
+
+  for (let i = 0; i < 200; i++) await p._dispatchToolCall(streamCall('t-live', `d${i}`));
+  assert.equal(chunks.length, 200, 'the cap is reached');
+
+  for (let i = 0; i < 64; i++) {
+    await p._dispatchToolCall(streamCall(`forged-${i}`, 'evict the counter', { id: `tc-f${i}` }));
+  }
+
+  await p._dispatchToolCall(streamCall('t-live', 'past the cap again'));
+  assert.equal(chunks.length, 200, 'the live turn is still capped');
+  assert.equal(
+    events.filter(e => e.kind === 'stream-cap-exceeded').length, 1,
+    'still one cap event for the one runaway',
+  );
+});
+
+test('cap state is held by the turn and dies with it', async () => {
+  const { p, chunks } = makeProc();
+  const entry = { turnId: 't-1', context: {} };
+  p.pendingQueue.push(entry);
+  p.pendingTurns.set('t-1', { replies: [] });
+  for (let i = 0; i < 3; i++) await p._dispatchToolCall(streamCall('t-1', `d${i}`));
+  assert.equal(entry._streamCalls, 3, 'the count rides the queue entry, not a side map');
+  assert.equal(chunks.length, 3);
 });
 
 test('cap is per turn, not per process', async () => {

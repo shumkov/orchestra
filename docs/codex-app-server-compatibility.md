@@ -33,10 +33,23 @@ reads without a legacy `workspaceWrite` request policy.
 - Orchestra baseline: `v0.5.0`, commit
   `b788efb1f99e5fbf8669d4efa7ce5a1f9c0f7dcb`.
 - Codex: `codex-cli 0.145.0`.
-- Binary SHA-256:
-  `1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590`.
-- Stable and experimental generated schema hashes remain pinned in
+- Reviewed native target receipts:
+  - `aarch64-apple-darwin`:
+    `codex-cli 0.145.0`,
+    `1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590`;
+  - `x86_64-unknown-linux-musl`:
+    `codex-cli 0.145.0`,
+    `a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14`.
+- The deprecated scalar binary checksum remains macOS-arm64 provenance.
+  Runtime checks resolve the current target receipt lazily.
+- Target-specific raw hashes pin the four deterministic stable and experimental
+  `ClientRequest.json` and legacy protocol files in
   `tests/fixtures/codex-app-server-0.145.0/manifest.json`.
+- The nondeterministically serialized stable and experimental v2 bundles are
+  enforced only through their shared recursively canonical hashes:
+  `02d8bf6651cd504bff0335f566c011e51ba77c5cc0538cb64ca7ac57739a1597`
+  and
+  `1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb`.
 - `turn/steer` still requires `threadId`, `input`, and `expectedTurnId`.
 - The authenticated direct-binary checker passed every named-profile evidence
   bit on 2026-07-26. This Mac has no configured session launcher, so the local
@@ -69,14 +82,41 @@ node scripts/spikes/codex-app-server-real.mjs \
   --binary /absolute/versioned/path/to/codex \
   --codex-home /absolute/non-temporary/codex-home \
   --workspace /absolute/workspace \
-  --daemon-secret-root /absolute/daemon-secret-root
+  --tmpdir /absolute/private/child-tmpdir \
+  --daemon-secret-root /absolute/private/child-tmpdir \
+  --external-network-host 1.1.1.1 \
+  --external-network-port 443
 ```
 
 Environment fallbacks are `POLYGRAM_CODEX_BIN`, `ORCHESTRA_CODEX_HOME`,
-`ORCHESTRA_CODEX_WORKSPACE`, `ORCHESTRA_SESSION_LAUNCHER`, and the
-path-delimited `ORCHESTRA_CODEX_DAEMON_SECRET_ROOTS`.
+`ORCHESTRA_CODEX_WORKSPACE`, `ORCHESTRA_CODEX_TMPDIR`,
+`ORCHESTRA_SESSION_LAUNCHER`, and the path-delimited
+`ORCHESTRA_CODEX_DAEMON_SECRET_ROOTS`. Linux also requires
+`ORCHESTRA_CODEX_EXTERNAL_NETWORK_HOST` and
+`ORCHESTRA_CODEX_EXTERNAL_NETWORK_PORT` when the corresponding flags are not
+passed. The endpoint must be an operator-approved, globally routable numeric
+IPv4 address and port that are reachable from the service environment; a
+hostname or private, loopback, link-local, benchmark, or documentation address
+is rejected. The checker requires the same endpoint to remain reachable from
+the host immediately before and after the sandbox-denial probe.
 Each synthetic daemon-secret root must contain an owner-only regular
 `.orchestra-codex-u1a-deny-probe` sentinel with no symlink or hard-link alias.
+On Linux, the child `TMPDIR` must be an existing canonical service-user-owned
+directory with exact mode `0700`, separate from both the workspace and
+`CODEX_HOME`. The same exact directory must also be supplied as a
+`--daemon-secret-root`, so the filesystem enforcement probe proves that its
+sentinel is unreadable from `command/exec`. Darwin does not require or validate
+this additional child-temp input.
+
+Before Linux app-server startup, the checker requires the reviewed profile to
+run a bounded harmless command using the Codex 0.145.0 CLI surface:
+
+```text
+codex sandbox --permission-profile polygram-session -- /bin/true
+```
+
+The checker does not trace bubblewrap. The final bounded VPS operational gate
+must separately prove that this exact invocation reaches `/usr/bin/bwrap`.
 
 The checker never creates, copies, reads, hashes, or prints authentication
 contents. `CODEX_HOME` must already exist, be canonical, non-temporary, owned
@@ -329,6 +369,25 @@ all cleanup paths before failing. The final integrated authenticated run
 passed every control and denial. The Unix-socket control uses a short,
 explicitly length-guarded macOS pathname and an asynchronous host runner so
 the control cannot false-fail while Node's listener is blocked.
+
+On Linux x64, the same gate additionally requires host-positive and
+sandbox-negative reads of the owned process's `/proc` command line,
+environment, and inherited file descriptor, plus a bounded `strace` attach
+probe. Local TCP, UDP, DNS-protocol, Unix-socket, and direct inherited-FD
+checks remain mandatory. Only the macOS Keychain checks are explicitly
+inapplicable on Linux; an unavailable Linux process, IPC, or network probe
+stops the gate.
+
+UDP and DNS listeners remain active until their command completes and for a
+bounded settle interval afterward, so delayed packets cannot be classified as
+denied early. An exact Linux `strace` ESRCH/`No such process` result counts as
+PID-namespace denial only when host-side process liveness and attach controls
+pass both before and after the sandbox attempt; helper failures remain
+fail-closed. The direct inherited-FD probe intentionally checks the production
+app-server spawn boundary, which receives only stdio pipes. The separate
+`/proc/<pid>/fd` probe checks whether a sandboxed same-UID command can recover a
+descriptor inherited by another owned process; no secret descriptor is
+deliberately passed to app-server.
 
 ## Transport-cut classification is deterministic; persistence is unproved
 

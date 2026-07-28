@@ -18,7 +18,6 @@ const assert = require('node:assert/strict');
 const {
   CodexAppServerClient,
   attestPinnedCodexHome,
-  protocolSchema,
 } = require('../lib/codex/app-server-client');
 const { CodexProcess } = require('../lib/process/codex-process');
 
@@ -3463,10 +3462,11 @@ test('real U2 client checkpoints containment before closing on response durabili
         sinkTimeoutMs: 500,
         closeGraceMs: 100,
         closeKillMs: 200,
-        attestBinaryFn: async (attestedBinary) => ({
+        attestBinaryFn: async (attestedBinary, targetReceipt) => ({
           path: attestedBinary,
-          sha256: protocolSchema.binarySha256,
-          version: protocolSchema.cliVersion,
+          target: targetReceipt.target,
+          sha256: targetReceipt.binarySha256,
+          version: targetReceipt.cliVersion,
         }),
         attestCodexHomeFn: (home, expectedHash) => (
           attestPinnedCodexHome(home, expectedHash, { temporaryRoots: [] })

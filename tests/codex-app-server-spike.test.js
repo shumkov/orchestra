@@ -8,6 +8,7 @@ const {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -17,6 +18,7 @@ const {
 } = require('node:fs');
 const { spawn, spawnSync } = require('node:child_process');
 const { createHash } = require('node:crypto');
+const { EventEmitter } = require('node:events');
 const test = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 const { pathToFileURL } = require('node:url');
@@ -34,6 +36,9 @@ const u1bResourceSpikeUrl = pathToFileURL(
 );
 const u1bEffectsSpikeUrl = pathToFileURL(
   path.resolve(__dirname, '../scripts/spikes/codex-app-server-effects-retries.mjs'),
+);
+const realRuntimeManifest = require(
+  './fixtures/codex-app-server-0.145.0/manifest.json',
 );
 
 function transportCutParams(method) {
@@ -87,6 +92,156 @@ const stateChangingTransportMethods = [
   'turn/interrupt',
   'thread/backgroundTerminals/clean',
 ];
+
+test('Codex U1a manifest pins deterministic raw schemas and canonical v2 bundles', async () => {
+  const {
+    assertGeneratedRawSchemaHashes,
+    assertGeneratedV2CanonicalHashes,
+    selectRawSchemaHashes,
+  } = await import(spikeUrl);
+  assert.deepEqual(realRuntimeManifest.binarySha256ByTarget, {
+    'aarch64-apple-darwin':
+      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+    'x86_64-unknown-linux-musl':
+      'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+  });
+  assert.deepEqual(
+    realRuntimeManifest.artifactProvenanceByTarget[
+      'x86_64-unknown-linux-musl'
+    ],
+    {
+      npmPackage: '@openai/codex@0.145.0-linux-x64',
+      npmIntegrity:
+        'sha512-u8w8LLv3DvsfrDCoswLIemZ0SoNEXyi511WsfFsSiYUazk9qMsB/NtU8N9vhAfN7mZAxLFoMex4v66JjHuZWwA==',
+    },
+  );
+  assert.equal(
+    realRuntimeManifest.schemaSha256.stableProtocolV2Canonical,
+    '02d8bf6651cd504bff0335f566c011e51ba77c5cc0538cb64ca7ac57739a1597',
+  );
+  assert.equal(
+    realRuntimeManifest.schemaSha256.experimentalProtocolV2Canonical,
+    '1bc09dedc506075562d4d49b702ecab6d947dd5a8c2a9014a5cde592a0938efb',
+  );
+  assert.deepEqual(realRuntimeManifest.schemaRawSha256ByTarget, {
+    'aarch64-apple-darwin': {
+      stableClientRequest:
+        'cc9f6e191a032bdfdc96d768f4ddaba4ced75408017af3ac0dbcc4d00c1faaa8',
+      stableProtocol:
+        'b6ec47c51bef8a6857dd9435f9919a43ba6616a5a9e3ab25087451cbc93d9f06',
+      experimentalClientRequest:
+        '03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c',
+      experimentalProtocol:
+        '1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68',
+    },
+    'x86_64-unknown-linux-musl': {
+      stableClientRequest:
+        '44615d6348466a48c05228d99eb555d1d655aaffc1474fb0abdd7f4945502e35',
+      stableProtocol:
+        '8a9694a5508a95ba4a48b1ba43551f88b704dbe6cd0c4f9f04f330d3166d2930',
+      experimentalClientRequest:
+        '03e30c97136d6618273e3e9197d8621bad9ac6cfd733c0cfe09dc8754ee6ac5c',
+      experimentalProtocol:
+        '1f66700d1cc3de4a5004e5614a6098878b405c7e7c5f8c9be97fc900d0ad6c68',
+    },
+  });
+  assert.deepEqual(
+    selectRawSchemaHashes('x86_64-unknown-linux-musl'),
+    realRuntimeManifest.schemaRawSha256ByTarget[
+      'x86_64-unknown-linux-musl'
+    ],
+  );
+  assert.throws(
+    () => selectRawSchemaHashes('x86_64-unknown-linux-gnu'),
+    /raw schema provenance/,
+  );
+  const linuxRaw = realRuntimeManifest.schemaRawSha256ByTarget[
+    'x86_64-unknown-linux-musl'
+  ];
+  const expectedByPath = new Map([
+    [path.join('/stable', 'ClientRequest.json'), linuxRaw.stableClientRequest],
+    [
+      path.join('/stable', 'codex_app_server_protocol.schemas.json'),
+      linuxRaw.stableProtocol,
+    ],
+    [
+      path.join('/experimental', 'ClientRequest.json'),
+      linuxRaw.experimentalClientRequest,
+    ],
+    [
+      path.join('/experimental', 'codex_app_server_protocol.schemas.json'),
+      linuxRaw.experimentalProtocol,
+    ],
+  ]);
+  const checkedPaths = [];
+  assert.equal(
+    assertGeneratedRawSchemaHashes(
+      '/stable',
+      '/experimental',
+      'x86_64-unknown-linux-musl',
+      (schemaPath) => {
+        checkedPaths.push(schemaPath);
+        return expectedByPath.get(schemaPath);
+      },
+    ),
+    true,
+  );
+  assert.deepEqual(checkedPaths, [...expectedByPath.keys()]);
+  assert.equal(
+    checkedPaths.some((schemaPath) => schemaPath.includes('.v2.schemas.json')),
+    false,
+  );
+
+  const stableV2Schema = { bundle: 'stable' };
+  const experimentalV2Schema = { bundle: 'experimental' };
+  const expectedCanonicalHashes = new Map([
+    [
+      stableV2Schema,
+      realRuntimeManifest.schemaSha256.stableProtocolV2Canonical,
+    ],
+    [
+      experimentalV2Schema,
+      realRuntimeManifest.schemaSha256.experimentalProtocolV2Canonical,
+    ],
+  ]);
+  const canonicalInputs = [];
+  assert.equal(
+    assertGeneratedV2CanonicalHashes(
+      stableV2Schema,
+      experimentalV2Schema,
+      (schema) => {
+        canonicalInputs.push(schema);
+        return expectedCanonicalHashes.get(schema);
+      },
+    ),
+    true,
+  );
+  assert.deepEqual(canonicalInputs, [stableV2Schema, experimentalV2Schema]);
+  assert.throws(
+    () => assertGeneratedV2CanonicalHashes(
+      stableV2Schema,
+      experimentalV2Schema,
+      (schema) => (
+        schema === stableV2Schema
+          ? '0'.repeat(64)
+          : expectedCanonicalHashes.get(schema)
+      ),
+    ),
+    /stable v2 protocol canonical schema hash mismatch/,
+  );
+  assert.throws(
+    () => assertGeneratedV2CanonicalHashes(
+      stableV2Schema,
+      experimentalV2Schema,
+      (schema) => (
+        schema === experimentalV2Schema
+          ? '0'.repeat(64)
+          : expectedCanonicalHashes.get(schema)
+      ),
+    ),
+    /experimental v2 protocol canonical schema hash mismatch/,
+  );
+});
 
 function createTransportCutFixture(
   t,
@@ -225,10 +380,12 @@ test('Codex U1a overall result requires every integrated runtime gate', async ()
 
 function passingSameUserSideChannelEvidence() {
   return {
+    platform: 'darwin',
     processHostControl: true,
     processArgvInspectionExitCode: 0,
     debuggerHostControl: true,
     debuggerExitCode: 1,
+    keychainApplicable: true,
     keychainHostControl: true,
     keychainExitCode: 0,
     tcpHostControl: true,
@@ -247,6 +404,42 @@ function passingSameUserSideChannelEvidence() {
     inheritedDescriptorExitCode: 0,
     processCanaryCleanup: true,
     keychainCleanup: true,
+  };
+}
+
+function passingLinuxSameUserSideChannelEvidence() {
+  return {
+    platform: 'linux',
+    processHostControl: true,
+    processArgvInspectionExitCode: 0,
+    procEnvironmentHostControl: true,
+    procEnvironmentExitCode: 0,
+    procFileDescriptorHostControl: true,
+    procFileDescriptorExitCode: 0,
+    debuggerHostControl: true,
+    processHostControlAfter: true,
+    debuggerHostControlAfter: true,
+    debuggerExitCode: 0,
+    keychainApplicable: false,
+    keychainInapplicable: true,
+    externalNetworkHostControlBefore: true,
+    externalNetworkHostControlAfter: true,
+    externalNetworkExitCode: 1,
+    tcpHostControl: true,
+    tcpExitCode: 1,
+    tcpCanaryReached: false,
+    udpHostControl: true,
+    udpCommandExitCode: 0,
+    udpCanaryReached: false,
+    dnsHostControl: true,
+    dnsCommandExitCode: 9,
+    dnsCanaryReached: false,
+    unixSocketHostControl: true,
+    unixSocketExitCode: 1,
+    unixSocketCanaryReached: false,
+    inheritedDescriptorHostControl: true,
+    inheritedDescriptorExitCode: 0,
+    processCanaryCleanup: true,
   };
 }
 
@@ -319,12 +512,139 @@ test('Codex U1a same-user side-channel gate fails closed on recovery or cleanup 
   );
 });
 
-test('Codex U1a side-channel command builders expose hashes but not canary contents', async () => {
+test('Codex U1a Linux side-channel gate requires proc, process, IPC, and network denial', async () => {
+  const { evaluateSameUserSideChannelProbe } = await import(spikeUrl);
+  const evidence = passingLinuxSameUserSideChannelEvidence();
+
+  assert.deepEqual(evaluateSameUserSideChannelProbe(evidence), {
+    gate: 'CONTINUE',
+    exitCode: 0,
+    failedChecks: [],
+  });
+  assert.deepEqual(
+    evaluateSameUserSideChannelProbe({
+      ...evidence,
+      debuggerExitCode: 48,
+    }),
+    {
+      gate: 'CONTINUE',
+      exitCode: 0,
+      failedChecks: [],
+    },
+  );
+  assert.deepEqual(
+    evaluateSameUserSideChannelProbe({
+      ...evidence,
+      debuggerExitCode: 48,
+      debuggerHostControlAfter: false,
+    }).failedChecks,
+    [
+      'debuggerHostControlAfter',
+      'debuggerDenied',
+    ],
+  );
+  assert.deepEqual(
+    evaluateSameUserSideChannelProbe({
+      ...evidence,
+      debuggerExitCode: 47,
+    }).failedChecks,
+    ['debuggerDenied'],
+  );
+  assert.deepEqual(
+    evaluateSameUserSideChannelProbe({
+      ...evidence,
+      procEnvironmentExitCode: 44,
+      procFileDescriptorExitCode: 45,
+      debuggerExitCode: 46,
+      keychainInapplicable: false,
+      externalNetworkExitCode: 0,
+    }).failedChecks,
+    [
+      'procEnvironmentDenied',
+      'procFileDescriptorDenied',
+      'debuggerDenied',
+      'keychainInapplicable',
+      'externalNetworkDenied',
+    ],
+  );
+  for (const [field, failedCheck] of [
+    ['processHostControl', 'processHostControl'],
+    ['procEnvironmentHostControl', 'procEnvironmentHostControl'],
+    ['procFileDescriptorHostControl', 'procFileDescriptorHostControl'],
+    ['debuggerHostControl', 'debuggerHostControl'],
+    ['processHostControlAfter', 'processHostControlAfter'],
+    ['debuggerHostControlAfter', 'debuggerHostControlAfter'],
+    ['externalNetworkHostControlBefore', 'externalNetworkHostControlBefore'],
+    ['externalNetworkHostControlAfter', 'externalNetworkHostControlAfter'],
+  ]) {
+    assert.deepEqual(
+      evaluateSameUserSideChannelProbe({
+        ...evidence,
+        [field]: false,
+      }).failedChecks,
+      [failedCheck],
+    );
+  }
+  assert.deepEqual(
+    evaluateSameUserSideChannelProbe({
+      ...evidence,
+      externalNetworkExitCode: 47,
+    }).failedChecks,
+    ['externalNetworkDenied'],
+  );
+  for (const [field, failedCheck] of [
+    ['tcpExitCode', 'tcpDenied'],
+    ['udpCommandExitCode', 'udpDenied'],
+    ['dnsCommandExitCode', 'dnsProtocolDenied'],
+    ['unixSocketExitCode', 'unixSocketDenied'],
+  ]) {
+    assert.deepEqual(
+      evaluateSameUserSideChannelProbe({
+        ...evidence,
+        [field]: 47,
+      }).failedChecks,
+      [failedCheck],
+    );
+  }
+});
+
+test('Codex U1a uses the Codex 0.145.0 permission-profile sandbox syntax', async () => {
   const {
+    buildSandboxSelfTestArgs,
+    shouldRunSandboxSelfTest,
+  } = await import(spikeUrl);
+
+  assert.deepEqual(
+    buildSandboxSelfTestArgs('polygram-session', ['/bin/true']),
+    [
+      'sandbox',
+      '--permission-profile',
+      'polygram-session',
+      '--',
+      '/bin/true',
+    ],
+  );
+  assert.equal(
+    shouldRunSandboxSelfTest('x86_64-unknown-linux-musl'),
+    true,
+  );
+  assert.equal(
+    shouldRunSandboxSelfTest('aarch64-apple-darwin'),
+    false,
+  );
+});
+
+test('Codex U1a side-channel command builders expose hashes but not canary contents', async (t) => {
+  const {
+    buildDebuggerInspectionCommand,
+    buildExternalNetworkProbeCommand,
     buildInheritedDescriptorProbeCommand,
+    buildProcEnvironmentInspectionCommand,
+    buildProcFileDescriptorInspectionCommand,
     buildProcessArgvInspectionCommand,
     buildUnixSocketProbeCommand,
     cleanupKeychainCanary,
+    resolveSideChannelUtility,
     runHostSideChannelCommand,
     runHostSideChannelCommandAsync,
   } = await import(spikeUrl);
@@ -334,6 +654,35 @@ test('Codex U1a side-channel command builders expose hashes but not canary conte
   const descriptorCommand = buildInheritedDescriptorProbeCommand(
     19,
     descriptorHash,
+  );
+  const linuxDescriptorCommand = buildInheritedDescriptorProbeCommand(
+    19,
+    descriptorHash,
+    'linux',
+  );
+  const linuxProcessCommand = buildProcessArgvInspectionCommand(
+    1234,
+    processHash,
+    'linux',
+  );
+  const environmentCommand = buildProcEnvironmentInspectionCommand(
+    1234,
+    processHash,
+  );
+  const procDescriptorCommand = buildProcFileDescriptorInspectionCommand(
+    1234,
+    3,
+    descriptorHash,
+  );
+  const debuggerDirectory = mkdtempSync(
+    path.join(process.cwd(), '.orchestra-strace-diagnostics-'),
+  );
+  t.after(() => rmSync(debuggerDirectory, { recursive: true, force: true }));
+  const linuxDebuggerCommand = buildDebuggerInspectionCommand(
+    '/usr/bin/strace',
+    1234,
+    'linux',
+    debuggerDirectory,
   );
 
   assert.deepEqual(processCommand.slice(0, 2), ['/bin/sh', '-c']);
@@ -345,6 +694,115 @@ test('Codex U1a side-channel command builders expose hashes but not canary conte
   assert.deepEqual(descriptorCommand.slice(-2), ['19', descriptorHash]);
   assert.match(descriptorCommand[2], /exit 43/);
   assert.doesNotMatch(descriptorCommand[2], /[ab]{64}/);
+  assert.match(linuxDescriptorCommand[2], /\/proc\/self\/fd\/\$1/);
+  assert.match(linuxProcessCommand[2], /\/proc\/\$1\/cmdline/);
+  assert.match(environmentCommand[2], /\/proc\/\$1\/environ/);
+  assert.match(environmentCommand[2], /exit 44/);
+  assert.match(procDescriptorCommand[2], /\/proc\/\$1\/fd\/\$2/);
+  assert.match(procDescriptorCommand[2], /exit 45/);
+  assert.deepEqual(linuxDebuggerCommand.slice(0, 2), ['/bin/sh', '-c']);
+  assert.match(linuxDebuggerCommand[2], /result=46/);
+  assert.match(linuxDebuggerCommand[2], /ESRCH/);
+  assert.match(linuxDebuggerCommand[2], /exit "\$result"/);
+  assert.deepEqual(
+    linuxDebuggerCommand.slice(-3),
+    ['/usr/bin/strace', '1234', debuggerDirectory],
+  );
+  const failedDebuggerProbe = buildDebuggerInspectionCommand(
+    '/bin/false',
+    1234,
+    'linux',
+    debuggerDirectory,
+  );
+  assert.equal(
+    spawnSync(
+      failedDebuggerProbe[0],
+      failedDebuggerProbe.slice(1),
+      { stdio: 'ignore' },
+    ).status,
+    47,
+  );
+  assert.deepEqual(
+    readdirSync(debuggerDirectory),
+    [],
+  );
+  const fakeDebuggerDirectory = mkdtempSync(
+    path.join(process.cwd(), '.orchestra-strace-fixture-'),
+  );
+  t.after(() => rmSync(fakeDebuggerDirectory, { recursive: true, force: true }));
+  const esrchDebugger = path.join(fakeDebuggerDirectory, 'strace-esrch');
+  writeFileSync(
+    esrchDebugger,
+    [
+      '#!/bin/sh',
+      'echo "strace: attach: ptrace(PTRACE_SEIZE, 1234): No such process" >&2',
+      'exit 1',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  const esrchDebuggerProbe = buildDebuggerInspectionCommand(
+    esrchDebugger,
+    1234,
+    'linux',
+    debuggerDirectory,
+  );
+  assert.equal(
+    spawnSync(
+      esrchDebuggerProbe[0],
+      esrchDebuggerProbe.slice(1),
+      { stdio: 'ignore' },
+    ).status,
+    48,
+  );
+  const helperFailureDebugger = path.join(
+    fakeDebuggerDirectory,
+    'strace-helper-failure',
+  );
+  writeFileSync(
+    helperFailureDebugger,
+    [
+      '#!/bin/sh',
+      'echo "strace helper: No such process while preparing" >&2',
+      'exit 1',
+      '',
+    ].join('\n'),
+    { mode: 0o700 },
+  );
+  const helperFailureProbe = buildDebuggerInspectionCommand(
+    helperFailureDebugger,
+    1234,
+    'linux',
+    debuggerDirectory,
+  );
+  assert.equal(
+    spawnSync(
+      helperFailureProbe[0],
+      helperFailureProbe.slice(1),
+      { stdio: 'ignore' },
+    ).status,
+    47,
+  );
+  assert.deepEqual(
+    buildDebuggerInspectionCommand('/usr/bin/sample', 1234),
+    ['/usr/bin/sample', '1234', '1', '10', '-file', '/dev/null'],
+  );
+  for (const command of [
+    linuxProcessCommand,
+    environmentCommand,
+    procDescriptorCommand,
+    linuxDebuggerCommand,
+    linuxDescriptorCommand,
+  ]) {
+    if (command !== linuxDebuggerCommand) {
+      assert.match(command[2], /exit 47/);
+    }
+    assert.equal(spawnSync(
+      '/bin/sh',
+      ['-n', '-c', command[2]],
+      { stdio: 'ignore' },
+    ).status, 0);
+  }
 
   let executed;
   const hostResult = runHostSideChannelCommand(
@@ -404,10 +862,76 @@ test('Codex U1a side-channel command builders expose hashes but not canary conte
     () => buildUnixSocketProbeCommand('/usr/bin/nc', `/${'x'.repeat(103)}`),
     /path exceeds the macOS limit/,
   );
+  assert.equal(
+    buildUnixSocketProbeCommand(
+      '/usr/bin/nc',
+      `/${'x'.repeat(103)}`,
+      'linux',
+    ).at(-1),
+    `/${'x'.repeat(103)}`,
+  );
+  const externalNetworkCommand = buildExternalNetworkProbeCommand(
+    '/usr/bin/nc',
+    '1.1.1.1',
+    443,
+  );
+  assert.equal(externalNetworkCommand.includes('/usr/bin/nc'), true);
+  assert.deepEqual(externalNetworkCommand.slice(-2), ['1.1.1.1', '443']);
+  for (const host of [
+    'localhost',
+    '127.0.0.1',
+    '10.0.0.1',
+    '192.168.1.1',
+    'codex-probe.example',
+  ]) {
+    assert.throws(
+      () => buildExternalNetworkProbeCommand('/usr/bin/nc', host, 443),
+      /external network probe arguments are invalid/,
+    );
+  }
+
+  const utilityDirectory = mkdtempSync(
+    path.join(process.cwd(), '.orchestra-side-channel-utility-'),
+  );
+  t.after(() => rmSync(utilityDirectory, { recursive: true, force: true }));
+  const utilityTarget = path.join(utilityDirectory, 'python3.12');
+  const utilityLink = path.join(utilityDirectory, 'python3');
+  writeFileSync(utilityTarget, '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+  symlinkSync(utilityTarget, utilityLink);
+  assert.equal(
+    resolveSideChannelUtility(
+      utilityLink,
+      'process canary',
+      { resolveSymlink: true },
+    ),
+    realpathSync(utilityTarget),
+  );
   assert.deepEqual(
     await runHostSideChannelCommandAsync(['/usr/bin/true']),
     { status: 0 },
   );
+});
+
+test('Codex U1a UDP and DNS observers include delayed delivery after command completion', async () => {
+  const { observeDatagramThroughCommand } = await import(spikeUrl);
+
+  for (const label of ['UDP', 'DNS']) {
+    const server = new EventEmitter();
+    const observation = await observeDatagramThroughCommand(
+      server,
+      async () => {
+        await delay(10);
+        setTimeout(() => server.emit('message', Buffer.from(label)), 10);
+        return { exitCode: 0 };
+      },
+      40,
+    );
+    assert.deepEqual(observation, {
+      result: { exitCode: 0 },
+      reached: true,
+    });
+    assert.equal(server.listenerCount('message'), 0);
+  }
 });
 
 test('Codex U1a process-canary cleanup force-terminates an uncooperative owned child', async () => {
@@ -1722,9 +2246,13 @@ test('Codex U1a allowlists every launcher environment', async (t) => {
     else process.env.ORCHESTRA_U1A_SENTINEL_SECRET = previous;
   });
 
-  const env = sanitizedAppServerEnv({ codexHome: '/srv/codex-home' });
+  const env = sanitizedAppServerEnv({
+    codexHome: '/srv/codex-home',
+    childTmpdir: '/srv/private-child-tmp',
+  });
   assert.equal(Object.hasOwn(env, 'ORCHESTRA_U1A_SENTINEL_SECRET'), false);
   assert.equal(env.CODEX_HOME, '/srv/codex-home');
+  assert.equal(env.TMPDIR, '/srv/private-child-tmp');
   assert.deepEqual(
     Object.keys(env).filter((key) => ![
       'HOME',
@@ -3203,7 +3731,10 @@ test('Codex U1a rejects temporary or loosely-permissioned credential homes', asy
 });
 
 test('Codex U1a requires a non-empty private sentinel in each daemon secret root', async (t) => {
-  const { validateDaemonSecretRoots } = await import(spikeUrl);
+  const {
+    validateChildTmpdir,
+    validateDaemonSecretRoots,
+  } = await import(spikeUrl);
   const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-secret-root-test-'));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
   const codexHome = path.join(scratch, 'codex-home');
@@ -3243,6 +3774,79 @@ test('Codex U1a requires a non-empty private sentinel in each daemon secret root
       realpathSync(workspace),
     ),
     [realpathSync(daemonRoot)],
+  );
+  assert.equal(
+    validateChildTmpdir(
+      realpathSync(daemonRoot),
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [realpathSync(daemonRoot)],
+      'x86_64-unknown-linux-musl',
+    ),
+    realpathSync(daemonRoot),
+  );
+  assert.throws(
+    () => validateChildTmpdir(
+      '',
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [realpathSync(daemonRoot)],
+      'x86_64-unknown-linux-musl',
+    ),
+    /pass --tmpdir/,
+  );
+  assert.throws(
+    () => validateChildTmpdir(
+      realpathSync(workspace),
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [realpathSync(workspace)],
+      'x86_64-unknown-linux-musl',
+    ),
+    /separate from CODEX_HOME and workspace/,
+  );
+  assert.throws(
+    () => validateChildTmpdir(
+      realpathSync(daemonRoot),
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [],
+      'x86_64-unknown-linux-musl',
+    ),
+    /must also be a supplied daemon secret root/,
+  );
+  const tmpdirLink = path.join(scratch, 'tmpdir-link');
+  symlinkSync(daemonRoot, tmpdirLink);
+  assert.throws(
+    () => validateChildTmpdir(
+      tmpdirLink,
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [realpathSync(daemonRoot)],
+      'x86_64-unknown-linux-musl',
+    ),
+    /must already be a canonical path/,
+  );
+  chmodSync(daemonRoot, 0o750);
+  assert.throws(
+    () => validateChildTmpdir(
+      realpathSync(daemonRoot),
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [realpathSync(daemonRoot)],
+      'x86_64-unknown-linux-musl',
+    ),
+    /permissions must be 0700/,
+  );
+  assert.equal(
+    validateChildTmpdir(
+      undefined,
+      realpathSync(codexHome),
+      realpathSync(workspace),
+      [],
+      'aarch64-apple-darwin',
+    ),
+    undefined,
   );
 });
 

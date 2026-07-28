@@ -34,6 +34,7 @@ const SUPERVISOR = path.resolve(
   __dirname,
   '../lib/codex/app-server-supervisor.mjs',
 );
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 const REQUEST_LOG = 'fake-codex-requests.jsonl';
 const SPAWN_LOG = 'fake-codex-spawn.json';
 
@@ -332,6 +333,7 @@ test('binary attestation completes before spawn is attempted', async (t) => {
       spawnCalls[0][1],
       [
         SUPERVISOR,
+        '--group-term-grace-ms=100',
         harness.directBinary,
         'app-server',
         '--strict-config',
@@ -549,6 +551,7 @@ test('owned supervisor preserves exact app-server argv, cwd, and filtered enviro
   assert.equal(call[0], process.execPath);
   assert.deepEqual(call[1], [
     SUPERVISOR,
+    '--group-term-grace-ms=100',
     direct.directBinary,
     'app-server',
     '--strict-config',
@@ -2087,7 +2090,60 @@ test('fault handoff distinguishes safe pre-spawn failure from quarantined post-s
   });
 });
 
-test('close is single-flight and escalates TERM to KILL exactly once', async (t) => {
+test('close reaps the supervisor when the app-server exits first', async (t) => {
+  // The order that breaks a piped stdin: the child goes away, the pipe unpipes
+  // itself, our stdin is left paused, and the EOF that asks the supervisor to
+  // shut down is never delivered. The supervisor then leads its group forever.
+  const harness = createHarness(t, {
+    methods: { 'config/read': { partialThenExit: true } },
+  });
+  const client = harness.makeClient({ closeGraceMs: 500, closeKillMs: 500 });
+  await client.start();
+  const supervisorPid = client.child.pid;
+  await client.request('config/read', {
+    cwd: harness.cwd,
+    includeLayers: true,
+  }).catch(() => {});
+
+  await closeAllowingRecycledGroupId(client);
+
+  await waitFor(
+    () => {
+      try {
+        process.kill(supervisorPid, 0);
+        return false;
+      } catch (error) {
+        return error.code === 'ESRCH';
+      }
+    },
+    'supervisor to exit',
+  );
+});
+
+// Once the leader exits, the group id it held can be recycled — on this host
+// that has been observed mid-run, with the read-only probe answering EPERM for
+// a group that had become someone else's. Only that one outcome is tolerated:
+// it carries an EPERM cause and means the group is not ours to read. A group
+// that still holds processes reports the same code with no cause, and must
+// still fail the test — otherwise a supervisor that left its group populated
+// would pass unnoticed.
+async function closeAllowingRecycledGroupId(client) {
+  try {
+    await client.close();
+  } catch (error) {
+    const recycled = error.code === 'CODEX_PROCESS_CLEANUP_UNVERIFIED'
+      && error.cause?.code === 'EPERM';
+    if (!recycled) throw error;
+  }
+}
+
+// Terminating the owned group belongs to the supervisor. A parent that checks
+// "is the leader still alive?" and then signals -pgid cannot close the window
+// between the two: the leader may exit and the id be recycled in between, so
+// the kill can land on an unrelated group. Only the group's live leader can
+// signal it without racing its own exit, so the parent signals nothing lethal
+// and confines itself to a read-only proof once the supervisor is gone.
+test('the supervisor terminates a stubborn tree without any parent signal', async (t) => {
   const harness = createHarness(t, {
     ignoreSigterm: true,
     ignoreStdinClose: true,
@@ -2102,18 +2158,21 @@ test('close is single-flight and escalates TERM to KILL exactly once', async (t)
     },
   });
   await client.start();
+  const supervisorPid = client.child.pid;
+
   const closes = [client.close(), client.close(), client.close()];
   assert.equal(closes[0], closes[1]);
   assert.equal(closes[1], closes[2]);
-  await Promise.all(closes);
-  assert.deepEqual(
-    signals.map(({ signal }) => signal),
-    ['SIGTERM', 'SIGKILL'],
-  );
-  assert.ok(signals.every(({ pid }) => pid < -1));
+  await closeAllowingRecycledGroupId(client);
+
+  // The claim under test: the tree came down without the parent ever aiming a
+  // signal at a process group it could not prove was still its own.
+  assert.deepEqual(signals.map(({ signal }) => signal), [0]);
+  assert.deepEqual(signals.map(({ pid }) => pid), [-supervisorPid]);
+  assert.doesNotThrow(() => client.close());
 });
 
-test('close never sends a stale KILL after TERM has already reaped the child', async (t) => {
+test('close sends no signal at all when the tree exits on its own', async (t) => {
   const harness = createHarness(t);
   const signals = [];
   const client = harness.makeClient({
@@ -2125,14 +2184,388 @@ test('close never sends a stale KILL after TERM has already reaped the child', a
     },
   });
   await client.start();
-  await client.close();
-  assert.equal(signals[0].signal, 'SIGTERM');
-  if (process.platform !== 'win32') {
-    assert.ok(signals.some(({ signal }) => signal === 'SIGUSR1'));
-  }
-  assert.equal(
-    signals.some(({ signal }) => signal === 'SIGKILL'),
-    false,
-  );
+  await closeAllowingRecycledGroupId(client);
+
+  assert.equal(signals.every(({ signal }) => signal === 0), true);
   assert.doesNotThrow(() => client.close());
+});
+
+// Terminating the owned group is the supervisor's job, so the parent's only
+// remaining kill(2) call is the read-only emptiness probe. A wedged
+// `/bin/ps -axo pid=,pgid=` used to leave close() awaiting forever — execFile's
+// timeout only sends SIGTERM, so the promise never settled.
+const OWNED_PID = 999_001;
+
+function fakeSupervisorChild(pid) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.exitCode = null;
+  child.signalCode = null;
+  child.stdin = new PassThrough();
+  child.stdout = new PassThrough();
+  child.stderr = new PassThrough();
+  child.kill = () => true;
+  child.exit = (code, signal) => {
+    if (child.exitCode !== null || child.signalCode !== null) return;
+    child.exitCode = code;
+    child.signalCode = signal;
+    child.emit('exit', code, signal);
+    child.emit('close', code, signal);
+  };
+  return child;
+}
+
+function killError(code) {
+  const error = new Error(`kill ${code}`);
+  error.code = code;
+  return error;
+}
+
+async function resolvedWithin(promise, deadlineMs = 1_500) {
+  let timer;
+  const outcome = await Promise.race([
+    promise.then(() => ({ resolved: true }), (error) => ({ resolved: false, error })),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve({ resolved: false, error: null }), deadlineMs);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  assert.equal(
+    outcome.resolved,
+    true,
+    outcome.error
+      ? `expected close to succeed, got ${outcome.error.code ?? outcome.error.message}`
+      : `expected close to settle within ${deadlineMs}ms`,
+  );
+}
+
+// Stands in for a supervisor that terminates its own group: ending stdin is the
+// only request the parent makes, and the supervisor's exit is the only answer it
+// waits for. `retires: false` models a supervisor that never finishes.
+function attachFakeSupervisor(harness, options = {}) {
+  const {
+    onProbe = () => { throw killError('ESRCH'); },
+    retires = true,
+  } = options;
+  const child = fakeSupervisorChild(OWNED_PID);
+  const signals = [];
+  const client = harness.makeClient({
+    closeGraceMs: 60,
+    closeKillMs: 60,
+    killFn: (target, signal) => {
+      signals.push({ pid: target, signal });
+      return onProbe(signal);
+    },
+    ...options.client,
+  });
+  client.child = child;
+  client._attachChild();
+  if (retires) child.stdin.once('finish', () => child.exit(0, null));
+  return { client, child, signals };
+}
+
+test('close requests shutdown with stdin alone and only reads the group', async (t) => {
+  const harness = createHarness(t);
+  const { client, child, signals } = attachFakeSupervisor(harness);
+
+  await client.close();
+
+  assert.equal(child.stdin.writableEnded, true);
+  assert.deepEqual(signals, [{ pid: -OWNED_PID, signal: 0 }]);
+});
+
+test('close ignores the process-table probe that used to wedge it', async (t) => {
+  const harness = createHarness(t);
+  const { client, signals } = attachFakeSupervisor(harness);
+  // The shipped cleanup awaited this inside its poll loop, so a wedged
+  // `/bin/ps` left close() unable to settle at all.
+  client._ownedGroupMembers = () => new Promise(() => {});
+
+  await resolvedWithin(client.close());
+
+  assert.deepEqual(signals, [{ pid: -OWNED_PID, signal: 0 }]);
+});
+
+test('close fails closed when the owned group never proves empty', async (t) => {
+  const harness = createHarness(t);
+  // Every read reports members, so emptiness is never proven.
+  const { client, signals } = attachFakeSupervisor(harness, {
+    onProbe: () => true,
+  });
+
+  await rejectedWithinWithCode(
+    client.close(),
+    'CODEX_PROCESS_CLEANUP_UNVERIFIED',
+    1_500,
+  );
+  assert.ok(signals.length >= 1);
+  assert.equal(signals.every(({ signal }) => signal === 0), true);
+});
+
+test('close fails closed when the owned group cannot be read', async (t) => {
+  const harness = createHarness(t);
+  const { client, signals } = attachFakeSupervisor(harness, {
+    onProbe: () => { throw killError('EPERM'); },
+  });
+
+  await rejectedWithinWithCode(
+    client.close(),
+    'CODEX_PROCESS_CLEANUP_UNVERIFIED',
+    1_500,
+  );
+  assert.equal(signals.every(({ signal }) => signal === 0), true);
+});
+
+test('close fails closed when the supervisor never terminates its group', async (t) => {
+  const harness = createHarness(t);
+  const { client, signals } = attachFakeSupervisor(harness, { retires: false });
+
+  await rejectedWithinWithCode(
+    client.close(),
+    'CODEX_PROCESS_CLOSE_TIMEOUT',
+    1_500,
+  );
+  // Escalating here is exactly what is unsafe: the parent cannot know the
+  // leader is still alive at the instant a group signal would land.
+  assert.deepEqual(signals, []);
+});
+
+test('supervisor terminates a stubborn tree on stdin EOF', async (t) => {
+  const harness = createHarness(t);
+  const stubborn = path.join(harness.cwd, 'stubborn-child.mjs');
+  writeFileSync(stubborn, [
+    "process.on('SIGTERM', () => {});",
+    'process.stdin.resume();',
+    "process.stdout.write('ready\\n');",
+    'setInterval(() => {}, 1000);',
+    '',
+  ].join('\n'));
+
+  const { supervisor, pgid, state } = spawnSupervisor(
+    t,
+    harness,
+    [process.execPath, stubborn],
+  );
+
+  let seen = '';
+  supervisor.stdout.on('data', (chunk) => { seen += chunk.toString(); });
+  await waitFor(() => seen.includes('ready'), 'stubborn child startup');
+
+  supervisor.stdin.end();
+  const exited = await settledWithin(
+    new Promise((resolve) => supervisor.once('close', () => resolve('exited'))),
+    5_000,
+  );
+  assert.equal(exited, 'exited', 'supervisor must terminate its own group');
+
+  // Nothing may be left in the group the supervisor led. Members killed with
+  // the leader linger as zombies until reaped, so this polls exactly as the
+  // client's own proof does.
+  await waitFor(
+    () => {
+      try {
+        process.kill(-pgid, 0);
+        return false;
+      } catch (error) {
+        return error.code === 'ESRCH';
+      }
+    },
+    'owned process group to drain',
+  );
+  state.groupProvenEmpty = true;
+});
+
+// Asks the supervisor to tear down the group it leads, the one safe way to do
+// it, and reports loudly if it will not. Signalling the group here is what the
+// whole design forbids, so a supervisor that ignores its shutdown request is a
+// leak to be surfaced, never something to kill our way out of.
+async function reapSupervisor(supervisor, state, timeoutMs = 2_000) {
+  if (state.groupProvenEmpty) return;
+  if (supervisor.exitCode !== null || supervisor.signalCode !== null) return;
+  supervisor.stdin.end();
+  let timer;
+  const outcome = await Promise.race([
+    new Promise((resolve) => supervisor.once('close', () => resolve('closed'))),
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), timeoutMs);
+    }),
+  ]);
+  if (timer !== undefined) clearTimeout(timer);
+  if (outcome === 'closed') return;
+  // Drop our own handles so the runner is not held open by the process we are
+  // about to report.
+  supervisor.stdout?.destroy();
+  supervisor.stderr?.destroy();
+  supervisor.stdin?.destroy();
+  supervisor.unref?.();
+  throw new Error(
+    `leaked supervisor pid ${supervisor.pid}: it did not terminate its own `
+    + `process group within ${timeoutMs}ms`,
+  );
+}
+
+function spawnSupervisor(t, harness, childArgs) {
+  const supervisor = spawn(
+    process.execPath,
+    [SUPERVISOR, '--group-term-grace-ms=100', ...childArgs],
+    { cwd: harness.cwd, stdio: ['pipe', 'pipe', 'pipe'], detached: true },
+  );
+  const pgid = supervisor.pid;
+  const state = { groupProvenEmpty: false };
+  t.after(() => reapSupervisor(supervisor, state));
+  return { supervisor, pgid, state };
+}
+
+test('supervisor teardown surfaces one that will not terminate its group', async () => {
+  const stuck = fakeSupervisorChild(4_242);
+  await assert.rejects(
+    reapSupervisor(stuck, { groupProvenEmpty: false }, 50),
+    /leaked supervisor pid 4242/,
+  );
+  assert.equal(stuck.stdin.destroyed, true, 'handles must be released');
+});
+
+test('supervisor teardown asks a live supervisor to shut itself down', async () => {
+  const willing = fakeSupervisorChild(4_243);
+  willing.stdin.once('finish', () => willing.exit(0, null));
+  await reapSupervisor(willing, { groupProvenEmpty: false }, 1_000);
+  assert.equal(willing.stdin.writableEnded, true);
+});
+
+test('supervisor teardown leaves a proven-empty group untouched', async () => {
+  const done = fakeSupervisorChild(4_244);
+  await reapSupervisor(done, { groupProvenEmpty: true }, 50);
+  assert.equal(done.stdin.writableEnded, false);
+});
+
+function settledWithin(promise, ms) {
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve('timeout'), ms);
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+}
+
+test('supervisor exits on parent EOF after its child has already gone', async (t) => {
+  const harness = createHarness(t);
+  const quick = path.join(harness.cwd, 'quick-exit-child.mjs');
+  writeFileSync(quick, "process.stdout.write('bye\\n');\nprocess.exit(0);\n");
+  const { supervisor, pgid, state } = spawnSupervisor(
+    t,
+    harness,
+    [process.execPath, quick],
+  );
+
+  // The child's exit reaches us as stdout EOF. This is the ordering that leaves
+  // a piped stdin unpiped and paused, losing the EOF that follows.
+  supervisor.stdout.resume();
+  const sawEof = await settledWithin(
+    new Promise((resolve) => supervisor.stdout.once('end', () => resolve('eof'))),
+    5_000,
+  );
+  assert.equal(sawEof, 'eof');
+  assert.equal(supervisor.exitCode, null, 'supervisor must outlive its child');
+
+  supervisor.stdin.end();
+  const exited = await settledWithin(
+    new Promise((resolve) => supervisor.once('close', () => resolve('exited'))),
+    5_000,
+  );
+  assert.equal(exited, 'exited', 'parent EOF must still reach the supervisor');
+
+  await waitFor(
+    () => {
+      try {
+        process.kill(-pgid, 0);
+        return false;
+      } catch (error) {
+        return error.code === 'ESRCH';
+      }
+    },
+    'owned process group to drain',
+  );
+  state.groupProvenEmpty = true;
+});
+
+test('supervisor forwards parent stdin to its child exactly once', async (t) => {
+  const harness = createHarness(t);
+  const echo = path.join(harness.cwd, 'echo-child.mjs');
+  writeFileSync(echo, [
+    "process.stdin.on('data', (chunk) => process.stdout.write(chunk));",
+    'process.stdin.resume();',
+    'setInterval(() => {}, 1000);',
+    '',
+  ].join('\n'));
+  const { supervisor } = spawnSupervisor(t, harness, [process.execPath, echo]);
+
+  let seen = '';
+  supervisor.stdout.on('data', (chunk) => { seen += chunk.toString(); });
+  supervisor.stdin.write('ping\n');
+  await waitFor(() => seen.includes('ping'), 'echoed stdin');
+  // Let any duplicate arrive before counting.
+  await new Promise((resolve) => setTimeout(resolve, 150));
+
+  // A second forwarder alongside the pipe would deliver — and echo — twice.
+  assert.equal(seen.split('ping').length - 1, 1, `forwarded more than once: ${seen}`);
+});
+
+test('supervisor reports its child gone when the child never starts', async (t) => {
+  const harness = createHarness(t);
+  const missing = path.join(harness.cwd, 'does-not-exist');
+  const { supervisor } = spawnSupervisor(t, harness, [missing, 'app-server']);
+
+  // A failed spawn still emits 'close', so dropping the generic 'error' report
+  // must not cost the parent its EOF.
+  supervisor.stdout.resume();
+  const closed = await settledWithin(
+    new Promise((resolve) => supervisor.stdout.on('end', () => resolve('eof'))),
+    4_000,
+  );
+
+  assert.equal(closed, 'eof');
+});
+
+test('cleanup never shells out to a process table query', () => {
+  const source = readFileSync(
+    path.resolve(__dirname, '../lib/codex/app-server-client.js'),
+    'utf8',
+  );
+  assert.equal(source.includes('/bin/ps'), false);
+  assert.equal(/\bp(?:s|grep)\b\s*['"]/.test(source), false);
+  assert.equal(source.includes('pgrep'), false);
+});
+
+test('close timer budgets must stay inside the platform timer range', async (t) => {
+  const harness = createHarness(t);
+  // Past the range a delay collapses to ~1ms, so a long close budget would
+  // silently become no budget rather than a long wait.
+  assert.throws(
+    () => harness.makeClient({ closeGraceMs: MAX_TIMER_DELAY_MS + 1 }),
+    /closeGraceMs must not exceed/,
+  );
+  assert.throws(
+    () => harness.makeClient({ closeKillMs: MAX_TIMER_DELAY_MS + 1 }),
+    /closeKillMs must not exceed/,
+  );
+  // close waits out grace and kill in a single timer, so the sum matters even
+  // when each half is individually legal.
+  assert.throws(
+    () => harness.makeClient({
+      closeGraceMs: MAX_TIMER_DELAY_MS,
+      closeKillMs: 1,
+    }),
+    /closeGraceMs \+ closeKillMs must not exceed/,
+  );
+  assert.doesNotThrow(() => harness.makeClient({
+    closeGraceMs: MAX_TIMER_DELAY_MS - 1,
+    closeKillMs: 1,
+  }));
+  // Byte and count limits are not delays and keep their existing range.
+  assert.doesNotThrow(
+    () => harness.makeClient({ maxQueuedBytes: MAX_TIMER_DELAY_MS + 1 }),
+  );
 });

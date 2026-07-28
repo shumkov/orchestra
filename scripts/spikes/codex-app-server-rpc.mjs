@@ -171,12 +171,16 @@ function projectSettingsProfile(value) {
   ) {
     throw new Error('app-server thread settings permission profile is malformed');
   }
-  return {
+  const profile = {
     id: requiredBoundedString(value.id, 'permission profile id'),
     extends: value.extends === null
       ? null
       : boundedString(value.extends, 'permission profile parent'),
   };
+  if (profile.id !== 'polygram-session' || profile.extends !== null) {
+    throw new Error('app-server thread settings permission profile drifted');
+  }
+  return profile;
 }
 
 function projectSettingsSandbox(value) {
@@ -195,6 +199,15 @@ function projectSettingsSandbox(value) {
   const roots = value.writableRoots.map((root) => (
     boundedString(root, 'sandbox writable root', 4096)
   ));
+  if (
+    value.type !== 'workspaceWrite'
+    || value.networkAccess !== false
+    || value.excludeSlashTmp !== true
+    || value.excludeTmpdirEnvVar !== true
+    || roots.length !== 0
+  ) {
+    throw new Error('app-server thread settings sandbox policy drifted');
+  }
   return {
     type: requiredBoundedString(value.type, 'sandbox type'),
     networkAccess: value.networkAccess,

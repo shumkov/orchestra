@@ -192,15 +192,22 @@ direct-binary run; it does not clear the broader hosted-tool enforcement gate.
 
 ## Profile provenance
 
-Live pinned-runtime characterization found the exact profile at top-level
+Two live pinned-runtime rollout runs found the exact profile at top-level
 `activePermissionProfile` in both `thread/start` and `thread/resume`
 responses. The value is fixture-pinned as `{id: "polygram-session",
 extends: null}`. Both attachment responses also return exactly one concrete
 `runtimeWorkspaceRoots` entry equal to the owned cwd. Orchestra exposes that
 entry only as `{count: 1, sha256: [sha256(ownedCwd)]}`.
 
-Fresh, resume, and `thread/settings/updated` all return the same legacy
-compatibility envelope:
+Neither rollout run emitted `thread/settings/updated` during fresh or resume
+attachment within the bounded wait. An exact attachment response is therefore
+sufficient profile provenance. If an attachment-time notification does appear,
+the checker still requires its complete static settings view to be exact.
+Notifications caused by explicit experimental `thread/settings/update` calls
+are characterized separately and do not establish attachment-time emission.
+
+Fresh and resume responses, and any observed `thread/settings/updated`, use the
+same legacy compatibility envelope:
 
 ```json
 {

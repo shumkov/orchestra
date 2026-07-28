@@ -509,7 +509,7 @@ test('factory threads toolDispatcherCapabilities into CliProcess', () => {
 
 // ─── turn identity for consumers ───────────────────────────────────
 
-test('the turn id is published on the caller\'s context object', async () => {
+test('the turn id is handed to the caller before any tool call can arrive', async () => {
   // A consumer holding per-turn state (a live preview) needs to know WHICH turn
   // it is holding, so it can refuse a late tool call from an earlier one. The
   // alternative — reading pendingQueue — is reaching into our internals.
@@ -517,14 +517,28 @@ test('the turn id is published on the caller\'s context object', async () => {
   p.bridgeReady = true;
   p.mcpReady = true;
   p._writeToBridge = () => true;
-  const context = { streamer: {} };
+  const seen = [];
+  const context = { streamer: {}, onTurnId: (id) => seen.push(id) };
 
   p.send('hello', { context }).catch(() => {});
   await new Promise(r => setImmediate(r));
 
-  assert.equal(typeof context.turnId, 'string');
-  assert.equal(context.turnId, p.pendingQueue[0].turnId,
-    'the published id must be the turn the engine actually created');
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0], p.pendingQueue[0].turnId,
+    'the id handed over must be the turn the engine actually created');
+});
+
+test('a consumer whose onTurnId throws does not take the turn down', async () => {
+  const { p } = makeProc();
+  p.bridgeReady = true;
+  p.mcpReady = true;
+  p._writeToBridge = () => true;
+
+  p.send('hello', { context: { onTurnId: () => { throw new Error('consumer bug'); } } })
+    .catch(() => {});
+  await new Promise(r => setImmediate(r));
+
+  assert.equal(p.pendingQueue.length, 1, 'the turn was still registered');
 });
 
 test('a reply dispatch carries the turn_id it named', async () => {

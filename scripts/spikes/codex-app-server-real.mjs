@@ -2669,9 +2669,9 @@ export function buildFileEnforcementScript(daemonSecretRootCount) {
   );
   return [
     '/usr/bin/head -c 1 "$1" >/dev/null 2>&1 || exit 10',
-    ': > "$2" || exit 11',
-    'if exec 3<"$3"; then exit 12; fi',
-    'if [ -e "$4" ] && exec 4<"$4"; then exit 13; fi',
+    'printf %s "" > "$2" || exit 11',
+    'if /usr/bin/head -c 1 "$3" >/dev/null 2>&1; then exit 12; fi',
+    'if [ -e "$4" ] && /usr/bin/head -c 1 "$4" >/dev/null 2>&1; then exit 13; fi',
     ...daemonChecks,
     'exit 0',
   ].join('; ');

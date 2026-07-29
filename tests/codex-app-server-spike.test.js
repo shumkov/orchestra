@@ -2728,6 +2728,74 @@ test('Codex U1a braces multi-digit daemon-root probe arguments', async () => {
   assert.doesNotMatch(script, /\bcd\b/);
 });
 
+test('Codex U1a dash file denial probe continues after denied CODEX_HOME opens', async (t) => {
+  const dash = ['/bin/dash', '/usr/bin/dash'].find(existsSync);
+  if (!dash) {
+    t.skip('dash is unavailable on this host');
+    return;
+  }
+  const { buildFileEnforcementScript } = await import(spikeUrl);
+  const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-dash-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const readable = path.join(scratch, 'workspace-readable');
+  const marker = path.join(scratch, 'workspace-marker');
+  const config = path.join(scratch, 'config.toml');
+  const auth = path.join(scratch, 'auth.json');
+  const daemonSentinel = path.join(scratch, 'daemon-sentinel');
+  writeFileSync(readable, 'x');
+
+  const fatalRedirection = spawnSync(
+    dash,
+    ['-c', 'exec 3<"$1"; exit 99', 'orchestra-u1a', config],
+    { encoding: 'utf8' },
+  );
+  assert.equal(fatalRedirection.status, 2);
+
+  const script = buildFileEnforcementScript(1);
+  const runProbe = ({
+    readablePath = readable,
+    markerPath = marker,
+  } = {}) => spawnSync(
+    dash,
+    [
+      '-c',
+      script,
+      'orchestra-u1a',
+      readablePath,
+      markerPath,
+      config,
+      auth,
+      daemonSentinel,
+    ],
+    { encoding: 'utf8' },
+  );
+
+  assert.equal(
+    runProbe({ readablePath: path.join(scratch, 'missing-readable') }).status,
+    10,
+  );
+  assert.equal(
+    runProbe({
+      markerPath: path.join(scratch, 'missing-parent', 'marker'),
+    }).status,
+    11,
+  );
+  const denied = runProbe();
+  assert.equal(denied.status, 0, denied.stderr);
+  assert.equal(denied.stdout, '');
+  assert.equal(existsSync(marker), true);
+
+  writeFileSync(config, '');
+  assert.equal(runProbe().status, 12);
+  unlinkSync(config);
+  writeFileSync(auth, '');
+  assert.equal(runProbe().status, 13);
+  unlinkSync(auth);
+  writeFileSync(daemonSentinel, '');
+  assert.equal(runProbe().status, 30);
+  assert.doesNotMatch(script, /\bexec [34]</);
+});
+
 test('Codex U1a passes protected sentinel files to the command probe', async () => {
   const { buildFileEnforcementCommand } = await import(spikeUrl);
   const command = buildFileEnforcementCommand(

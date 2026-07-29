@@ -722,6 +722,19 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   assert.match(progressSection, /- \[x\]/i, 'shows the checked-item syntax an update re-sends');
   assert.match(progressSection, /check items off|tick(ing)? (them|items) off/i,
     'names checking items off as the canonical progressive-update idiom');
+  // 2026-07-29 live failure: the agent posted the plan checklist and ENDED the
+  // turn waiting for approval; the user had to say "do it" before any work (or
+  // any ticking) happened. The contract must make the plan a progress display,
+  // not a proposal — and the checklist the FIRST action of multi-step work, in
+  // the same hard register that fixed reply adoption.
+  assert.match(progressSection, /FIRST visible action MUST/i,
+    'the plan checklist must be the first visible action of multi-step work');
+  assert.match(progressSection, /NOT a stopping point/i,
+    'posting the plan must not end the turn awaiting approval');
+  assert.match(progressSection, /after EVERY step|after each one/i,
+    'ticking happens after every completed step, not at the end');
+  assert.match(progressSection, /CONTRACT VIOLATION/i,
+    'silent work then a dump is named a contract violation, not a style choice');
   assert.match(progressSection, /re-?render/i, 'states that an edit re-renders (rich stays rich)');
   assert.match(progressSection, /whole list|full list|entire list/i,
     'an edit REPLACES the body, so a partial re-send would lose the rest of the list');

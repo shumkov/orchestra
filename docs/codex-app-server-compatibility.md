@@ -220,9 +220,23 @@ Every production `turn/start` carries the complete catalog-validated
 `model`/`effort` pair selected for that admission. Changing the local
 selection preserves the process generation and provider thread, leaves an
 active turn and its steering on their admitted pair, and applies to the next
-turn. Dynamic settings notifications must agree with the attached, last
-observed, admitting, or active pair while the full static permission,
-workspace, approval, and provider policy remains exact.
+turn.
+
+The pinned `ThreadStartResponse` and `ThreadResumeResponse` schemas require
+`model` but permit `reasoningEffort` to be omitted or `null`. Orchestra
+validates attachment model and any present effort as non-empty strings of at
+most 512 UTF-8 bytes. Missing effort remains unknown: it is not replaced with
+the local selection or a catalog default. `thread/settings/updated` remains
+stricter and must contain a complete model/effort pair.
+
+Complete observed, admitting, active, and last-accepted turn settings take
+precedence over partial attachment evidence. A model-only attachment may
+authorize the first complete observation only by exact model, only before the
+first turn admission, and only while no complete candidate exists. First turn
+admission retires that partial authority permanently; the last accepted
+complete pair remains authoritative after the turn finishes. All settings
+notifications still require the full static permission, workspace, approval,
+and provider policy to remain exact.
 
 Codex does not persist a resumable rollout for `thread/start` alone. The
 checker therefore completes one fixed no-tools text turn, requires the matching
@@ -245,6 +259,13 @@ sufficient profile provenance. If an attachment-time notification does appear,
 the checker still requires its complete static settings view to be exact.
 Notifications caused by explicit experimental `thread/settings/update` calls
 are characterized separately and do not establish attachment-time emission.
+
+The named-profile gate reports raw attachment-schema evidence separately from
+live production attachment validation. Fresh and resume responses must pass
+the same bounded parser used by `CodexProcess`; raw schema hashes or shape
+checks alone cannot clear the gate. Output retains only validation booleans and
+the effort presence class (`omitted`, `null`, or `present`), not model or effort
+values.
 
 Fresh and resume responses, and any observed `thread/settings/updated`, use the
 same legacy compatibility envelope:

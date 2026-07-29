@@ -49,6 +49,9 @@ const {
   protocolSchema: productionProtocolSchema,
   resolveCodexTargetPin,
 } = require('../../lib/codex/app-server-client.js');
+const {
+  parseCodexAttachmentSettings,
+} = require('../../lib/codex/thread-attachment-settings.js');
 const fixtureDir = resolve(here, '../../tests/fixtures/codex-app-server-0.145.0');
 const manifest = JSON.parse(readFileSync(join(fixtureDir, 'manifest.json'), 'utf8'));
 const profileProvenanceFixture = JSON.parse(
@@ -657,6 +660,7 @@ export async function attestConnectionPolicy(
 
 const NAMED_PROFILE_CHECKS = [
   'schemaHashesVerified',
+  'attachmentResponseSchemaVerified',
   'stableProfileMethodsVerified',
   'configSourceAttested',
   'configUnchangedAtEnd',
@@ -671,6 +675,8 @@ const NAMED_PROFILE_CHECKS = [
   'accountAuthenticated',
   'freshProfileProvenance',
   'resumeProfileProvenance',
+  'freshAttachmentProductionValidated',
+  'resumeAttachmentProductionValidated',
   'resumableTurnCompleted',
   'noUnexpectedServerRequests',
 ];
@@ -1047,6 +1053,38 @@ export function assertTransportCorrelationSurfaces(protocolSchema) {
     resumeUserMessageClientId: true,
     semantics: 'correlation-only',
   };
+}
+
+function schemaAllowsNull(definition) {
+  if (Array.isArray(definition?.type)) {
+    return definition.type.includes('null');
+  }
+  if (definition?.type === 'null') return true;
+  return [...(definition?.anyOf ?? []), ...(definition?.oneOf ?? [])]
+    .some((candidate) => schemaAllowsNull(candidate));
+}
+
+export function assertAttachmentResponseSchemas(protocolSchema) {
+  const definitions = protocolSchema.definitions ?? {};
+  const verified = {};
+  for (const [name, key] of [
+    ['ThreadStartResponse', 'threadStart'],
+    ['ThreadResumeResponse', 'threadResume'],
+  ]) {
+    const definition = definitions[name];
+    const required = new Set(definition?.required ?? []);
+    if (
+      definition?.type !== 'object'
+      || !required.has('model')
+      || required.has('reasoningEffort')
+      || !Object.hasOwn(definition?.properties ?? {}, 'reasoningEffort')
+      || !schemaAllowsNull(definition.properties.reasoningEffort)
+    ) {
+      throw new Error(`${name} attachment settings schema changed`);
+    }
+    verified[key] = true;
+  }
+  return verified;
 }
 
 export function findClientUserMessageEvidence(
@@ -2410,12 +2448,6 @@ export async function characterizeThreadProfile(connection, method, params) {
   if (method === 'thread/resume' && threadId !== params.threadId) {
     throw new Error('thread/resume returned a different thread id');
   }
-  const notification = await connection.waitForNotification(
-    (message) => (
-      message.method === 'thread/settings/updated'
-      && message.params?.threadId === threadId
-    ),
-  );
   const attachmentPolicy = characterizeNamedProfilePolicy(
     result,
     params.cwd ?? result.cwd,
@@ -2424,6 +2456,13 @@ export async function characterizeThreadProfile(connection, method, params) {
   if (!attachmentPolicy.exact) {
     throw new Error(`${method} returned unexpected named-profile policy`);
   }
+  const attachmentSettings = parseCodexAttachmentSettings(result);
+  const notification = await connection.waitForNotification(
+    (message) => (
+      message.method === 'thread/settings/updated'
+      && message.params?.threadId === threadId
+    ),
+  );
   const settingsPolicy = notification
     ? characterizeNamedProfilePolicy(
         notification.params.threadSettings,
@@ -2435,8 +2474,8 @@ export async function characterizeThreadProfile(connection, method, params) {
   }
   return {
     threadId,
-    model: result.model,
-    reasoningEffort: result.reasoningEffort ?? null,
+    attachmentProductionValidated: true,
+    attachmentEffortPresence: attachmentSettings.effortPresence,
     responseExtensionExact: exactActiveProfile(result.activePermissionProfile),
     settingsNotificationExact: exactActiveProfile(
       notification?.params?.threadSettings?.activePermissionProfile,
@@ -4094,6 +4133,9 @@ async function main() {
       schema,
       experimentalV2Schema,
     );
+    assertAttachmentResponseSchemas(schema);
+    assertAttachmentResponseSchemas(experimentalV2Schema);
+    const attachmentResponseSchemaVerified = true;
     const experimentalClientRequest = JSON.parse(
       readFileSync(experimentalClientRequestPath, 'utf8'),
     );
@@ -4180,10 +4222,14 @@ async function main() {
 
     let freshProfile = {
       threadId: null,
+      attachmentProductionValidated: false,
+      attachmentEffortPresence: 'not-run',
       responseExtensionExact: false,
       settingsNotificationExact: false,
     };
     let resumeProfile = {
+      attachmentProductionValidated: false,
+      attachmentEffortPresence: 'not-run',
       responseExtensionExact: false,
       settingsNotificationExact: false,
     };
@@ -4329,6 +4375,7 @@ async function main() {
     });
     const evidence = {
       schemaHashesVerified: true,
+      attachmentResponseSchemaVerified,
       stableProfileMethodsVerified,
       configSourceAttested: true,
       configUnchangedAtEnd,
@@ -4343,6 +4390,12 @@ async function main() {
       accountAuthenticated,
       freshProfileProvenance: provenance.accepted,
       resumeProfileProvenance: provenance.accepted,
+      freshAttachmentProductionValidated: (
+        freshProfile.attachmentProductionValidated
+      ),
+      resumeAttachmentProductionValidated: (
+        resumeProfile.attachmentProductionValidated
+      ),
       resumableTurnCompleted,
       noUnexpectedServerRequests: noUnexpectedRequests,
     };
@@ -4408,10 +4461,12 @@ async function main() {
       legacyWorkspaceWriteReadOnlyAccessField: hasRestrictedReadPolicy,
       freshProfileResponseExtensionExact: freshProfile.responseExtensionExact,
       freshProfileSettingsNotificationExact: freshProfile.settingsNotificationExact,
+      freshAttachmentEffortPresence: freshProfile.attachmentEffortPresence,
       freshAttachmentPolicy: freshProfile.attachmentPolicy,
       freshSettingsPolicy: freshProfile.settingsPolicy,
       resumeProfileResponseExtensionExact: resumeProfile.responseExtensionExact,
       resumeProfileSettingsNotificationExact: resumeProfile.settingsNotificationExact,
+      resumeAttachmentEffortPresence: resumeProfile.attachmentEffortPresence,
       resumeAttachmentPolicy: resumeProfile.attachmentPolicy,
       resumeSettingsPolicy: resumeProfile.settingsPolicy,
       provenanceSurface: provenance.surface,

@@ -175,8 +175,11 @@ test('prompt: the stream contract section is present only when gated on', async 
       'an explicit MUST against the named tool, like the reply contract');
     assert.match(section, /two paragraphs/i,
       'a concrete trigger — "anything long" was a judgment call the model kept resolving as no');
-    assert.match(section, /after EVERY section|after EACH section/,
+    assert.match(section, /after (EVERY|EACH) section/i,
       'per-section cadence, not "at natural checkpoints"');
+    assert.match(section, /every paragraph|each paragraph/i,
+      'a sectionless answer still has a defined checkpoint — otherwise the '
+      + 'cadence rule silently exempts four paragraphs of unbroken prose');
     assert.match(section, /before you (start writing|write) the next/i,
       'the call comes BEFORE the next section, so the preview leads the writing');
     assert.match(section, /contract violation/i,

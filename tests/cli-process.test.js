@@ -702,26 +702,41 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   // notify, so a final answer delivered as an edit would re-open the fold-drop
   // bug. What an edit MAY carry has since widened (below); what it may never
   // be is the answer.
-  assert.match(hint, /NEVER delivers the final answer|never the final answer/i,
+  // Scoped to the section that carries the edit contract, and whitespace-
+  // normalized. `reply(files` in particular appears in the file-send directive
+  // further down, so an unscoped assertion would pass on that one and prove
+  // nothing about this section.
+  const progressSection = hint
+    .slice(hint.indexOf('### Staying responsive on a long task'))
+    .split(/\n### /)[0]
+    .replace(/\s+/g, ' ');
+  assert.match(progressSection, /NEVER delivers the final answer|never the final answer/i,
     'edit_message updates work in progress, never the turn\'s answer');
-  assert.match(hint, /FINAL answer as a fresh `?reply/i,
+  assert.match(progressSection, /FINAL answer as a fresh `?reply/i,
     'the final answer must be a fresh reply (notifies + carries consumed_turn_ids)');
   // An edit re-renders the bubble through the same pipeline the original reply
   // used, so a rich chat re-renders an edited checklist rich. That makes
   // ticking items off in place the canonical progress idiom — the whole reason
   // the daemon-side feature exists — and the prompt has to actually say so, or
   // the agent keeps treating checkboxes as decoration.
-  assert.match(hint, /- \[x\]/i, 'shows the checked-item syntax an update re-sends');
-  assert.match(hint, /check items off|tick(ing)? (them|items) off/i,
+  assert.match(progressSection, /- \[x\]/i, 'shows the checked-item syntax an update re-sends');
+  assert.match(progressSection, /check items off|tick(ing)? (them|items) off/i,
     'names checking items off as the canonical progressive-update idiom');
-  assert.match(hint, /re-?render/i, 'states that an edit re-renders (rich stays rich)');
-  assert.match(hint, /whole list|full list|entire list/i,
+  assert.match(progressSection, /re-?render/i, 'states that an edit re-renders (rich stays rich)');
+  assert.match(progressSection, /whole list|full list|entire list/i,
     'an edit REPLACES the body, so a partial re-send would lose the rest of the list');
   // Caps stated honestly rather than "keep it short": the agent cannot see the
   // chat's richText setting, so it needs both numbers and the fact that the
   // tool reports which one applied.
-  assert.match(hint, /4,?000/, 'states the plain single-bubble cap');
-  assert.match(hint, /32,?000/, 'states the larger rich cap');
+  assert.match(progressSection, /4,?000/, 'states the plain single-bubble cap');
+  assert.match(progressSection, /32,?000/, 'states the larger rich cap');
+  // Reply and edit are NOT at parity, and prose that implies they are earns an
+  // agent that tries to attach a file by editing. Structure re-renders; media
+  // does not travel through an edit at all.
+  assert.match(progressSection, /TEXT-ONLY|text only/i, 'an edit renders text, not media');
+  assert.match(progressSection, /reply\(files/i, 'names the tool that DOES carry media');
+  assert.match(progressSection, /in a chat that renders rich|chat that renders rich/i,
+    'rich re-rendering is per-chat — an unqualified promise is one the daemon may not keep');
   assert.match(hint, /one or two tool calls, just answer/i,
     'over-trigger guard: quick tasks get one reply, no status bubble');
   // File-send directive (2026-06-16): the agent was curling the Bot API to send

@@ -1489,6 +1489,594 @@ test('Codex U1a background-terminal verification fails closed on cursor and time
   );
 });
 
+function linuxProcStat(pid, ppid, startTimeTicks, state = 'S') {
+  return [
+    `${pid} (fixture process)`,
+    state,
+    ppid,
+    ...Array(17).fill('0'),
+    startTimeTicks,
+  ].join(' ');
+}
+
+function procError(code) {
+  return Object.assign(new Error(`proc ${code}`), { code });
+}
+
+const TRACKED_TERMINAL_ENVIRONMENT_TOKEN = '0123456789abcdef0123456789abcdef';
+
+function linuxTrackedTerminalProcFixture(overrides = {}) {
+  const records = new Map([
+    [3, {
+      stat: linuxProcStat(3, 1, '30'),
+      cmdline: Buffer.from('/bin/sleep\0' + '120\0'),
+      executableIdentity: { device: '8', inode: '42' },
+    }],
+    [500, {
+      stat: linuxProcStat(500, 1, '5000'),
+      cmdline: Buffer.from('/usr/bin/codex\0app-server\0'),
+      executableIdentity: { device: '8', inode: '10' },
+    }],
+    [600, {
+      stat: linuxProcStat(600, 500, '6000'),
+      cmdline: Buffer.from('/usr/bin/bwrap\0'),
+      executableIdentity: { device: '8', inode: '20' },
+    }],
+    [700, {
+      stat: linuxProcStat(700, 600, '7000'),
+      cmdline: Buffer.from('/bin/sleep\0' + '120\0'),
+      environ: Buffer.from(
+        `ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=${TRACKED_TERMINAL_ENVIRONMENT_TOKEN}\0`,
+      ),
+      executableIdentity: { device: '8', inode: '42' },
+    }],
+  ]);
+  for (const [pid, record] of overrides.records ?? []) {
+    if (record === null) records.delete(pid);
+    else records.set(pid, { ...records.get(pid), ...record });
+  }
+  const statReads = new Map();
+  return {
+    listPids: overrides.listPids ?? (() => [...records.keys()].map(String)),
+    readStat(pid) {
+      const record = records.get(pid);
+      const reads = statReads.get(pid) ?? 0;
+      statReads.set(pid, reads + 1);
+      if (overrides.readStat) {
+        const result = overrides.readStat(pid, reads, record);
+        if (result !== undefined) return result;
+      }
+      if (!record) throw procError('ENOENT');
+      return record.stat;
+    },
+    readCmdline(pid) {
+      if (overrides.readCmdline) {
+        const result = overrides.readCmdline(pid, records.get(pid));
+        if (result !== undefined) return result;
+      }
+      const record = records.get(pid);
+      if (!record) throw procError('ENOENT');
+      return record.cmdline;
+    },
+    readEnviron(pid) {
+      if (overrides.readEnviron) {
+        const result = overrides.readEnviron(pid, records.get(pid));
+        if (result !== undefined) return result;
+      }
+      const record = records.get(pid);
+      if (!record) throw procError('ENOENT');
+      return record.environ ?? Buffer.alloc(0);
+    },
+    readExecutableIdentity(pid) {
+      if (overrides.readExecutableIdentity) {
+        const result = overrides.readExecutableIdentity(
+          pid,
+          records.get(pid),
+        );
+        if (result !== undefined) return result;
+      }
+      const record = records.get(pid);
+      if (!record) throw procError('ENOENT');
+      return record.executableIdentity;
+    },
+  };
+}
+
+test('Codex U1a Linux tracked-terminal host PID ignores namespace PID 3', async () => {
+  const {
+    captureLinuxProcessIdentity,
+    resolveTrackedTerminalProcess,
+    trackedTerminalProcessAlive,
+  } = await import(spikeUrl);
+  const proc = linuxTrackedTerminalProcFixture();
+  const rootIdentity = captureLinuxProcessIdentity(500, proc.readStat);
+  const tracked = resolveTrackedTerminalProcess(3, {
+    platform: 'linux',
+    rootIdentity,
+    expectedExecutableIdentity: { device: '8', inode: '42' },
+    expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+    proc,
+  });
+
+  assert.deepEqual(tracked, { pid: 700, startTimeTicks: '7000' });
+  let killPid = null;
+  function hostKill0(pid) {
+    killPid = pid;
+    throw procError('EPERM');
+  }
+  assert.throws(() => hostKill0(3), { code: 'EPERM' });
+  assert.equal(killPid, 3);
+  killPid = null;
+  assert.equal(
+    trackedTerminalProcessAlive(tracked, {
+      platform: 'linux',
+      readStat: proc.readStat,
+      kill0: hostKill0,
+    }),
+    true,
+  );
+  assert.equal(killPid, null);
+  assert.equal(
+    trackedTerminalProcessAlive(tracked, {
+      platform: 'linux',
+      readStat() {
+        throw procError('ENOENT');
+      },
+      kill0() {
+        throw new Error('Linux liveness must not signal a host PID');
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    trackedTerminalProcessAlive(tracked, {
+      platform: 'linux',
+      readStat: () => linuxProcStat(700, 600, '7000', 'Z'),
+    }),
+    false,
+  );
+});
+
+test('Codex U1a Linux tracked-terminal resolution rejects an older matching sleep', async () => {
+  const {
+    captureLinuxProcessIdentity,
+    resolveTrackedTerminalProcess,
+  } = await import(spikeUrl);
+  const exactExecutable = { device: '8', inode: '42' };
+  const olderSleep = {
+    stat: linuxProcStat(650, 500, '6500'),
+    cmdline: Buffer.from('/bin/sleep\0' + '120\0'),
+    environ: Buffer.from(
+      'ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=fedcba9876543210fedcba9876543210\0',
+    ),
+    executableIdentity: exactExecutable,
+  };
+  const notReadyProc = linuxTrackedTerminalProcFixture({
+    records: [
+      [650, olderSleep],
+      [700, {
+        cmdline: Buffer.from('/bin/sh\0-c\0pending tracked sleep\0'),
+      }],
+    ],
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, notReadyProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: notReadyProc,
+    }),
+    /no exact tracked sleep descendant/,
+  );
+
+  const readyProc = linuxTrackedTerminalProcFixture({
+    records: [[650, olderSleep]],
+  });
+  assert.deepEqual(
+    resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, readyProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: readyProc,
+    }),
+    { pid: 700, startTimeTicks: '7000' },
+  );
+
+  const unreadableEnvironmentProc = linuxTrackedTerminalProcFixture({
+    readEnviron(pid, record) {
+      if (pid === 700) throw procError('EACCES');
+      return record?.environ;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(
+        500,
+        unreadableEnvironmentProc.readStat,
+      ),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: unreadableEnvironmentProc,
+    }),
+    /tracked sleep environment was unreadable/,
+  );
+
+  for (const environ of [
+    Buffer.from(
+      `ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=${TRACKED_TERMINAL_ENVIRONMENT_TOKEN}`,
+    ),
+    Buffer.from(
+      [
+        `ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=${TRACKED_TERMINAL_ENVIRONMENT_TOKEN}`,
+        `ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=${TRACKED_TERMINAL_ENVIRONMENT_TOKEN}`,
+        '',
+      ].join('\0'),
+    ),
+  ]) {
+    const malformedEnvironmentProc = linuxTrackedTerminalProcFixture({
+      readEnviron(pid, record) {
+        if (pid === 700) return environ;
+        return record?.environ;
+      },
+    });
+    assert.throws(
+      () => resolveTrackedTerminalProcess(3, {
+        platform: 'linux',
+        rootIdentity: captureLinuxProcessIdentity(
+          500,
+          malformedEnvironmentProc.readStat,
+        ),
+        expectedExecutableIdentity: exactExecutable,
+        expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+        proc: malformedEnvironmentProc,
+      }),
+      /tracked sleep environment was malformed/,
+    );
+  }
+});
+
+test('Codex U1a Linux tracked-terminal resolution bounds total work and deadline', async () => {
+  const {
+    captureLinuxProcessIdentity,
+    resolveTrackedTerminalProcess,
+  } = await import(spikeUrl);
+  const exactExecutable = { device: '8', inode: '42' };
+  let monotonicMs = 0;
+  const slowProc = linuxTrackedTerminalProcFixture({
+    readStat(pid, reads, record) {
+      monotonicMs += 2;
+      return record?.stat;
+    },
+  });
+  const rootIdentity = captureLinuxProcessIdentity(500, slowProc.readStat);
+  monotonicMs = 0;
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity,
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: slowProc,
+      resolutionLimits: {
+        deadlineMs: 5,
+        evidenceBytesRead: 0,
+        maxEvidenceBytes: 64 * 1_024 * 1_024,
+        monotonicNow: () => monotonicMs,
+      },
+    }),
+    /Linux proc resolution exceeded its deadline/,
+  );
+
+  const wideRecords = [];
+  for (let pid = 800; pid < 900; pid += 1) {
+    wideRecords.push([pid, {
+      stat: linuxProcStat(pid, 500, String(pid * 10)),
+      cmdline: Buffer.alloc(1_024, 0x61),
+      environ: Buffer.alloc(0),
+      executableIdentity: { device: '8', inode: String(pid) },
+    }]);
+  }
+  const wideProc = linuxTrackedTerminalProcFixture({
+    records: wideRecords,
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, wideProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: wideProc,
+      resolutionLimits: {
+        deadlineMs: Number.POSITIVE_INFINITY,
+        evidenceBytesRead: 0,
+        maxEvidenceBytes: 4_096,
+        monotonicNow: () => 0,
+      },
+    }),
+    /Linux proc resolution exceeded its evidence byte budget/,
+  );
+
+  const sharedLimits = {
+    deadlineMs: Number.POSITIVE_INFINITY,
+    evidenceBytesRead: 0,
+    maxEvidenceBytes: 64 * 1_024 * 1_024,
+    monotonicNow: () => 0,
+  };
+  const sharedProc = linuxTrackedTerminalProcFixture();
+  resolveTrackedTerminalProcess(3, {
+    platform: 'linux',
+    rootIdentity: captureLinuxProcessIdentity(500, sharedProc.readStat),
+    expectedExecutableIdentity: exactExecutable,
+    expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+    proc: sharedProc,
+    resolutionLimits: sharedLimits,
+  });
+  assert.ok(sharedLimits.evidenceBytesRead > 0);
+  sharedLimits.maxEvidenceBytes = sharedLimits.evidenceBytesRead;
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, sharedProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: sharedProc,
+      resolutionLimits: sharedLimits,
+    }),
+    /Linux proc resolution exceeded its evidence byte budget/,
+  );
+});
+
+test('Codex U1a Linux tracked-terminal resolution fails closed on ambiguity and identity drift', async () => {
+  const {
+    captureLinuxProcessIdentity,
+    resolveTrackedTerminalProcess,
+    trackedTerminalProcessAlive,
+  } = await import(spikeUrl);
+  const exactExecutable = { device: '8', inode: '42' };
+
+  const zeroProc = linuxTrackedTerminalProcFixture({
+    records: [[700, {
+      stat: linuxProcStat(700, 600, '7000'),
+      cmdline: Buffer.from('/bin/sleep\0' + '119\0'),
+      executableIdentity: exactExecutable,
+    }]],
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, zeroProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: zeroProc,
+    }),
+    /no exact tracked sleep descendant/,
+  );
+
+  const ambiguousProc = linuxTrackedTerminalProcFixture({
+    records: [[701, {
+      stat: linuxProcStat(701, 500, '7010'),
+      cmdline: Buffer.from('/bin/sleep\0' + '120\0'),
+      environ: Buffer.from(
+        `ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN=${TRACKED_TERMINAL_ENVIRONMENT_TOKEN}\0`,
+      ),
+      executableIdentity: exactExecutable,
+    }]],
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, ambiguousProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: ambiguousProc,
+    }),
+    /multiple exact tracked sleep descendants/,
+  );
+
+  const reusedDuringResolution = linuxTrackedTerminalProcFixture({
+    readStat(pid, reads, record) {
+      if (pid === 700 && reads > 0) {
+        return linuxProcStat(700, 600, '7001');
+      }
+      return record?.stat;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(
+        500,
+        reusedDuringResolution.readStat,
+      ),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: reusedDuringResolution,
+    }),
+    /process identity changed during resolution/,
+  );
+  assert.throws(
+    () => trackedTerminalProcessAlive(
+      { pid: 700, startTimeTicks: '7000' },
+      {
+        platform: 'linux',
+        readStat: () => linuxProcStat(700, 600, '7001'),
+      },
+    ),
+    /tracked sleep PID was reused/,
+  );
+
+  const changedAncestry = linuxTrackedTerminalProcFixture({
+    readStat(pid, reads, record) {
+      if (pid === 600 && reads > 0) {
+        return linuxProcStat(600, 499, '6000');
+      }
+      return record?.stat;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, changedAncestry.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: changedAncestry,
+    }),
+    /process identity changed during resolution/,
+  );
+
+  const wrongExecutable = linuxTrackedTerminalProcFixture({
+    readExecutableIdentity(pid, record) {
+      if (pid === 700) return { device: '8', inode: '99' };
+      return record?.executableIdentity;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, wrongExecutable.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: wrongExecutable,
+    }),
+    /tracked sleep executable identity mismatch/,
+  );
+});
+
+test('Codex U1a Linux tracked-terminal proc parsing is bounded and fail-closed', async () => {
+  const {
+    captureLinuxProcessIdentity,
+    parseLinuxProcStat,
+    resolveTrackedTerminalProcess,
+  } = await import(spikeUrl);
+  const exactExecutable = { device: '8', inode: '42' };
+
+  assert.deepEqual(
+    parseLinuxProcStat(linuxProcStat(700, 600, '7000'), 700),
+    {
+      pid: 700,
+      ppid: 600,
+      state: 'S',
+      startTimeTicks: '7000',
+    },
+  );
+  for (const malformed of [
+    '',
+    '700 no-parentheses S 600',
+    linuxProcStat(701, 600, '7000'),
+    linuxProcStat(700, 600, 'not-decimal'),
+  ]) {
+    assert.throws(
+      () => parseLinuxProcStat(malformed, 700),
+      /Linux proc stat/,
+    );
+  }
+
+  const unreadableProc = linuxTrackedTerminalProcFixture({
+    readCmdline(pid, record) {
+      if (pid === 700) throw procError('EACCES');
+      return record?.cmdline;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, unreadableProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: unreadableProc,
+    }),
+    /tracked descendant cmdline was unreadable/,
+  );
+  assert.throws(
+    () => captureLinuxProcessIdentity(500, () => {
+      throw procError('EACCES');
+    }),
+    /required Linux process stat was unreadable/,
+  );
+
+  const oversizedCmdlineProc = linuxTrackedTerminalProcFixture({
+    readCmdline(pid, record) {
+      if (pid === 700) return Buffer.alloc(65_537);
+      return record?.cmdline;
+    },
+  });
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(
+        500,
+        oversizedCmdlineProc.readStat,
+      ),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: oversizedCmdlineProc,
+    }),
+    /tracked descendant cmdline exceeded its byte bound/,
+  );
+
+  const boundedProc = linuxTrackedTerminalProcFixture();
+  assert.throws(
+    () => resolveTrackedTerminalProcess(3, {
+      platform: 'linux',
+      rootIdentity: captureLinuxProcessIdentity(500, boundedProc.readStat),
+      expectedExecutableIdentity: exactExecutable,
+      expectedEnvironmentToken: TRACKED_TERMINAL_ENVIRONMENT_TOKEN,
+      proc: boundedProc,
+      maxPidEntries: 3,
+    }),
+    /Linux proc scan exceeded 3 entries/,
+  );
+});
+
+test('Codex U1a Darwin tracked-terminal liveness keeps marker PID kill semantics', async () => {
+  const {
+    resolveTrackedTerminalProcess,
+    trackedTerminalProcessAlive,
+  } = await import(spikeUrl);
+  const tracked = resolveTrackedTerminalProcess(3, {
+    platform: 'darwin',
+    proc: {
+      listPids() {
+        throw new Error('Darwin must not scan procfs');
+      },
+    },
+  });
+  assert.deepEqual(tracked, { pid: 3, startTimeTicks: null });
+
+  let observedPid;
+  assert.equal(
+    trackedTerminalProcessAlive(tracked, {
+      platform: 'darwin',
+      kill0(pid) {
+        observedPid = pid;
+      },
+    }),
+    true,
+  );
+  assert.equal(observedPid, 3);
+  assert.equal(
+    trackedTerminalProcessAlive(tracked, {
+      platform: 'darwin',
+      kill0() {
+        throw procError('ESRCH');
+      },
+    }),
+    false,
+  );
+  assert.throws(
+    () => trackedTerminalProcessAlive(tracked, {
+      platform: 'darwin',
+      kill0() {
+        throw procError('EPERM');
+      },
+    }),
+    { code: 'EPERM' },
+  );
+});
+
 test('Codex U1a tracked-terminal stop gate requires cleanup and observed PID death', async () => {
   const { evaluateTrackedTerminalStopGate } = await import(spikeUrl);
   const passing = {

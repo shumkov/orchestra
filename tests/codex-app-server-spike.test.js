@@ -243,6 +243,55 @@ test('Codex U1a manifest pins deterministic raw schemas and canonical v2 bundles
   );
 });
 
+test('Codex U1a pins schema-optional attachment effort while requiring the model', async () => {
+  const { assertAttachmentResponseSchemas } = await import(spikeUrl);
+  const makeResponse = () => ({
+    type: 'object',
+    required: ['model', 'thread'],
+    properties: {
+      model: { type: 'string' },
+      reasoningEffort: {
+        anyOf: [
+          { $ref: '#/definitions/ReasoningEffort' },
+          { type: 'null' },
+        ],
+      },
+      thread: { $ref: '#/definitions/Thread' },
+    },
+  });
+  const schema = {
+    definitions: {
+      ThreadStartResponse: makeResponse(),
+      ThreadResumeResponse: makeResponse(),
+    },
+  };
+
+  assert.deepEqual(assertAttachmentResponseSchemas(schema), {
+    threadResume: true,
+    threadStart: true,
+  });
+
+  for (const mutate of [
+    (response) => response.required.push('reasoningEffort'),
+    (response) => {
+      response.required = response.required.filter((key) => key !== 'model');
+    },
+    (response) => delete response.properties.reasoningEffort,
+    (response) => {
+      response.properties.reasoningEffort = {
+        $ref: '#/definitions/ReasoningEffort',
+      };
+    },
+  ]) {
+    const invalid = structuredClone(schema);
+    mutate(invalid.definitions.ThreadStartResponse);
+    assert.throws(
+      () => assertAttachmentResponseSchemas(invalid),
+      /ThreadStartResponse attachment settings schema changed/,
+    );
+  }
+});
+
 function createTransportCutFixture(
   t,
   { exitAfterLine, responseAfterLine = null },
@@ -281,10 +330,10 @@ function createTransportCutFixture(
   return { fakeServer, marker, scratch };
 }
 
-test('Codex U1a named profile clears the obsolete readOnlyAccess false-negative', async () => {
-  const { evaluateNamedProfileGate } = await import(spikeUrl);
-  const evidence = {
+function passingNamedProfileEvidence(overrides = {}) {
+  return {
     schemaHashesVerified: true,
+    attachmentResponseSchemaVerified: true,
     stableProfileMethodsVerified: true,
     configSourceAttested: true,
     configUnchangedAtEnd: true,
@@ -299,9 +348,17 @@ test('Codex U1a named profile clears the obsolete readOnlyAccess false-negative'
     accountAuthenticated: true,
     freshProfileProvenance: true,
     resumeProfileProvenance: true,
+    freshAttachmentProductionValidated: true,
+    resumeAttachmentProductionValidated: true,
     resumableTurnCompleted: true,
     noUnexpectedServerRequests: true,
+    ...overrides,
   };
+}
+
+test('Codex U1a named profile clears the obsolete readOnlyAccess false-negative', async () => {
+  const { evaluateNamedProfileGate } = await import(spikeUrl);
+  const evidence = passingNamedProfileEvidence();
 
   assert.deepEqual(evaluateNamedProfileGate(evidence), {
     gate: 'CONTINUE',
@@ -312,25 +369,9 @@ test('Codex U1a named profile clears the obsolete readOnlyAccess false-negative'
 
 test('Codex U1a profile name alone cannot clear the gate', async () => {
   const { evaluateNamedProfileGate } = await import(spikeUrl);
-  const result = evaluateNamedProfileGate({
-    schemaHashesVerified: true,
-    stableProfileMethodsVerified: true,
+  const result = evaluateNamedProfileGate(passingNamedProfileEvidence({
     configSourceAttested: false,
-    configUnchangedAtEnd: true,
-    requirementsAttested: true,
-    profileListed: true,
-    commandWorkspaceRead: true,
-    commandWorkspaceWrite: true,
-    commandCodexHomeDenied: true,
-    commandDaemonSecretsDenied: true,
-    commandNetworkDenied: true,
-    legacySandboxAbsent: true,
-    accountAuthenticated: true,
-    freshProfileProvenance: true,
-    resumeProfileProvenance: true,
-    resumableTurnCompleted: true,
-    noUnexpectedServerRequests: true,
-  });
+  }));
 
   assert.equal(result.gate, 'STOP');
   assert.equal(result.exitCode, 2);
@@ -339,27 +380,30 @@ test('Codex U1a profile name alone cannot clear the gate', async () => {
 
 test('Codex U1a named profile stops if Codex rewrites config during runtime', async () => {
   const { evaluateNamedProfileGate } = await import(spikeUrl);
-  const result = evaluateNamedProfileGate({
-    schemaHashesVerified: true,
-    stableProfileMethodsVerified: true,
-    configSourceAttested: true,
+  const result = evaluateNamedProfileGate(passingNamedProfileEvidence({
     configUnchangedAtEnd: false,
-    requirementsAttested: true,
-    profileListed: true,
-    commandWorkspaceRead: true,
-    commandWorkspaceWrite: true,
-    commandCodexHomeDenied: true,
-    commandDaemonSecretsDenied: true,
-    commandNetworkDenied: true,
-    legacySandboxAbsent: true,
-    accountAuthenticated: true,
-    freshProfileProvenance: true,
-    resumeProfileProvenance: true,
-    resumableTurnCompleted: true,
-    noUnexpectedServerRequests: true,
-  });
+  }));
 
   assert.deepEqual(result.failedChecks, ['configUnchangedAtEnd']);
+});
+
+test('Codex U1a separates raw schema evidence from production attachment evidence', async () => {
+  const { evaluateNamedProfileGate } = await import(spikeUrl);
+  const evidence = passingNamedProfileEvidence();
+
+  for (const missing of [
+    'attachmentResponseSchemaVerified',
+    'freshAttachmentProductionValidated',
+    'resumeAttachmentProductionValidated',
+  ]) {
+    const incomplete = { ...evidence };
+    delete incomplete[missing];
+    assert.deepEqual(evaluateNamedProfileGate(incomplete), {
+      gate: 'STOP',
+      exitCode: 2,
+      failedChecks: [missing],
+    });
+  }
 });
 
 test('Codex U1a overall result requires every integrated runtime gate', async () => {
@@ -2677,6 +2721,108 @@ test('Codex U1a rejects resume provenance from a different thread', async () => 
     }),
     /thread\/resume returned a different thread id/,
   );
+});
+
+test('Codex U1a live responses pass the production attachment validator', async (t) => {
+  const { characterizeThreadProfile } = await import(spikeUrl);
+  const makeResponse = (changes = {}) => ({
+    thread: { id: 'thread-1' },
+    cwd: '/workspace',
+    model: 'gpt-5.6-sol',
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    runtimeWorkspaceRoots: ['/workspace'],
+    sandbox: {
+      type: 'workspaceWrite',
+      networkAccess: false,
+      excludeSlashTmp: true,
+      excludeTmpdirEnvVar: true,
+      writableRoots: [],
+    },
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+    ...changes,
+  });
+
+  for (const [name, changes, presence] of [
+    ['omitted', {}, 'omitted'],
+    ['null', { reasoningEffort: null }, 'null'],
+    ['present', { reasoningEffort: 'xhigh' }, 'present'],
+  ]) {
+    await t.test(name, async () => {
+      const connection = {
+        async request() {
+          return makeResponse(changes);
+        },
+        async waitForNotification() {
+          return null;
+        },
+      };
+      const profile = await characterizeThreadProfile(
+        connection,
+        'thread/start',
+        { cwd: '/workspace' },
+      );
+
+      assert.equal(profile.attachmentProductionValidated, true);
+      assert.equal(profile.attachmentEffortPresence, presence);
+      assert.equal(Object.hasOwn(profile, 'model'), false);
+      assert.equal(Object.hasOwn(profile, 'reasoningEffort'), false);
+    });
+  }
+
+  for (const [name, changes] of [
+    ['overlong model', { model: 'm'.repeat(513) }],
+    ['multibyte overlong model', { model: 'é'.repeat(257) }],
+    ['empty effort', { reasoningEffort: '' }],
+    ['overlong effort', { reasoningEffort: 'e'.repeat(513) }],
+    ['multibyte overlong effort', { reasoningEffort: 'é'.repeat(257) }],
+  ]) {
+    await t.test(name, async () => {
+      const connection = {
+        async request() {
+          return makeResponse(changes);
+        },
+        waitForNotification() {
+          throw new Error('must not wait after malformed attachment settings');
+        },
+      };
+      await assert.rejects(
+        characterizeThreadProfile(
+          connection,
+          'thread/start',
+          { cwd: '/workspace' },
+        ),
+        /attachment (model|effort)/,
+      );
+    });
+  }
+
+  await t.test('static drift wins over malformed dynamic settings', async () => {
+    const connection = {
+      async request() {
+        return makeResponse({
+          model: '',
+          modelProvider: 'other-provider',
+        });
+      },
+      waitForNotification() {
+        throw new Error('must not wait after invalid attachment policy');
+      },
+    };
+
+    await assert.rejects(
+      characterizeThreadProfile(
+        connection,
+        'thread/start',
+        { cwd: '/workspace' },
+      ),
+      /thread\/start returned unexpected named-profile policy/,
+    );
+  });
 });
 
 test('Codex U1a completes one no-tools turn before cross-process resume', async () => {

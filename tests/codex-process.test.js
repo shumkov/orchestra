@@ -269,6 +269,38 @@ function namedProfileSettings() {
   };
 }
 
+function completeThreadSettings({
+  model = 'gpt-5.6-sol',
+  effort = 'xhigh',
+} = {}) {
+  return {
+    model,
+    effort,
+    modelProvider: 'openai',
+    approvalPolicy: 'never',
+    approvalsReviewer: 'user',
+    sandboxPolicy: { type: 'workspaceWrite' },
+    activePermissionProfile: {
+      id: 'polygram-session',
+      extends: null,
+    },
+  };
+}
+
+function attachmentResultWithoutEffort(
+  threadId,
+  model = 'gpt-5.6-sol',
+  options = {},
+) {
+  const result = threadResult(threadId, model);
+  if (Object.hasOwn(options, 'reasoningEffort')) {
+    result.reasoningEffort = options.reasoningEffort;
+  } else {
+    delete result.reasoningEffort;
+  }
+  return result;
+}
+
 function makeProcess({
   handlers = {},
   checkpointSink = async () => {},
@@ -337,6 +369,78 @@ async function startTurnAndComplete(client, {
   });
 }
 
+test('Codex production attachment validator bounds schema-optional effort', () => {
+  const {
+    MAX_ATTACHMENT_SETTING_BYTES,
+    parseCodexAttachmentSettings,
+  } = require('../lib/codex/thread-attachment-settings');
+  assert.equal(MAX_ATTACHMENT_SETTING_BYTES, 512);
+
+  const exactModel = 'm'.repeat(512);
+  assert.deepEqual(
+    parseCodexAttachmentSettings({ model: exactModel }),
+    {
+      complete: false,
+      effort: null,
+      effortPresence: 'omitted',
+      model: exactModel,
+    },
+  );
+  assert.deepEqual(
+    parseCodexAttachmentSettings({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: null,
+    }),
+    {
+      complete: false,
+      effort: null,
+      effortPresence: 'null',
+      model: 'gpt-5.6-sol',
+    },
+  );
+  const exactEffort = 'e'.repeat(512);
+  assert.deepEqual(
+    parseCodexAttachmentSettings({
+      model: 'gpt-5.6-sol',
+      reasoningEffort: exactEffort,
+    }),
+    {
+      complete: true,
+      effort: exactEffort,
+      effortPresence: 'present',
+      model: 'gpt-5.6-sol',
+    },
+  );
+
+  for (const model of [
+    '',
+    null,
+    42,
+    'm'.repeat(513),
+    'é'.repeat(257),
+  ]) {
+    assert.throws(
+      () => parseCodexAttachmentSettings({ model }),
+      /attachment model/,
+    );
+  }
+  for (const effort of [
+    '',
+    undefined,
+    42,
+    'e'.repeat(513),
+    'é'.repeat(257),
+  ]) {
+    assert.throws(
+      () => parseCodexAttachmentSettings({
+        model: 'gpt-5.6-sol',
+        reasoningEffort: effort,
+      }),
+      /attachment effort/,
+    );
+  }
+});
+
 test('fresh start checkpoints one stable thread and emits init once', async () => {
   const checkpoints = [];
   const fixture = makeProcess({
@@ -393,30 +497,109 @@ test('resume preserves the provider thread; an active resumed thread is a recove
   assert.deepEqual(closes, []);
 });
 
-test('fresh attach accepts a matching settings notification before thread/start response', async () => {
+test('Codex attachment accepts schema-optional effort without containment', async (t) => {
+  for (const method of ['thread/start', 'thread/resume']) {
+    for (const absence of ['omitted', 'null']) {
+      await t.test(`${method} ${absence}`, async (subtest) => {
+        const checkpoints = [];
+        const containment = [];
+        const existingSessionId = method === 'thread/resume'
+          ? 'thread-existing'
+          : null;
+        const fixture = makeProcess({
+          existingSessionId,
+          checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+          handlers: {
+            [method]: async (params) => attachmentResultWithoutEffort(
+              params.threadId ?? 'codex-thread',
+              params.model ?? 'gpt-5.6-sol',
+              absence === 'null' ? { reasoningEffort: null } : {},
+            ),
+          },
+        });
+        subtest.after(() => fixture.proc.kill());
+        fixture.proc.on('containment-failed', (event) => containment.push(event));
+
+        await fixture.start();
+
+        assert.equal(fixture.proc.state, 'Idle');
+        assert.equal(fixture.proc.observedThreadSettings, null);
+        assert.equal(fixture.proc.provisionalAttachmentModel, 'gpt-5.6-sol');
+        assert.deepEqual(containment, []);
+        assert.deepEqual(
+          checkpoints
+            .filter(({ kind }) => kind === 'thread-initialized')
+            .map(({ model, effort }) => ({ model, effort })),
+          [{ model: 'gpt-5.6-sol', effort: 'xhigh' }],
+        );
+        assert.equal(
+          fixture.client.requests.some(({ method: sent }) => sent === 'turn/start'),
+          false,
+        );
+      });
+    }
+  }
+});
+
+test('Codex named-profile attachment accepts production omitted and null effort', async (t) => {
+  for (const method of ['thread/start', 'thread/resume']) {
+    for (const absence of ['omitted', 'null']) {
+      await t.test(`${method} ${absence}`, async (subtest) => {
+        const containment = [];
+        const existingSessionId = method === 'thread/resume'
+          ? 'thread-existing'
+          : null;
+        const fixture = makeProcess({
+          existingSessionId,
+          processOptions: {
+            expectedStaticPolicy: NAMED_PROFILE_STATIC_POLICY,
+          },
+          handlers: {
+            [method]: async (params) => {
+              const result = namedProfileThreadResult(
+                params.threadId ?? 'codex-thread',
+              );
+              if (absence === 'null') result.reasoningEffort = null;
+              else delete result.reasoningEffort;
+              return result;
+            },
+          },
+        });
+        subtest.after(() => fixture.proc.kill());
+        fixture.proc.on('containment-failed', (event) => containment.push(event));
+
+        await fixture.start();
+
+        assert.equal(fixture.proc.state, 'Idle');
+        assert.equal(fixture.proc.observedThreadSettings, null);
+        assert.equal(fixture.proc.provisionalAttachmentModel, 'gpt-5.6-sol');
+        assert.deepEqual(containment, []);
+        assert.equal(
+          fixture.client.requests.some(
+            ({ method: sent }) => sent === 'turn/start',
+          ),
+          false,
+        );
+      });
+    }
+  }
+});
+
+test('Codex attachment preserves a complete settings notification observed before an effort-omitting response', async () => {
   const fixture = makeProcess({
     handlers: {
       'thread/start': async ({ model }, client) => {
         await client.notify('thread/settings/updated', {
           threadId: 'codex-thread',
           threadSettings: {
-            model,
-            effort: 'xhigh',
-            modelProvider: 'openai',
-            approvalPolicy: 'never',
-            approvalsReviewer: 'user',
+            ...completeThreadSettings({ model }),
             collaborationMode: {
               mode: 'default',
               model,
             },
-            sandboxPolicy: { type: 'workspaceWrite' },
-            activePermissionProfile: {
-              id: 'polygram-session',
-              extends: null,
-            },
           },
         });
-        return threadResult('codex-thread', model);
+        return attachmentResultWithoutEffort('codex-thread', model);
       },
     },
   });
@@ -425,7 +608,462 @@ test('fresh attach accepts a matching settings notification before thread/start 
 
   assert.equal(fixture.proc.providerSessionId, 'codex-thread');
   assert.equal(fixture.proc.state, 'Idle');
+  assert.deepEqual(fixture.proc.observedThreadSettings, {
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
+  });
+  assert.equal(fixture.proc.provisionalAttachmentModel, null);
   await fixture.proc.kill();
+});
+
+test('Codex notification before attachment response still requires complete settings', async () => {
+  const fixture = makeProcess({
+    handlers: {
+      'thread/start': async ({ model }, client) => {
+        const settings = completeThreadSettings({ model });
+        delete settings.effort;
+        await client.notify('thread/settings/updated', {
+          threadId: 'codex-thread',
+          threadSettings: settings,
+        });
+        return attachmentResultWithoutEffort('codex-thread', model);
+      },
+    },
+  });
+
+  await assert.rejects(
+    fixture.start(),
+    (error) => error.code === 'CODEX_CONTAINMENT_FAILED',
+  );
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.containmentReason, 'thread-settings-drift');
+});
+
+test('Codex notification before response rejects attachment model and effort conflicts', async (t) => {
+  const cases = [
+    {
+      name: 'model conflict',
+      mutate(result) {
+        result.model = 'gpt-5.6-terra';
+        delete result.reasoningEffort;
+      },
+    },
+    {
+      name: 'present effort conflict',
+      mutate(result) {
+        result.reasoningEffort = 'high';
+      },
+    },
+  ];
+  for (const { name, mutate } of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = makeProcess({
+        handlers: {
+          'thread/start': async ({ model }, client) => {
+            await client.notify('thread/settings/updated', {
+              threadId: 'codex-thread',
+              threadSettings: completeThreadSettings({ model }),
+            });
+            const result = threadResult('codex-thread', model);
+            mutate(result);
+            return result;
+          },
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+
+      await assert.rejects(
+        fixture.start(),
+        (error) => error.code === 'CODEX_THREAD_SETTINGS_MISMATCH',
+      );
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+    });
+  }
+});
+
+test('Codex complete settings notifications enforce production UTF-8 bounds', async (t) => {
+  await t.test('exact bounds', async (subtest) => {
+    const model = 'm'.repeat(512);
+    const effort = 'e'.repeat(512);
+    const fixture = makeProcess({
+      handlers: {
+        'thread/start': async (_params, client) => {
+          await client.notify('thread/settings/updated', {
+            threadId: 'codex-thread',
+            threadSettings: completeThreadSettings({ model, effort }),
+          });
+          return attachmentResultWithoutEffort('codex-thread', model);
+        },
+      },
+    });
+    subtest.after(() => fixture.proc.kill());
+
+    await fixture.start();
+
+    assert.deepEqual(fixture.proc.observedThreadSettings, { model, effort });
+    assert.equal(fixture.proc.state, 'Idle');
+  });
+
+  for (const [name, settings] of [
+    ['513-byte model', { model: 'm'.repeat(513), effort: 'xhigh' }],
+    ['multibyte over-limit model', {
+      model: 'é'.repeat(257),
+      effort: 'xhigh',
+    }],
+    ['513-byte effort', {
+      model: 'gpt-5.6-sol',
+      effort: 'e'.repeat(513),
+    }],
+    ['multibyte over-limit effort', {
+      model: 'gpt-5.6-sol',
+      effort: 'é'.repeat(257),
+    }],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = makeProcess({
+        handlers: {
+          'thread/start': async (_params, client) => {
+            await client.notify('thread/settings/updated', {
+              threadId: 'codex-thread',
+              threadSettings: completeThreadSettings(settings),
+            });
+            return attachmentResultWithoutEffort('codex-thread');
+          },
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+
+      await assert.rejects(
+        fixture.start(),
+        (error) => error.code === 'CODEX_CONTAINMENT_FAILED',
+      );
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(fixture.proc.containmentError.code, 'CODEX_PROTOCOL_ERROR');
+    });
+  }
+});
+
+test('Codex attachment-only effort omission does not relax complete settings notifications', async (t) => {
+  await t.test('matching model establishes the first complete observation', async () => {
+    const fixture = makeProcess({
+      handlers: {
+        'thread/start': async ({ model }) => (
+          attachmentResultWithoutEffort('codex-thread', model)
+        ),
+      },
+    });
+    t.after(() => fixture.proc.kill());
+    await fixture.start();
+
+    await fixture.client.notify('thread/settings/updated', {
+      threadId: 'codex-thread',
+      threadSettings: completeThreadSettings({ effort: 'high' }),
+    });
+
+    assert.equal(fixture.proc.state, 'Idle');
+    assert.deepEqual(fixture.proc.observedThreadSettings, {
+      model: 'gpt-5.6-sol',
+      effort: 'high',
+    });
+    assert.equal(fixture.proc.provisionalAttachmentModel, null);
+  });
+
+  await t.test('conflicting model contains the process', async () => {
+    const fixture = makeProcess({
+      handlers: {
+        'thread/start': async ({ model }) => (
+          attachmentResultWithoutEffort('codex-thread', model)
+        ),
+      },
+    });
+    t.after(() => fixture.proc.kill());
+    await fixture.start();
+
+    await fixture.client.notify('thread/settings/updated', {
+      threadId: 'codex-thread',
+      threadSettings: completeThreadSettings({
+        model: 'gpt-5.6-terra',
+        effort: 'high',
+      }),
+    });
+
+    assert.equal(fixture.proc.state, 'ContainmentFailed');
+    assert.equal(fixture.proc.containmentError.code, 'CODEX_THREAD_SETTINGS_MISMATCH');
+  });
+
+  await t.test('effort remains required after attachment', async () => {
+    const fixture = makeProcess({
+      handlers: {
+        'thread/start': async ({ model }) => (
+          attachmentResultWithoutEffort('codex-thread', model)
+        ),
+      },
+    });
+    t.after(() => fixture.proc.kill());
+    await fixture.start();
+    const settings = completeThreadSettings();
+    delete settings.effort;
+
+    await fixture.client.notify('thread/settings/updated', {
+      threadId: 'codex-thread',
+      threadSettings: settings,
+    });
+
+    assert.equal(fixture.proc.state, 'ContainmentFailed');
+    assert.equal(fixture.proc.containmentError.code, 'CODEX_PROTOCOL_ERROR');
+  });
+});
+
+test('Codex attachment candidate precedence survives delayed thread initialization', async (t) => {
+  for (const candidateField of ['admittingTurnSettings', 'activeTurnSettings']) {
+    for (const effort of ['xhigh', 'high']) {
+      await t.test(`${candidateField} ${effort}`, async (subtest) => {
+        const initialized = deferred();
+        const releaseInitialized = deferred();
+        const fixture = makeProcess({
+          checkpointSink: async (checkpoint) => {
+            if (checkpoint.kind === 'thread-initialized') {
+              initialized.resolve();
+              await releaseInitialized.promise;
+            }
+          },
+          handlers: {
+            'thread/start': async ({ model }) => (
+              attachmentResultWithoutEffort('codex-thread', model)
+            ),
+          },
+        });
+        subtest.after(() => fixture.proc.kill());
+        const start = fixture.start();
+        await initialized.promise;
+        assert.equal(fixture.proc.state, 'AttachingThread');
+        assert.equal(fixture.proc.attachmentResponseValidated, true);
+        fixture.proc[candidateField] = Object.freeze({
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+        });
+
+        await fixture.client.notify('thread/settings/updated', {
+          threadId: 'codex-thread',
+          threadSettings: completeThreadSettings({ effort }),
+        });
+
+        releaseInitialized.resolve();
+        if (effort === 'xhigh') {
+          await start;
+          assert.equal(fixture.proc.state, 'Idle');
+          assert.deepEqual(fixture.proc.observedThreadSettings, {
+            model: 'gpt-5.6-sol',
+            effort: 'xhigh',
+          });
+        } else {
+          await assert.rejects(start);
+          assert.equal(fixture.proc.state, 'ContainmentFailed');
+          assert.equal(
+            fixture.proc.containmentError.code,
+            'CODEX_THREAD_SETTINGS_MISMATCH',
+          );
+        }
+      });
+    }
+  }
+});
+
+test('Codex attachment candidate precedence bounds delayed provisional observations', async (t) => {
+  for (const model of ['gpt-5.6-sol', 'gpt-5.6-terra']) {
+    await t.test(model, async (subtest) => {
+      const initialized = deferred();
+      const releaseInitialized = deferred();
+      const fixture = makeProcess({
+        checkpointSink: async (checkpoint) => {
+          if (checkpoint.kind === 'thread-initialized') {
+            initialized.resolve();
+            await releaseInitialized.promise;
+          }
+        },
+        handlers: {
+          'thread/start': async ({ model: attachmentModel }) => (
+            attachmentResultWithoutEffort('codex-thread', attachmentModel)
+          ),
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+      const start = fixture.start();
+      await initialized.promise;
+      assert.equal(fixture.proc.state, 'AttachingThread');
+      assert.equal(fixture.proc.attachmentResponseValidated, true);
+      assert.equal(fixture.proc.observedThreadSettings, null);
+      assert.equal(fixture.proc.admittingTurnSettings, null);
+      assert.equal(fixture.proc.activeTurnSettings, null);
+
+      await fixture.client.notify('thread/settings/updated', {
+        threadId: 'codex-thread',
+        threadSettings: completeThreadSettings({ model, effort: 'high' }),
+      });
+
+      releaseInitialized.resolve();
+      if (model === 'gpt-5.6-sol') {
+        await start;
+        assert.equal(fixture.proc.state, 'Idle');
+        assert.deepEqual(fixture.proc.observedThreadSettings, {
+          model: 'gpt-5.6-sol',
+          effort: 'high',
+        });
+      } else {
+        await assert.rejects(start);
+        assert.equal(fixture.proc.state, 'ContainmentFailed');
+        assert.equal(
+          fixture.proc.containmentError.code,
+          'CODEX_THREAD_SETTINGS_MISMATCH',
+        );
+      }
+    });
+  }
+});
+
+test('Codex partial resume permits a complete first-turn override', async () => {
+  const fixture = makeProcess({
+    existingSessionId: 'thread-existing',
+    handlers: {
+      'thread/resume': async ({ threadId }) => (
+        attachmentResultWithoutEffort(threadId, 'gpt-5.6-sol')
+      ),
+      'turn/start': async (params, client) => {
+        await client.notify('thread/settings/updated', {
+          threadId: 'thread-existing',
+          threadSettings: completeThreadSettings({
+            model: params.model,
+            effort: params.effort,
+          }),
+        });
+        const turnId = 'turn-first-override';
+        setImmediate(() => startTurnAndComplete(client, {
+          threadId: 'thread-existing',
+          turnId,
+        }));
+        return {
+          turn: {
+            id: turnId,
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+    },
+  });
+  await fixture.start();
+  await fixture.proc.selectModelSettings({
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+  });
+
+  await fixture.proc.send('use the new pair');
+
+  assert.equal(fixture.proc.state, 'Idle');
+  assert.equal(fixture.proc.provisionalAttachmentModel, null);
+  assert.deepEqual(fixture.proc.lastAcceptedTurnSettings, {
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+  });
+  assert.deepEqual(fixture.proc.observedThreadSettings, {
+    model: 'gpt-5.6-terra',
+    effort: 'high',
+  });
+  await fixture.proc.kill();
+});
+
+test('Codex accepted turn settings retire provisional attachment authority', async (t) => {
+  for (const effort of ['xhigh', 'high']) {
+    await t.test(`late ${effort}`, async (subtest) => {
+      const fixture = makeProcess({
+        handlers: {
+          'thread/start': async ({ model }) => (
+            attachmentResultWithoutEffort('codex-thread', model)
+          ),
+          'turn/start': async (_params, client) => {
+            const turnId = `turn-late-${effort}`;
+            setImmediate(() => startTurnAndComplete(client, { turnId }));
+            return {
+              turn: {
+                id: turnId,
+                status: 'inProgress',
+                items: [],
+                error: null,
+              },
+            };
+          },
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+      await fixture.start();
+      await fixture.proc.send('establish an accepted pair');
+      assert.equal(fixture.proc.observedThreadSettings, null);
+      assert.equal(fixture.proc.provisionalAttachmentModel, null);
+      assert.equal(fixture.proc.admittingTurnSettings, null);
+      assert.equal(fixture.proc.activeTurnSettings, null);
+      assert.deepEqual(fixture.proc.lastAcceptedTurnSettings, {
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      });
+
+      await fixture.client.notify('thread/settings/updated', {
+        threadId: 'codex-thread',
+        threadSettings: completeThreadSettings({ effort }),
+      });
+
+      if (effort === 'xhigh') {
+        assert.equal(fixture.proc.state, 'Idle');
+        assert.deepEqual(fixture.proc.observedThreadSettings, {
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+        });
+      } else {
+        assert.equal(fixture.proc.state, 'ContainmentFailed');
+        assert.equal(
+          fixture.proc.containmentError.code,
+          'CODEX_THREAD_SETTINGS_MISMATCH',
+        );
+      }
+    });
+  }
+});
+
+test('Codex malformed attachment settings contain before turn dispatch', async (t) => {
+  const cases = [
+    ['empty model', { model: '' }],
+    ['non-string model', { model: 42 }],
+    ['513-byte model', { model: 'm'.repeat(513) }],
+    ['multibyte over-limit model', { model: 'é'.repeat(257) }],
+    ['empty effort', { reasoningEffort: '' }],
+    ['undefined effort', { reasoningEffort: undefined }],
+    ['non-string effort', { reasoningEffort: 42 }],
+    ['513-byte effort', { reasoningEffort: 'e'.repeat(513) }],
+    ['multibyte over-limit effort', { reasoningEffort: 'é'.repeat(257) }],
+  ];
+  for (const [name, changes] of cases) {
+    await t.test(name, async (subtest) => {
+      const fixture = makeProcess({
+        handlers: {
+          'thread/start': async ({ model }) => ({
+            ...threadResult('codex-thread', model),
+            ...changes,
+          }),
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+
+      await assert.rejects(
+        fixture.start(),
+        (error) => error.code === 'CODEX_PROTOCOL_ERROR',
+      );
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(
+        fixture.client.requests.some(({ method }) => method === 'turn/start'),
+        false,
+      );
+    });
+  }
 });
 
 test('an observed settings notification after a completed turn remains healthy', async () => {
@@ -1767,6 +2405,10 @@ test('named-profile attachment rejects every runtime and legacy policy drift bef
     }],
     ['provider changed', (result) => {
       result.modelProvider = 'other-provider';
+    }],
+    ['provider changed with optional effort omitted', (result) => {
+      result.modelProvider = 'other-provider';
+      delete result.reasoningEffort;
     }],
   ];
 

@@ -152,6 +152,39 @@ test('prompt: the stream contract section is present only when gated on', async 
     assert.match(on, /### Showing your answer as you write it/);
     assert.match(on, /mcp__orchestra-bridge__stream/);
     assert.match(on, /NEVER end a turn on a stream call/);
+    // Live adoption failure: a fresh session with the tool registered and this
+    // section present never called it once. The old wording read as advice —
+    // "while you are COMPOSING anything long", "at natural checkpoints",
+    // "skip it for short answers" — every clause a judgment call the model
+    // resolved as "not now". The reply tool's section is the one that gets
+    // obeyed, and it is obeyed because it is a hard contract with a stated
+    // consequence, a MUST, and a trigger the model cannot argue itself out of.
+    // Mirror that shape here.
+    // Scoped to the stream section: the reply block already says "HARD
+    // CONTRACT" and "MUST", so asserting against the whole prompt would pass
+    // on the neighbour's strength and prove nothing about this one.
+    // Whitespace-normalized: the prompt is hand-wrapped at ~78 columns and the
+    // model reads it as flowing text, so a phrase that happens to straddle a
+    // line break is the same contract. Asserting on the raw string would pin
+    // the wrapping instead of the wording.
+    const section = on.slice(on.indexOf('### Showing your answer as you write it'))
+      .split(/\n### /)[0]
+      .replace(/\s+/g, ' ');
+    assert.match(section, /HARD CONTRACT/, 'the section registers as a contract, not a style note');
+    assert.match(section, /MUST call `?mcp__orchestra-bridge__stream/,
+      'an explicit MUST against the named tool, like the reply contract');
+    assert.match(section, /two paragraphs/i,
+      'a concrete trigger — "anything long" was a judgment call the model kept resolving as no');
+    assert.match(section, /after EVERY section|after EACH section/,
+      'per-section cadence, not "at natural checkpoints"');
+    assert.match(section, /before you (start writing|write) the next/i,
+      'the call comes BEFORE the next section, so the preview leads the writing');
+    assert.match(section, /contract violation/i,
+      'silence while composing is named as a violation, with the user watching stated as the reason');
+    assert.match(section, /whole answer up to that point/,
+      'each call replaces the preview — a partial snapshot would truncate the bubble');
+    assert.match(section, /NEVER end a turn on a stream call/,
+      'the preview/delivery boundary survives the rewrite');
     assert.doesNotMatch(off, /__stream/,
       'a consumer without the capability must not be coached toward the tool');
   } finally {

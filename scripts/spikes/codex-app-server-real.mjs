@@ -10,7 +10,9 @@ import {
   mkdtempSync,
   createReadStream,
   openSync,
+  opendirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   statSync,
@@ -21,6 +23,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { createSocket } from 'node:dgram';
 import { createServer, isIP } from 'node:net';
 import { tmpdir } from 'node:os';
+import { performance } from 'node:perf_hooks';
 import { setTimeout as delay } from 'node:timers/promises';
 import {
   delimiter,
@@ -62,6 +65,18 @@ const BACKGROUND_TERMINAL_MAX_POLLS = 20;
 const MAX_RESUME_EVIDENCE_TURNS = 1_000;
 const MAX_RESUME_EVIDENCE_ITEMS_PER_TURN = 1_000;
 const TRACKED_TERMINAL_SLEEP_SECONDS = 120;
+const LINUX_PROC_MAX_PID_ENTRIES = 65_536;
+const LINUX_PROC_MAX_PID = 2_147_483_647;
+const LINUX_PROC_STAT_MAX_BYTES = 4_096;
+const LINUX_PROC_CMDLINE_MAX_BYTES = 65_536;
+const LINUX_PROC_ENVIRON_MAX_BYTES = 65_536;
+const LINUX_PROC_MAX_EVIDENCE_BYTES = 64 * 1_024 * 1_024;
+const LINUX_PROC_MAX_ANCESTRY_DEPTH = 256;
+const LINUX_TRACKED_PROCESS_RESOLUTION_TIMEOUT_MS = 5_000;
+const LINUX_TRACKED_PROCESS_RESOLUTION_INTERVAL_MS = 100;
+const LINUX_TRACKED_TERMINAL_TOKEN_NAME = (
+  'ORCHESTRA_CODEX_TRACKED_TERMINAL_TOKEN'
+);
 const PROCESS_CANARY_LIFETIME_MS = 90_000;
 const SIDE_CHANNEL_TIMEOUT_MS = 10_000;
 const DATAGRAM_SETTLE_MS = 1_500;
@@ -1402,14 +1417,614 @@ export function evaluateTrackedTerminalStopGate(evidence) {
   };
 }
 
-function processAlive(pid) {
+function processAlive(pid, kill0 = (candidate) => process.kill(candidate, 0)) {
   try {
-    process.kill(pid, 0);
+    kill0(pid);
     return true;
   } catch (error) {
     if (error.code === 'ESRCH') return false;
     throw error;
   }
+}
+
+function isTransientProcError(error) {
+  return error?.code === 'ENOENT' || error?.code === 'ESRCH';
+}
+
+function isProcResolutionLimitError(error) {
+  return (
+    error?.code === 'CODEX_TRACKED_PROC_DEADLINE'
+    || error?.code === 'CODEX_TRACKED_PROC_EVIDENCE_BUDGET'
+  );
+}
+
+function procResolutionError(message, code) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function parseLinuxPid(value, label) {
+  if (
+    typeof value !== 'string'
+    || !/^[1-9]\d{0,9}$/.test(value)
+  ) {
+    throw new Error(`${label} is not a canonical Linux PID`);
+  }
+  const pid = Number(value);
+  if (
+    !Number.isSafeInteger(pid)
+    || pid < 2
+    || pid > LINUX_PROC_MAX_PID
+    || String(pid) !== value
+  ) {
+    throw new Error(`${label} is outside the Linux PID range`);
+  }
+  return pid;
+}
+
+export function parseLinuxProcStat(value, expectedPid) {
+  if (
+    typeof value !== 'string'
+    || Buffer.byteLength(value) > LINUX_PROC_STAT_MAX_BYTES
+  ) {
+    throw new Error('Linux proc stat is invalid or exceeds its byte bound');
+  }
+  const normalized = value.endsWith('\n') ? value.slice(0, -1) : value;
+  const commandStart = normalized.indexOf(' (');
+  const commandEnd = normalized.lastIndexOf(') ');
+  if (commandStart < 1 || commandEnd <= commandStart + 1) {
+    throw new Error('Linux proc stat has an invalid command field');
+  }
+  const pidText = normalized.slice(0, commandStart);
+  const fields = normalized.slice(commandEnd + 2).split(' ');
+  if (
+    fields.length < 20
+    || fields.some((field) => field === '')
+    || !/^[A-Za-z]$/.test(fields[0])
+    || !/^(0|[1-9]\d{0,9})$/.test(fields[1])
+    || !/^(0|[1-9]\d*)$/.test(fields[19])
+  ) {
+    throw new Error('Linux proc stat has invalid required fields');
+  }
+  const pid = parseLinuxPid(pidText, 'Linux proc stat PID');
+  if (pid !== expectedPid) {
+    throw new Error('Linux proc stat PID differs from its directory');
+  }
+  const ppid = Number(fields[1]);
+  if (
+    !Number.isSafeInteger(ppid)
+    || ppid < 0
+    || ppid > LINUX_PROC_MAX_PID
+  ) {
+    throw new Error('Linux proc stat parent PID is outside its range');
+  }
+  return {
+    pid,
+    ppid,
+    state: fields[0],
+    startTimeTicks: fields[19],
+  };
+}
+
+function readBoundedProcFile(path, maxBytes, checkDeadline = () => {}) {
+  checkDeadline();
+  const descriptor = openSync(path, 'r');
+  try {
+    const buffer = Buffer.alloc(maxBytes + 1);
+    let totalBytesRead = 0;
+    while (totalBytesRead < buffer.length) {
+      checkDeadline();
+      const bytesRead = readSync(
+        descriptor,
+        buffer,
+        totalBytesRead,
+        buffer.length - totalBytesRead,
+        null,
+      );
+      checkDeadline();
+      if (bytesRead === 0) break;
+      totalBytesRead += bytesRead;
+    }
+    return buffer.subarray(0, totalBytesRead);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function readLinuxProcStat(pid, checkDeadline) {
+  const value = readBoundedProcFile(
+    join('/proc', String(pid), 'stat'),
+    LINUX_PROC_STAT_MAX_BYTES,
+    checkDeadline,
+  );
+  if (value.length > LINUX_PROC_STAT_MAX_BYTES) {
+    throw new Error('Linux proc stat exceeded its byte bound');
+  }
+  return value.toString('utf8');
+}
+
+function readLinuxProcCmdline(pid, checkDeadline) {
+  return readBoundedProcFile(
+    join('/proc', String(pid), 'cmdline'),
+    LINUX_PROC_CMDLINE_MAX_BYTES,
+    checkDeadline,
+  );
+}
+
+function readLinuxProcEnviron(pid, checkDeadline) {
+  return readBoundedProcFile(
+    join('/proc', String(pid), 'environ'),
+    LINUX_PROC_ENVIRON_MAX_BYTES,
+    checkDeadline,
+  );
+}
+
+function linuxExecutableIdentity(path) {
+  const file = statSync(path, { bigint: true });
+  if (!file.isFile()) {
+    throw new Error('tracked sleep executable is not a regular file');
+  }
+  return {
+    device: file.dev.toString(),
+    inode: file.ino.toString(),
+  };
+}
+
+function readLinuxProcExecutableIdentity(pid) {
+  return linuxExecutableIdentity(join('/proc', String(pid), 'exe'));
+}
+
+function listLinuxProcPids(checkDeadline = () => {}) {
+  checkDeadline();
+  const directory = opendirSync('/proc');
+  const pids = [];
+  try {
+    for (
+      let entry = directory.readSync();
+      entry !== null;
+      entry = directory.readSync()
+    ) {
+      checkDeadline();
+      if (!/^[1-9]\d*$/.test(entry.name) || entry.name === '1') continue;
+      pids.push(entry.name);
+      if (pids.length > LINUX_PROC_MAX_PID_ENTRIES) {
+        throw new Error(
+          `Linux proc scan exceeded ${LINUX_PROC_MAX_PID_ENTRIES} entries`,
+        );
+      }
+    }
+    checkDeadline();
+  } finally {
+    directory.closeSync();
+  }
+  return pids;
+}
+
+function assertProcessIdentity(actual, expected) {
+  if (
+    actual.pid !== expected.pid
+    || actual.ppid !== expected.ppid
+    || actual.startTimeTicks !== expected.startTimeTicks
+  ) {
+    throw new Error('tracked process identity changed during resolution');
+  }
+  if (['Z', 'X', 'x'].includes(actual.state)) {
+    throw new Error('tracked process exited during resolution');
+  }
+}
+
+function assertExecutableIdentity(actual, expected) {
+  if (
+    !actual
+    || !/^(0|[1-9]\d*)$/.test(actual.device)
+    || !/^(0|[1-9]\d*)$/.test(actual.inode)
+    || actual.device !== expected.device
+    || actual.inode !== expected.inode
+  ) {
+    throw new Error('tracked sleep executable identity mismatch');
+  }
+}
+
+export function captureLinuxProcessIdentity(
+  pid,
+  readStat = readLinuxProcStat,
+) {
+  if (!Number.isSafeInteger(pid) || pid < 2 || pid > LINUX_PROC_MAX_PID) {
+    throw new Error('Linux process PID is invalid');
+  }
+  let parsed;
+  try {
+    parsed = parseLinuxProcStat(readStat(pid), pid);
+  } catch (error) {
+    if (isTransientProcError(error)) {
+      throw new Error('required Linux process disappeared');
+    }
+    if (error.message?.startsWith('Linux proc stat')) throw error;
+    throw new Error('required Linux process stat was unreadable', {
+      cause: error,
+    });
+  }
+  if (['Z', 'X', 'x'].includes(parsed.state)) {
+    throw new Error('required Linux process is not alive');
+  }
+  return {
+    pid: parsed.pid,
+    startTimeTicks: parsed.startTimeTicks,
+  };
+}
+
+function trackedDescendants(rootPid, processes, checkDeadline = () => {}) {
+  const children = new Map();
+  for (const processInfo of processes.values()) {
+    checkDeadline();
+    const siblings = children.get(processInfo.ppid) ?? [];
+    siblings.push(processInfo);
+    children.set(processInfo.ppid, siblings);
+  }
+  const descendants = new Map();
+  const queue = [{ pid: rootPid, depth: 0 }];
+  for (let index = 0; index < queue.length; index += 1) {
+    checkDeadline();
+    const parent = queue[index];
+    for (const child of children.get(parent.pid) ?? []) {
+      checkDeadline();
+      if (descendants.has(child.pid) || child.pid === rootPid) {
+        throw new Error('Linux proc descendant graph contains a cycle');
+      }
+      const depth = parent.depth + 1;
+      if (depth > LINUX_PROC_MAX_ANCESTRY_DEPTH) {
+        throw new Error('Linux proc descendant ancestry exceeded its bound');
+      }
+      descendants.set(child.pid, { ...child, depth });
+      queue.push({ pid: child.pid, depth });
+    }
+  }
+  checkDeadline();
+  return descendants;
+}
+
+function readRequiredProcEvidence(reader, pid, label) {
+  try {
+    return reader(pid);
+  } catch (error) {
+    if (isProcResolutionLimitError(error)) throw error;
+    if (isTransientProcError(error)) {
+      throw procResolutionError(
+        `${label} disappeared during resolution`,
+        'CODEX_TRACKED_PROC_CHURN',
+      );
+    }
+    throw new Error(`${label} was unreadable`, { cause: error });
+  }
+}
+
+function createLinuxProcResolutionLimits() {
+  return {
+    deadlineMs: Number.POSITIVE_INFINITY,
+    evidenceBytesRead: 0,
+    maxEvidenceBytes: LINUX_PROC_MAX_EVIDENCE_BYTES,
+    monotonicNow: () => performance.now(),
+  };
+}
+
+function validateLinuxProcResolutionLimits(limits) {
+  if (
+    !limits
+    || (
+      limits.deadlineMs !== Number.POSITIVE_INFINITY
+      && (!Number.isFinite(limits.deadlineMs) || limits.deadlineMs < 0)
+    )
+    || !Number.isSafeInteger(limits.evidenceBytesRead)
+    || limits.evidenceBytesRead < 0
+    || !Number.isSafeInteger(limits.maxEvidenceBytes)
+    || limits.maxEvidenceBytes < 1
+    || limits.maxEvidenceBytes > LINUX_PROC_MAX_EVIDENCE_BYTES
+    || limits.evidenceBytesRead > limits.maxEvidenceBytes
+    || typeof limits.monotonicNow !== 'function'
+  ) {
+    throw new Error('Linux proc resolution limits are invalid');
+  }
+}
+
+function checkLinuxProcResolutionDeadline(limits) {
+  const now = limits.monotonicNow();
+  if (!Number.isFinite(now) || now < 0) {
+    throw new Error('Linux proc monotonic clock is invalid');
+  }
+  if (now > limits.deadlineMs) {
+    throw procResolutionError(
+      'Linux proc resolution exceeded its deadline',
+      'CODEX_TRACKED_PROC_DEADLINE',
+    );
+  }
+}
+
+function accountLinuxProcEvidence(limits, value) {
+  let bytes;
+  if (Buffer.isBuffer(value)) bytes = value.length;
+  else if (typeof value === 'string') bytes = Buffer.byteLength(value);
+  else return value;
+  const nextTotal = limits.evidenceBytesRead + bytes;
+  if (
+    !Number.isSafeInteger(nextTotal)
+    || nextTotal > limits.maxEvidenceBytes
+  ) {
+    throw procResolutionError(
+      'Linux proc resolution exceeded its evidence byte budget',
+      'CODEX_TRACKED_PROC_EVIDENCE_BUDGET',
+    );
+  }
+  limits.evidenceBytesRead = nextTotal;
+  return value;
+}
+
+function hasTrackedTerminalEnvironmentToken(environ, token) {
+  if (
+    !Buffer.isBuffer(environ)
+    || environ.length > LINUX_PROC_ENVIRON_MAX_BYTES
+    || (environ.length > 0 && environ[environ.length - 1] !== 0)
+  ) {
+    throw new Error('tracked sleep environment was malformed');
+  }
+  const prefix = Buffer.from(`${LINUX_TRACKED_TERMINAL_TOKEN_NAME}=`);
+  const expected = Buffer.from(
+    `${LINUX_TRACKED_TERMINAL_TOKEN_NAME}=${token}`,
+  );
+  let matchingKeyCount = 0;
+  let matchingValueCount = 0;
+  let fieldStart = 0;
+  for (let index = 0; index < environ.length; index += 1) {
+    if (environ[index] !== 0) continue;
+    const field = environ.subarray(fieldStart, index);
+    fieldStart = index + 1;
+    if (
+      field.length < prefix.length
+      || !field.subarray(0, prefix.length).equals(prefix)
+    ) continue;
+    matchingKeyCount += 1;
+    if (field.equals(expected)) matchingValueCount += 1;
+  }
+  if (matchingKeyCount > 1) {
+    throw new Error('tracked sleep environment was malformed');
+  }
+  return matchingKeyCount === 1 && matchingValueCount === 1;
+}
+
+export function resolveTrackedTerminalProcess(
+  namespacePid,
+  {
+    platform = process.platform,
+    rootIdentity,
+    expectedExecutableIdentity,
+    expectedEnvironmentToken,
+    proc = {},
+    maxPidEntries = LINUX_PROC_MAX_PID_ENTRIES,
+    resolutionLimits = createLinuxProcResolutionLimits(),
+  } = {},
+) {
+  if (
+    !Number.isSafeInteger(namespacePid)
+    || namespacePid < 2
+    || namespacePid > LINUX_PROC_MAX_PID
+  ) {
+    throw new Error('tracked-terminal marker PID is invalid');
+  }
+  if (platform !== 'linux') {
+    return { pid: namespacePid, startTimeTicks: null };
+  }
+  if (
+    !rootIdentity
+    || !Number.isSafeInteger(rootIdentity.pid)
+    || typeof rootIdentity.startTimeTicks !== 'string'
+  ) {
+    throw new Error('app-server host process identity is invalid');
+  }
+  if (
+    !expectedExecutableIdentity
+    || !/^(0|[1-9]\d*)$/.test(expectedExecutableIdentity.device)
+    || !/^(0|[1-9]\d*)$/.test(expectedExecutableIdentity.inode)
+  ) {
+    throw new Error('tracked sleep executable identity is invalid');
+  }
+  if (
+    typeof expectedEnvironmentToken !== 'string'
+    || !/^[a-f0-9]{32}$/.test(expectedEnvironmentToken)
+  ) {
+    throw new Error('tracked sleep environment token is invalid');
+  }
+  if (
+    !Number.isSafeInteger(maxPidEntries)
+    || maxPidEntries < 1
+    || maxPidEntries > LINUX_PROC_MAX_PID_ENTRIES
+  ) {
+    throw new Error('Linux proc scan bound is invalid');
+  }
+  validateLinuxProcResolutionLimits(resolutionLimits);
+  const checkDeadline = () => {
+    checkLinuxProcResolutionDeadline(resolutionLimits);
+  };
+  const readAccountedEvidence = (reader, pid) => {
+    checkDeadline();
+    const value = reader(pid, checkDeadline);
+    checkDeadline();
+    return accountLinuxProcEvidence(resolutionLimits, value);
+  };
+  checkDeadline();
+  const listPids = proc.listPids ?? listLinuxProcPids;
+  const readStat = proc.readStat ?? readLinuxProcStat;
+  const readCmdline = proc.readCmdline ?? readLinuxProcCmdline;
+  const readEnviron = proc.readEnviron ?? readLinuxProcEnviron;
+  const readExecutableIdentity = (
+    proc.readExecutableIdentity ?? readLinuxProcExecutableIdentity
+  );
+  const listedPids = listPids(checkDeadline);
+  checkDeadline();
+  if (!Array.isArray(listedPids)) {
+    throw new Error('Linux proc scan did not return a PID list');
+  }
+  if (listedPids.length > maxPidEntries) {
+    throw new Error(`Linux proc scan exceeded ${maxPidEntries} entries`);
+  }
+
+  const processes = new Map();
+  for (const listedPid of listedPids) {
+    checkDeadline();
+    const pid = parseLinuxPid(listedPid, 'Linux proc directory PID');
+    if (processes.has(pid)) {
+      throw new Error('Linux proc scan returned a duplicate PID');
+    }
+    let rawStat;
+    try {
+      rawStat = readAccountedEvidence(readStat, pid);
+    } catch (error) {
+      if (isProcResolutionLimitError(error)) throw error;
+      if (isTransientProcError(error)) continue;
+      throw new Error('Linux proc stat was unreadable', { cause: error });
+    }
+    processes.set(pid, parseLinuxProcStat(rawStat, pid));
+  }
+  checkDeadline();
+
+  const root = processes.get(rootIdentity.pid);
+  if (!root) {
+    throw procResolutionError(
+      'app-server host process disappeared during resolution',
+      'CODEX_TRACKED_PROC_CHURN',
+    );
+  }
+  if (
+    root.startTimeTicks !== rootIdentity.startTimeTicks
+    || ['Z', 'X', 'x'].includes(root.state)
+  ) {
+    throw new Error('app-server host process identity changed');
+  }
+
+  const descendants = trackedDescendants(root.pid, processes, checkDeadline);
+  const expectedCmdline = Buffer.from(
+    `/bin/sleep\0${TRACKED_TERMINAL_SLEEP_SECONDS}\0`,
+  );
+  const candidates = [];
+  for (const processInfo of descendants.values()) {
+    checkDeadline();
+    const cmdline = readRequiredProcEvidence(
+      (pid) => readAccountedEvidence(readCmdline, pid),
+      processInfo.pid,
+      'tracked descendant cmdline',
+    );
+    if (!Buffer.isBuffer(cmdline)) {
+      throw new Error('tracked descendant cmdline was malformed');
+    }
+    if (cmdline.length > LINUX_PROC_CMDLINE_MAX_BYTES) {
+      throw new Error('tracked descendant cmdline exceeded its byte bound');
+    }
+    if (!cmdline.equals(expectedCmdline)) continue;
+    const environ = readRequiredProcEvidence(
+      (pid) => readAccountedEvidence(readEnviron, pid),
+      processInfo.pid,
+      'tracked sleep environment',
+    );
+    if (
+      hasTrackedTerminalEnvironmentToken(
+        environ,
+        expectedEnvironmentToken,
+      )
+    ) {
+      candidates.push(processInfo);
+    }
+  }
+  if (candidates.length === 0) {
+    throw procResolutionError(
+      'no exact tracked sleep descendant was found',
+      'CODEX_TRACKED_SLEEP_NOT_FOUND',
+    );
+  }
+  if (candidates.length > 1) {
+    throw new Error('multiple exact tracked sleep descendants were found');
+  }
+
+  const candidate = candidates[0];
+  checkDeadline();
+  const actualExecutableIdentity = readRequiredProcEvidence(
+    (pid) => {
+      checkDeadline();
+      const identity = readExecutableIdentity(pid, checkDeadline);
+      checkDeadline();
+      return identity;
+    },
+    candidate.pid,
+    'tracked sleep executable identity',
+  );
+  assertExecutableIdentity(
+    actualExecutableIdentity,
+    expectedExecutableIdentity,
+  );
+
+  const chain = [];
+  let current = candidate;
+  while (true) {
+    checkDeadline();
+    chain.push(current);
+    if (current.pid === root.pid) break;
+    if (chain.length > LINUX_PROC_MAX_ANCESTRY_DEPTH) {
+      throw new Error('tracked process ancestry exceeded its bound');
+    }
+    current = processes.get(current.ppid);
+    if (!current) {
+      throw new Error('tracked process ancestry was incomplete');
+    }
+  }
+  for (const expected of chain) {
+    checkDeadline();
+    const actual = parseLinuxProcStat(
+      readRequiredProcEvidence(
+        (pid) => readAccountedEvidence(readStat, pid),
+        expected.pid,
+        'tracked process stat',
+      ),
+      expected.pid,
+    );
+    assertProcessIdentity(actual, expected);
+  }
+
+  checkDeadline();
+  return {
+    pid: candidate.pid,
+    startTimeTicks: candidate.startTimeTicks,
+  };
+}
+
+export function trackedTerminalProcessAlive(
+  identity,
+  {
+    platform = process.platform,
+    readStat = readLinuxProcStat,
+    kill0 = (pid) => process.kill(pid, 0),
+  } = {},
+) {
+  if (
+    !identity
+    || !Number.isSafeInteger(identity.pid)
+    || identity.pid < 2
+    || (
+      platform === 'linux'
+      && !/^(0|[1-9]\d*)$/.test(identity.startTimeTicks)
+    )
+  ) {
+    throw new Error('tracked process identity is invalid');
+  }
+  if (platform !== 'linux') return processAlive(identity.pid, kill0);
+  let current;
+  try {
+    current = parseLinuxProcStat(readStat(identity.pid), identity.pid);
+  } catch (error) {
+    if (isTransientProcError(error)) return false;
+    throw new Error('tracked sleep stat was unreadable', { cause: error });
+  }
+  if (current.startTimeTicks !== identity.startTimeTicks) {
+    throw new Error('tracked sleep PID was reused');
+  }
+  return !['Z', 'X', 'x'].includes(current.state);
 }
 
 async function waitForCondition(predicate, timeoutMs, intervalMs = 100) {
@@ -1427,17 +2042,35 @@ export async function characterizeTrackedTerminalStop(
   threadId,
   workspace,
 ) {
+  const platform = process.platform;
+  let linuxRootIdentity = null;
+  let expectedSleepExecutableIdentity = null;
+  let linuxTrackedTerminalToken = null;
+  if (platform === 'linux') {
+    const appServerHostPid = connection.child?.pid;
+    linuxRootIdentity = captureLinuxProcessIdentity(appServerHostPid);
+    expectedSleepExecutableIdentity = linuxExecutableIdentity('/bin/sleep');
+    linuxTrackedTerminalToken = randomBytes(16).toString('hex');
+  }
   const fixture = mkdtempSync(join(workspace, '.orchestra-codex-u1a-stop-'));
   chmodSync(fixture, 0o700);
   const marker = join(fixture, 'pid');
   const relativeMarker = relative(workspace, marker);
+  const trackedSleepCommand = platform === 'linux'
+    ? (
+      `export ${LINUX_TRACKED_TERMINAL_TOKEN_NAME}=`
+      + `${linuxTrackedTerminalToken}; `
+      + `exec /bin/sleep ${TRACKED_TERMINAL_SLEEP_SECONDS}`
+    )
+    : `exec /bin/sleep ${TRACKED_TERMINAL_SLEEP_SECONDS}`;
   const command = [
     '/bin/sh -c',
-    `'printf "%s\\n" "$$" > "$1"; exec /bin/sleep ${TRACKED_TERMINAL_SLEEP_SECONDS}'`,
+    `'printf "%s\\n" "$$" > "$1"; ${trackedSleepCommand}'`,
     'orchestra-u1a',
     `'${relativeMarker.replaceAll("'", "'\\''")}'`,
   ].join(' ');
   let syntheticPid;
+  let trackedProcess;
   const evidence = {
     commandStarted: false,
     markerObserved: false,
@@ -1494,8 +2127,50 @@ export async function characterizeTrackedTerminalStop(
         throw error;
       }
     }, 5_000);
-    if (!syntheticPid || !processAlive(syntheticPid)) {
+    if (!syntheticPid) {
       throw new Error('synthetic sleep PID was not observed alive');
+    }
+    if (platform === 'linux') {
+      const resolutionLimits = {
+        deadlineMs: (
+          performance.now() + LINUX_TRACKED_PROCESS_RESOLUTION_TIMEOUT_MS
+        ),
+        evidenceBytesRead: 0,
+        maxEvidenceBytes: LINUX_PROC_MAX_EVIDENCE_BYTES,
+        monotonicNow: () => performance.now(),
+      };
+      trackedProcess = await waitForCondition(
+        () => {
+          try {
+            return resolveTrackedTerminalProcess(syntheticPid, {
+              platform,
+              rootIdentity: linuxRootIdentity,
+              expectedExecutableIdentity: expectedSleepExecutableIdentity,
+              expectedEnvironmentToken: linuxTrackedTerminalToken,
+              resolutionLimits,
+            });
+          } catch (error) {
+            if (
+              error.code === 'CODEX_TRACKED_SLEEP_NOT_FOUND'
+              || error.code === 'CODEX_TRACKED_PROC_CHURN'
+            ) return null;
+            throw error;
+          }
+        },
+        LINUX_TRACKED_PROCESS_RESOLUTION_TIMEOUT_MS,
+        LINUX_TRACKED_PROCESS_RESOLUTION_INTERVAL_MS,
+      );
+    } else {
+      trackedProcess = resolveTrackedTerminalProcess(
+        syntheticPid,
+        { platform },
+      );
+    }
+    if (
+      !trackedProcess
+      || !trackedTerminalProcessAlive(trackedProcess, { platform })
+    ) {
+      throw new Error('synthetic sleep host process was not observed alive');
     }
     evidence.markerObserved = true;
 
@@ -1537,7 +2212,10 @@ export async function characterizeTrackedTerminalStop(
     evidence.listedAfterTerminal = terminals.some(
       (entry) => entry.itemId === commandItemId,
     );
-    evidence.commandAliveAfterTerminal = processAlive(syntheticPid);
+    evidence.commandAliveAfterTerminal = trackedTerminalProcessAlive(
+      trackedProcess,
+      { platform },
+    );
 
     const cleanResult = await connection.request(
       'thread/backgroundTerminals/clean',
@@ -1554,11 +2232,37 @@ export async function characterizeTrackedTerminalStop(
       threadId,
     );
     evidence.observedSyntheticPidDead = Boolean(
-      await waitForCondition(() => !processAlive(syntheticPid), 10_000),
+      await waitForCondition(
+        () => !trackedTerminalProcessAlive(trackedProcess, { platform }),
+        10_000,
+      ),
     );
     return evidence;
   } finally {
-    if (syntheticPid && processAlive(syntheticPid)) {
+    if (
+      platform === 'linux'
+      && evidence.commandStarted
+      && !evidence.observedSyntheticPidDead
+    ) {
+      try {
+        await connection.request(
+          'thread/backgroundTerminals/clean',
+          { threadId },
+        );
+        if (trackedProcess) {
+          await waitForCondition(
+            () => !trackedTerminalProcessAlive(trackedProcess, { platform }),
+            5_000,
+          );
+        }
+      } catch {
+        // The synthetic command self-expires after a bounded duration.
+      }
+    } else if (
+      platform !== 'linux'
+      && syntheticPid
+      && processAlive(syntheticPid)
+    ) {
       try {
         await connection.request('thread/backgroundTerminals/clean', { threadId });
         await waitForCondition(() => !processAlive(syntheticPid), 5_000);

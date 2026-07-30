@@ -12,6 +12,7 @@ const { test, describe } = require('node:test');
 const assert = require('node:assert/strict');
 
 const { CliProcess } = require('../index');
+const { createProcessFactory } = require('../lib/process/factory');
 const { ProcessManager } = require('../lib/process/process-manager');
 const { Process } = require('../lib/process/process');
 
@@ -136,6 +137,152 @@ describe('CliProcess.reloadReasonsFor — soak telemetry', () => {
   });
 });
 
+describe('CliProcess displayHint normalization', () => {
+  // The comparison is `!==` against a string, so a non-string field is drift
+  // that can never be resolved: a resolver returning null would leave the proc
+  // holding null, and every context carrying '' would respawn it again.
+  test('a non-string hint is stored as the empty string', () => {
+    for (const hint of [null, undefined, 0, false]) {
+      const p = new CliProcess({
+        sessionKey: 'sk',
+        chatId: '42',
+        tmuxRunner: fakeRunner,
+        botName: 'testbot',
+        claudeBin: '/usr/bin/echo',
+        toolDispatcher: fakeDispatcher,
+        displayHint: hint,
+        logger: quietLogger,
+      });
+      assert.equal(p.displayHint, '');
+    }
+  });
+
+  test('a proc spawned from a null-returning resolver is not permanently drifted', () => {
+    const p = cliProc({ displayHint: null });
+    assert.equal(
+      p.wouldReloadFor({ model: 'opus', effort: 'high', displayHint: '' }),
+      false,
+    );
+  });
+});
+
+// ── Through the REAL factory: the hint the reload compared against is the hint
+//    the respawn carries — no second source that can disagree. ──
+
+const factoryDeps = {
+  config: { chats: {} },
+  tmuxRunner: fakeRunner,
+  botName: 'testbot',
+  toolDispatcher: fakeDispatcher,
+  channelsClaudeBin: '/usr/bin/echo',
+  logger: quietLogger,
+  pmDefault: 'cli',
+};
+
+describe('createProcessFactory — the spawn context owns the hint', () => {
+  test('a context hint is used verbatim, even when the resolver disagrees', () => {
+    const factory = createProcessFactory({
+      ...factoryDeps,
+      displayHint: () => 'RESOLVER HINT',
+    });
+    const proc = factory('sk', { chatId: '42', displayHint: 'CONTEXT HINT' });
+    assert.equal(proc.displayHint, 'CONTEXT HINT');
+  });
+
+  test('no context hint → the resolver still supplies it (older consumers)', () => {
+    const seen = [];
+    const factory = createProcessFactory({
+      ...factoryDeps,
+      displayHint: (chatId, threadId, config) => {
+        seen.push({ chatId, threadId, hasConfig: config != null });
+        return 'RESOLVER HINT';
+      },
+    });
+    const proc = factory('sk', { chatId: '42', threadId: '7' });
+    assert.equal(proc.displayHint, 'RESOLVER HINT');
+    assert.deepEqual(seen, [{ chatId: '42', threadId: '7', hasConfig: true }]);
+  });
+
+  test('a static string hint still applies to every session', () => {
+    const factory = createProcessFactory({ ...factoryDeps, displayHint: 'STATIC' });
+    assert.equal(factory('sk', { chatId: '42' }).displayHint, 'STATIC');
+  });
+
+  test('a non-string context hint falls back to the resolver', () => {
+    const factory = createProcessFactory({
+      ...factoryDeps,
+      displayHint: () => 'RESOLVER HINT',
+    });
+    assert.equal(
+      factory('sk', { chatId: '42', displayHint: null }).displayHint,
+      'RESOLVER HINT',
+    );
+  });
+});
+
+describe('ProcessManager + the real factory — a toggle respawns exactly once', () => {
+  // The treadmill this guards: apply-path and detect-path reading different
+  // sources. If the respawned proc got the resolver's string while the reload
+  // compared against the context's, a one-character disagreement would respawn
+  // the session on every message, forever.
+  function realFactoryManager({ resolverHint }) {
+    const events = [];
+    const spawned = [];
+    const killed = [];
+    const factory = createProcessFactory({
+      ...factoryDeps,
+      displayHint: () => resolverHint,
+    });
+    const pm = new ProcessManager({
+      processFactory: (sessionKey, ctx) => {
+        const proc = factory(sessionKey, ctx);
+        // The hint is fixed by construction; tmux spawn and teardown are not
+        // what this test is about.
+        proc.start = async () => {
+          proc.model = proc._resolveModel(ctx);
+          proc.effort = proc._resolveEffort(ctx);
+        };
+        proc.kill = async (reason) => {
+          killed.push(reason);
+          proc.closed = true;
+          proc.emit('close', { reason });
+        };
+        spawned.push(proc);
+        return proc;
+      },
+      db: { logEvent: (kind, detail) => events.push({ kind, detail }) },
+      logger: quietLogger,
+    });
+    return { pm, events, spawned, killed };
+  }
+
+  test('the respawn carries the context hint the reload compared against', async () => {
+    const fleet = realFactoryManager({ resolverHint: 'RESOLVER DISAGREES' });
+    const ctx = { chatId: '42', model: 'opus', effort: 'high', displayHint: 'HINT A' };
+    await fleet.pm.getOrSpawn('sk', ctx);
+
+    const toggled = { ...ctx, displayHint: 'HINT B' };
+    const second = await fleet.pm.getOrSpawn('sk', toggled);
+    assert.deepEqual(fleet.killed, ['config-reload']);
+    assert.equal(second.displayHint, 'HINT B',
+      'the resolver must not overwrite the hint the drift check just accepted');
+
+    // The treadmill test: the same context again must reuse the warm proc.
+    const third = await fleet.pm.getOrSpawn('sk', toggled);
+    assert.equal(third, second, 'a settled toggle must not respawn again');
+    assert.equal(fleet.spawned.length, 2, 'exactly two spawns for one toggle');
+    assert.deepEqual(fleet.killed, ['config-reload']);
+  });
+
+  test('an unchanged chat never respawns, whatever the resolver would return', async () => {
+    const fleet = realFactoryManager({ resolverHint: 'RESOLVER DISAGREES' });
+    const ctx = { chatId: '42', model: 'opus', effort: 'high', displayHint: 'HINT A' };
+    for (let i = 0; i < 5; i++) await fleet.pm.getOrSpawn('sk', ctx);
+    assert.equal(fleet.spawned.length, 1);
+    assert.deepEqual(fleet.killed, []);
+  });
+});
+
 // ── Full path: getOrSpawn kills the stale proc and the respawn carries the new
 //    hint, because the factory re-resolves the consumer's hint per spawn. ──
 
@@ -168,16 +315,16 @@ for (const m of ['wouldReloadFor', 'reloadReasonsFor', '_resolveModel', '_resolv
 function hintManager() {
   const events = [];
   const spawns = [];
-  // Mirrors factory.js: the consumer registers a resolver, and it is called
-  // fresh on every spawn with the current config — so a hint that changed while
-  // the old proc was warm lands on the new one without anyone passing it along.
+  // Mirrors factory.js: the spawn context's hint wins, and the consumer's
+  // resolver — called fresh per spawn with the current config — is the fallback
+  // for a context that carries none.
   const state = { hint: 'HINT A' };
   const pm = new ProcessManager({
     processFactory: (sessionKey, ctx) => {
       const p = new HintProcess({
         sessionKey,
         chatId: ctx?.chatId,
-        displayHint: state.hint,
+        displayHint: typeof ctx?.displayHint === 'string' ? ctx.displayHint : state.hint,
       });
       spawns.push(p);
       return p;
@@ -230,5 +377,40 @@ describe('ProcessManager.getOrSpawn — display-hint drift respawns through the 
     await pm.getOrSpawn('sk', { ...ctx, model: 'sonnet' });
     const reload = events.find(e => e.kind === 'cli-config-reload');
     assert.equal(reload.detail.reason, 'model');
+    assert.equal(reload.detail.from_hint_hash, undefined,
+      'hint fingerprints belong only to a hint reload');
+    assert.equal(reload.detail.to_hint_hash, undefined);
+  });
+
+  test('a hint reload logs fingerprints, never hint bodies', async () => {
+    // A treadmill (respawn per message) and a real toggle look identical in the
+    // soak without something to compare across reloads. Fingerprints, because
+    // the hint is a multi-KB system-prompt block and the events table has no
+    // retention — the 4GB shumabit.db bloat is what unbounded detail costs.
+    const { pm, events } = hintManager();
+    const ctx = { chatId: '42', model: 'opus', effort: 'high', displayHint: 'HINT A' };
+    await pm.getOrSpawn('sk', ctx);
+    await pm.getOrSpawn('sk', { ...ctx, displayHint: 'HINT B' });
+
+    const reload = events.find(e => e.kind === 'cli-config-reload');
+    assert.equal(reload.detail.reason, 'display-hint');
+    assert.match(reload.detail.from_hint_hash, /^[0-9a-f]{8}$/);
+    assert.match(reload.detail.to_hint_hash, /^[0-9a-f]{8}$/);
+    assert.notEqual(reload.detail.from_hint_hash, reload.detail.to_hint_hash);
+    const serialized = JSON.stringify(reload.detail);
+    assert.doesNotMatch(serialized, /HINT A|HINT B/, 'no hint body may be stored');
+  });
+
+  test('the same hint always fingerprints the same, so a treadmill is visible', async () => {
+    const { pm, events } = hintManager();
+    const ctx = { chatId: '42', model: 'opus', effort: 'high', displayHint: 'HINT A' };
+    await pm.getOrSpawn('sk', ctx);
+    await pm.getOrSpawn('sk', { ...ctx, displayHint: 'HINT B' });
+    await pm.getOrSpawn('sk', { ...ctx, displayHint: 'HINT A' });
+
+    const reloads = events.filter(e => e.kind === 'cli-config-reload');
+    assert.equal(reloads.length, 2);
+    assert.equal(reloads[0].detail.from_hint_hash, reloads[1].detail.to_hint_hash,
+      'the same hint string must fingerprint identically across reloads');
   });
 });

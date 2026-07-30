@@ -32,8 +32,18 @@ Telegram or WhatsApp:
 
 - `toolDispatcher(call) => {ok, error?, message_id?}` — delivers reply/edit/react on the
   consumer's transport (already injected in polygram/water today).
-- `displayHint: string` — surface-rendering rules appended to the system prompt
-  (**new option**, replacing cli-process's hard `require('../delivery/display-hint')`).
+- `displayHint: string | (chatId, threadId, config) => string` — surface-rendering rules
+  appended to the system prompt (**new option**, replacing cli-process's hard
+  `require('../delivery/display-hint')`). A resolver is called once per spawn, so the hint
+  can vary per chat/topic.
+  **Contract for a hint that can change** (e.g. a per-chat rich-text toggle): the hint is
+  spawn-time state, so a change reaches a warm session only by respawning it. The consumer
+  must put the identical resolved string on the spawn context as `spawnContext.displayHint`.
+  That string is what `getOrSpawn` compares against the warm proc to detect the change, and
+  it is what the respawn is constructed with — the resolver is only the fallback for a
+  context that carries no hint. Two independent sources is the failure mode to avoid: if a
+  consumer's context string and its resolver disagree by one character, every message looks
+  like drift and the session respawns forever.
 - `maxOutboundFileBytes: number` — outbound file cap (**new option**, replacing
   `require('../attachments').resolveFileCaps`).
 - `claudeBin`, `botName`, `tmuxRunner`, `logger`, `db` (telemetry) — as today.

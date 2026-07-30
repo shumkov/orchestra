@@ -81,6 +81,506 @@ test('CliProcess construction — valid params', () => {
   assert.equal(p.bridgeReady, false);
 });
 
+function activeCleanRestartProcess(overrides = {}) {
+  const p = handshakeProcess(overrides);
+  const turnId = 'turn-active';
+  p.bridgeReady = true;
+  p.mcpReady = true;
+  p.tmuxSession = 'tmux-active';
+  p.bridgeServer = {
+    close: async () => {},
+  };
+  p._hookTail = {
+    drain: async () => ({ offset: 123 }),
+    close: () => {},
+  };
+  p._hookNdjsonPath = '/tmp/test-hook.ndjson';
+  p.pendingTurns.set(turnId, {
+    replies: [],
+    startedAt: Date.now(),
+    reject: () => {},
+  });
+  p.pendingQueue.push({
+    turnId,
+    context: { sourceMsgId: 42 },
+  });
+  p.inputLedger.set(turnId, {
+    turnId,
+    source: 'primary',
+    msgId: 42,
+    state: 'seen',
+  });
+  return { p, turnId };
+}
+
+test('clean restart retirement returns one eligible active CLI source after strict termination and hook drain', async () => {
+  const events = [];
+  const { p } = activeCleanRestartProcess({
+    tmuxRunner: {
+      ...fakeRunner,
+      killSession: async (_name, opts) => events.push(['tmux', opts]),
+      sessionExists: async () => false,
+    },
+  });
+  p.bridgeServer.close = async () => events.push(['bridge']);
+  p._hookTail.drain = async () => {
+    events.push(['drain']);
+    return { offset: 123 };
+  };
+
+  const snapshot = await p.retireForCleanRestart({
+    getDeliveryEvidence: async (sessionKey, sourceMsgId) => {
+      events.push(['delivery', sessionKey, sourceMsgId]);
+      return { outputAttempted: false, pending: 0, fenced: true };
+    },
+  });
+
+  assert.deepEqual(snapshot, {
+    sessionKey: 'handshake',
+    sourceMsgId: 42,
+    eligible: true,
+    reason: 'eligible',
+  });
+  assert.deepEqual(events, [
+    ['delivery', 'handshake', 42],
+    ['tmux', { strict: true }],
+    ['bridge'],
+    ['drain'],
+  ]);
+  assert.equal(p.closed, true);
+});
+
+test('clean restart retirement rejects malformed Polygram delivery evidence', () => {
+  const malformedEvidence = [
+    { pending: 0, fenced: true },
+    { outputAttempted: 'false', pending: 0, fenced: true },
+    { outputAttempted: false, pending: '1', fenced: true },
+    { outputAttempted: false, pending: -1, fenced: true },
+    { outputAttempted: false, pending: 0.5, fenced: true },
+    { outputAttempted: false, pending: Number.NaN, fenced: true },
+    { outputAttempted: false, pending: 0, fenced: false },
+  ];
+
+  for (const evidence of malformedEvidence) {
+    const { p } = activeCleanRestartProcess();
+    assert.deepEqual(
+      p._classifyCleanRestart(evidence),
+      ['delivery-ambiguous', 42],
+      JSON.stringify(evidence),
+    );
+  }
+});
+
+test('delivery ambiguity takes precedence over an unresolved active tool', () => {
+  const { p, turnId } = activeCleanRestartProcess();
+  p.pendingTurns.get(turnId).activeToolIds = new Set(['tool']);
+
+  assert.deepEqual(
+    p._classifyCleanRestart({
+      outputAttempted: false,
+      pending: 1,
+      fenced: true,
+    }),
+    ['delivery-ambiguous', 42],
+  );
+});
+
+test('clean restart retirement conservatively rejects sticky output, tool, interaction, input, loss, and delivery evidence', async () => {
+  const cases = [
+    ['prior-output', ({ pending }) => { pending.outputAttempted = true; }],
+    ['unresolved-tool', ({ pending }) => { pending.activeToolIds = new Set(['tool']); }],
+    ['unresolved-question', ({ p }) => { p._openQuestions.add('q'); }],
+    ['unresolved-approval', ({ p }) => { p._openApprovals.add('a'); }],
+    ['active-subagent', ({ p }) => { p._pendingSubagentStarts.push({ toolUseId: 'agent' }); }],
+    ['other-action-owner', ({ p }) => {
+      p.inputLedger.set('injected', { source: 'inject', msgId: 99, state: 'written' });
+    }],
+    ['bridge-loss', ({ p }) => { p._cleanRestartEvidenceLost = true; }],
+  ];
+
+  for (const [reason, mutate] of cases) {
+    const { p, turnId } = activeCleanRestartProcess({
+      tmuxRunner: {
+        ...fakeRunner,
+        killSession: async () => {},
+        sessionExists: async () => false,
+      },
+    });
+    p._openApprovals = new Set();
+    mutate({ p, pending: p.pendingTurns.get(turnId) });
+    const snapshot = await p.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({ outputAttempted: false, pending: 0, fenced: true }),
+    });
+    assert.equal(snapshot.eligible, false, reason);
+    assert.equal(snapshot.reason, reason, reason);
+  }
+
+  const { p: delivery } = activeCleanRestartProcess({
+    tmuxRunner: {
+      ...fakeRunner,
+      killSession: async () => {},
+      sessionExists: async () => false,
+    },
+  });
+  delivery._openApprovals = new Set();
+  const deliverySnapshot = await delivery.retireForCleanRestart({
+    getDeliveryEvidence: async () => ({
+      outputAttempted: false,
+      pending: 1,
+      fenced: true,
+    }),
+  });
+  assert.equal(deliverySnapshot.reason, 'delivery-ambiguous');
+
+  const { p: externalOutput } = activeCleanRestartProcess({
+    tmuxRunner: {
+      ...fakeRunner,
+      killSession: async () => {},
+    },
+  });
+  const externalOutputSnapshot = await externalOutput.retireForCleanRestart({
+    getDeliveryEvidence: async () => ({
+      outputAttempted: true,
+      pending: 0,
+      fenced: true,
+    }),
+  });
+  assert.equal(externalOutputSnapshot.reason, 'prior-output');
+});
+
+test('clean restart retirement rejects zero/multiple pendings and missing source correlation', async () => {
+  for (const [reason, mutate] of [
+    ['no-active-turn', ({ p }) => {
+      p.pendingTurns.clear();
+      p.pendingQueue.length = 0;
+      p.inputLedger.clear();
+    }],
+    ['multiple-active-turns', ({ p }) => {
+      p.pendingTurns.set('other', { replies: [], reject: () => {} });
+    }],
+    ['uncorrelated-source', ({ p }) => {
+      p.pendingQueue[0].context = {};
+      p.inputLedger.get('turn-active').msgId = null;
+    }],
+  ]) {
+    const { p } = activeCleanRestartProcess({
+      tmuxRunner: {
+        ...fakeRunner,
+        killSession: async () => {},
+        sessionExists: async () => false,
+      },
+    });
+    p._openApprovals = new Set();
+    mutate({ p });
+    const evidenceArgs = [];
+    const snapshot = await p.retireForCleanRestart({
+      getDeliveryEvidence: async (...args) => {
+        evidenceArgs.push(args);
+        return { outputAttempted: false, pending: 0, fenced: true };
+      },
+    });
+    assert.equal(snapshot.reason, reason);
+    assert.deepEqual(evidenceArgs, [['handshake', null]]);
+  }
+});
+
+test('clean restart retirement fails loud on tmux, bridge, or hook-tail uncertainty', async () => {
+  for (const [label, configure] of [
+    ['tmux', ({ p }) => {
+      p.runner.killSession = async () => {
+        throw Object.assign(new Error('kill failed'), { code: 'TMUX_KILL_FAILED' });
+      };
+    }],
+    ['bridge', ({ p }) => {
+      p.bridgeServer.close = async () => { throw new Error('close failed'); };
+    }],
+    ['hook', ({ p }) => {
+      p._hookTail.drain = async () => { throw new Error('drain failed'); };
+    }],
+  ]) {
+    const { p } = activeCleanRestartProcess({
+      tmuxRunner: {
+        ...fakeRunner,
+        killSession: async () => {},
+        sessionExists: async () => false,
+      },
+    });
+    p._openApprovals = new Set();
+    configure({ p });
+    await assert.rejects(
+      p.retireForCleanRestart({
+        getDeliveryEvidence: async () => ({ outputAttempted: false, pending: 0, fenced: true }),
+      }),
+      (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+      label,
+    );
+  }
+});
+
+async function exerciseStrictResume(t, {
+  createJsonl,
+  cwdName = 'workspace',
+  existingSessionId = 'resume-session',
+  expectedSessionId = 'resume-session',
+} = {}) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'strict-resume-'));
+  const cwd = path.join(root, cwdName);
+  const appDataDir = path.join(root, 'app-data');
+  fs.mkdirSync(cwd, { recursive: true });
+  t.mock.method(os, 'homedir', () => root);
+  const projectDir = path.join(
+    root,
+    '.claude',
+    'projects',
+    cwd.replace(/[/.]/g, '-'),
+  );
+  if (createJsonl) {
+    fs.mkdirSync(projectDir, { recursive: true });
+    fs.writeFileSync(path.join(projectDir, `${existingSessionId}.jsonl`), '{}\n');
+  }
+  const spawns = [];
+  const p = handshakeProcess({
+    appDataDir,
+    attachmentBase: path.join(root, 'attachments'),
+    tmuxRunner: {
+      ...fakeRunner,
+      spawn: async (opts) => spawns.push(opts),
+    },
+  });
+  p.sockPath = path.join(root, 'bridge.sock');
+  p.sockSecret = 'secret';
+  p.claudeSessionId = existingSessionId;
+  p._handleStartupDialogs = async () => {};
+  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  const opts = {
+    cwd,
+    existingSessionId,
+    expectedSessionId,
+    resumePolicy: 'require-existing-session',
+  };
+  return { p, opts, spawns };
+}
+
+test('strict resume rejects a missing JSONL instead of accepting fresh fallback', async (t) => {
+  const { p, opts, spawns } = await exerciseStrictResume(t, { createJsonl: false });
+
+  await assert.rejects(
+    p._spawnTmuxClaude({ tmuxName: 'strict', opts }),
+    (error) => error.code === 'REQUIRED_SESSION_NOT_FOUND',
+  );
+  assert.equal(spawns.length, 0);
+  assert.equal(p.resumeAttestation, null);
+});
+
+test('strict resume requires expectedSessionId to equal the requested existing session', async (t) => {
+  const { p, opts, spawns } = await exerciseStrictResume(t, {
+    createJsonl: true,
+    expectedSessionId: 'different-session',
+  });
+
+  await assert.rejects(
+    p._spawnTmuxClaude({ tmuxName: 'strict', opts }),
+    (error) => error.code === 'REQUIRED_SESSION_MISMATCH',
+  );
+  assert.equal(spawns.length, 0);
+  assert.equal(p.resumeAttestation, null);
+});
+
+test('strict resume exposes immutable public attestation for the exact channels session', async (t) => {
+  const { p, opts, spawns } = await exerciseStrictResume(t, { createJsonl: true });
+
+  await p._spawnTmuxClaude({ tmuxName: 'strict', opts });
+
+  assert.equal(spawns.length, 1);
+  const resumeIndex = spawns[0].args.indexOf('--resume');
+  assert.equal(spawns[0].args[resumeIndex + 1], 'resume-session');
+  assert.equal(p.resumeAttestation, null);
+  assert.deepEqual(p._pendingResumeAttestation, {
+    namespace: 'claude:channels',
+    sessionId: 'resume-session',
+    resumed: true,
+    freshFallback: false,
+  });
+  p._strictExpectedSessionId = 'resume-session';
+  p.claudeSessionId = 'resume-session';
+  p._resumeAttestation = p._pendingResumeAttestation;
+  assert.equal(Object.isFrozen(p.resumeAttestation), true);
+  assert.throws(() => {
+    p.resumeAttestation.sessionId = 'mutated';
+  }, TypeError);
+});
+
+test('strict resume finds Claude JSONL when the cwd contains dots', async (t) => {
+  const { p, opts, spawns } = await exerciseStrictResume(t, {
+    createJsonl: true,
+    cwdName: 'workspace.with-dots',
+  });
+
+  await p._spawnTmuxClaude({ tmuxName: 'strict', opts });
+
+  assert.equal(spawns.length, 1);
+  const resumeIndex = spawns[0].args.indexOf('--resume');
+  assert.equal(spawns[0].args[resumeIndex + 1], 'resume-session');
+});
+
+test('strict resume publishes attestation only after spawn and handshake succeed', async () => {
+  const p = handshakeProcess();
+  const attestation = Object.freeze({
+    namespace: 'claude:channels',
+    sessionId: 'resume-session',
+    resumed: true,
+    freshFallback: false,
+  });
+  p._createSocketServer = async () => {};
+  p._spawnTmuxClaude = async () => {
+    p.claudeSessionId = 'resume-session';
+    p._pendingResumeAttestation = attestation;
+  };
+  p._waitForBridgeHandshake = async () => {};
+  p._armHookTail = () => {};
+  p._startPingLoop = () => {};
+  p._stopStartupPingLoop = () => {};
+
+  await p.start({
+    existingSessionId: 'resume-session',
+    expectedSessionId: 'resume-session',
+    resumePolicy: 'require-existing-session',
+  });
+
+  assert.equal(p.resumeAttestation, attestation);
+});
+
+test('strict resume never publishes attestation when spawn fails', async () => {
+  const p = handshakeProcess();
+  p._createSocketServer = async () => {};
+  p._spawnTmuxClaude = async () => {
+    p._pendingResumeAttestation = Object.freeze({
+      namespace: 'claude:channels',
+      sessionId: 'resume-session',
+      resumed: true,
+      freshFallback: false,
+    });
+    throw new Error('spawn failed');
+  };
+  p._teardownOnStartFailure = async () => {};
+
+  await assert.rejects(
+    p.start({
+      existingSessionId: 'resume-session',
+      expectedSessionId: 'resume-session',
+      resumePolicy: 'require-existing-session',
+    }),
+    /spawn failed/,
+  );
+  assert.equal(p.resumeAttestation, null);
+});
+
+test('strict resume rejects a bridge-reported different session identity', async () => {
+  const p = handshakeProcess();
+  p._strictExpectedSessionId = 'expected-session';
+  p._pendingResumeAttestation = Object.freeze({
+    namespace: 'claude:channels',
+    sessionId: 'expected-session',
+    resumed: true,
+    freshFallback: false,
+  });
+  const accepted = p._acceptBridgeSessionId('different-session');
+
+  assert.equal(accepted, false);
+  assert.equal(p.resumeAttestation, null);
+  assert.equal(p._pendingResumeAttestation, null);
+  assert.equal(p._bridgeHandshakeCancellationError.code, 'REQUIRED_SESSION_MISMATCH');
+});
+
+test('clean restart retirement attempts every containment cleanup after tmux failure', async () => {
+  const events = [];
+  const { p } = activeCleanRestartProcess({
+    tmuxRunner: {
+      ...fakeRunner,
+      killSession: async () => {
+        events.push('tmux');
+        throw new Error('tmux failed');
+      },
+    },
+  });
+  p.bridgeServer.close = async () => events.push('bridge');
+  p._hookTail.drain = async () => events.push('drain');
+  p._hookTail.close = () => events.push('tail-close');
+
+  await assert.rejects(
+    p.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({ outputAttempted: false, pending: 0, fenced: true }),
+    }),
+    (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+  );
+
+  assert.deepEqual(events.slice(0, 4), ['tmux', 'bridge', 'drain', 'tail-close']);
+  assert.equal(p.closed, true);
+});
+
+test('reply arriving after the clean-restart fence is blocked and sticky-marks output evidence', async () => {
+  let dispatches = 0;
+  const { p, turnId } = activeCleanRestartProcess({
+    toolDispatcher: async () => {
+      dispatches++;
+      return { ok: true };
+    },
+  });
+  const acknowledgements = [];
+  p._writeToBridge = message => {
+    acknowledgements.push(message);
+    return true;
+  };
+  p._cleanRestartOutputFenced = true;
+
+  await p._dispatchToolCall({
+    kind: 'tool',
+    name: 'reply',
+    tool_call_id: 'reply-after-fence',
+    args: {
+      chat_id: '1',
+      turn_id: turnId,
+      text: 'must not deliver',
+    },
+  });
+
+  assert.equal(dispatches, 0);
+  assert.equal(p.pendingTurns.get(turnId).outputAttempted, true);
+  assert.equal(p._cleanRestartEvidenceLost, true);
+  assert.equal(acknowledgements[0].ok, false);
+  assert.equal(p._classifyCleanRestart({
+    outputAttempted: false,
+    pending: 0,
+    fenced: true,
+  })[0], 'prior-output');
+});
+
+test('delivery-evidence rejection still runs every containment cleanup', async () => {
+  const events = [];
+  const { p } = activeCleanRestartProcess({
+    tmuxRunner: {
+      ...fakeRunner,
+      killSession: async () => events.push('tmux'),
+    },
+  });
+  p.bridgeServer.close = async () => events.push('bridge');
+  p._hookTail.drain = async () => events.push('drain');
+  p._hookTail.close = () => events.push('tail-close');
+
+  await assert.rejects(
+    p.retireForCleanRestart({
+      getDeliveryEvidence: async (sessionKey, sourceMsgId) => {
+        assert.deepEqual([sessionKey, sourceMsgId], ['handshake', 42]);
+        throw new Error('registry failed');
+      },
+    }),
+    (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+  );
+
+  assert.deepEqual(events.slice(0, 4), ['tmux', 'bridge', 'drain', 'tail-close']);
+  assert.equal(p.closed, true);
+});
+
 test('Claude 2.1.220 MCP registration keeps a thirty-second readiness window', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
   const p = handshakeProcess();
@@ -529,7 +1029,7 @@ test('P1 #9: ChannelsBridgeServer wraps listen() in restrictive umask', () => {
 
 // Parity audit P4 + P7 + P8 — agent / topic-precedence / --resume.
 
-async function captureSpawnArgs(constructorOpts, startOpts) {
+async function captureSpawnArgs(constructorOpts, startOpts, { includeProcess = false } = {}) {
   const spawnedArgs = [];
   const runner = {
     spawn: async opts => { spawnedArgs.push(...opts.args); },
@@ -556,15 +1056,19 @@ async function captureSpawnArgs(constructorOpts, startOpts) {
   const sock = net.connect(p.sockPath);
   await new Promise(r => sock.once('connect', r));
   sock.write(JSON.stringify({ kind: 'hello', session_key: p.sessionKey, secret: p.sockSecret }) + '\n');
-  sock.write(JSON.stringify({ kind: 'session_init', claude_session_id: 'test-sid' }) + '\n');
+  sock.write(JSON.stringify({
+    kind: 'session_init',
+    claude_session_id: startOpts?.expectedSessionId || 'test-sid',
+  }) + '\n');
   // 0.12 Phase 1.6: also synthesize the mcp-ready signal that real bridges
   // emit on first claude ListToolsRequest. Without it, _waitForBridgeHandshake
   // would block until the configured mcp-ready timeout.
   sock.write(JSON.stringify({ kind: 'mcp-ready', session: p.sessionKey }) + '\n');
   await startP;
+  const resumeAttestation = p.resumeAttestation;
   sock.end();
   await p.kill('test');
-  return spawnedArgs;
+  return includeProcess ? { spawnedArgs, resumeAttestation } : spawnedArgs;
 }
 
 test('P4 parity: --agent flag passed when chatConfig.agent set', async () => {
@@ -624,8 +1128,35 @@ test('rc.8: --resume used when existingSessionId set AND session file exists on 
       '--session-id NOT present when --resume is in effect');
   } finally {
     fs.rmSync(sidFile, { force: true });
-    fs.rmdirSync(projectsDir, { recursive: true });
+    fs.rmSync(projectsDir, { recursive: true, force: true });
     fs.rmdirSync(testCwd);
+  }
+});
+
+test('strict resume attestation follows the real spawn and bridge handshake path', async () => {
+  const testCwd = fs.mkdtempSync(path.join(os.tmpdir(), 'strict-integration-'));
+  const sid = 'strict-integrated-session';
+  const projectsDir = path.join(os.homedir(), '.claude', 'projects', testCwd.replace(/\//g, '-'));
+  fs.mkdirSync(projectsDir, { recursive: true });
+  fs.writeFileSync(path.join(projectsDir, `${sid}.jsonl`), '{}\n');
+  try {
+    const { spawnedArgs, resumeAttestation } = await captureSpawnArgs({}, {
+      cwd: testCwd,
+      existingSessionId: sid,
+      expectedSessionId: sid,
+      resumePolicy: 'require-existing-session',
+    }, { includeProcess: true });
+    assert.equal(spawnedArgs[spawnedArgs.indexOf('--resume') + 1], sid);
+    assert.deepEqual(resumeAttestation, {
+      namespace: 'claude:channels',
+      sessionId: sid,
+      resumed: true,
+      freshFallback: false,
+    });
+    assert.equal(Object.isFrozen(resumeAttestation), true);
+  } finally {
+    fs.rmSync(projectsDir, { recursive: true, force: true });
+    fs.rmSync(testCwd, { recursive: true, force: true });
   }
 });
 

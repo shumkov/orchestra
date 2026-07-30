@@ -293,6 +293,42 @@ describe('ProcessManager — weighted LRU eviction', () => {
     assert.equal(pm.has('first'), false);
     assert.equal(pm.has('second'), true);
   });
+
+  test('noWaitForCapacity rejects immediately instead of parking behind in-flight work', async () => {
+    const pm = new ProcessManager({
+      processFactory: mockFactory({ cost: 1 }),
+      budget: 1,
+    });
+    const active = await pm.getOrSpawn('active');
+    active.inFlight = true;
+    pm._awaitLruSlot = () => {
+      throw new Error('no-wait admission must not park');
+    };
+
+    await assert.rejects(
+      pm.getOrSpawn('recovery', { noWaitForCapacity: true }),
+      (error) => error.code === 'PROCESS_ADMISSION_UNAVAILABLE',
+    );
+    assert.equal(pm.has('recovery'), false);
+    assert.equal(pm.get('active'), active);
+  });
+
+  test('noWaitForCapacity rejects rather than soft-overflowing a pinned process', async () => {
+    const pm = new ProcessManager({
+      processFactory: mockFactory({ cost: 1 }),
+      budget: 1,
+    });
+    const pinned = await pm.getOrSpawn('pinned');
+    pinned.hasActiveBackgroundWork = () => true;
+
+    await assert.rejects(
+      pm.getOrSpawn('recovery', { noWaitForCapacity: true }),
+      (error) => error.code === 'PROCESS_ADMISSION_UNAVAILABLE',
+    );
+    assert.equal(pm.has('recovery'), false);
+    assert.equal(pm.get('pinned'), pinned);
+    assert.equal(pm.totalCost, 1);
+  });
 });
 
 describe('ProcessManager — eviction-pin for live background work (Policy C)', () => {
@@ -384,6 +420,150 @@ describe('ProcessManager — delivery-work eviction pin', () => {
 });
 
 describe('ProcessManager — kill / killChat / shutdown', () => {
+  test('retireForCleanRestart fences, strictly retires every process, and returns per-session snapshots', async () => {
+    const calls = [];
+    class RetiringProcess extends MockProcess {
+      constructor(opts, { backend, snapshot }) {
+        super(opts, { backend });
+        this.snapshot = snapshot;
+      }
+      async retireForCleanRestart({ getDeliveryEvidence }) {
+        calls.push(`retire:${this.sessionKey}`);
+        const sourceMsgId = this.snapshot.sourceMsgId ?? null;
+        const deliveryEvidence = await getDeliveryEvidence(this.sessionKey, sourceMsgId);
+        this.closed = true;
+        return { ...this.snapshot, deliveryEvidence };
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new RetiringProcess(
+        { sessionKey },
+        sessionKey === 'cli'
+          ? {
+            backend: 'cli',
+            snapshot: {
+              sessionKey,
+              sourceMsgId: 42,
+              eligible: true,
+              reason: 'eligible',
+            },
+          }
+          : {
+            backend: 'sdk',
+            snapshot: {
+              sessionKey,
+              sourceMsgId: 99,
+              eligible: true,
+              reason: 'eligible',
+            },
+          },
+      ),
+    });
+    await pm.getOrSpawn('cli');
+    await pm.getOrSpawn('sdk');
+
+    const snapshots = await pm.retireForCleanRestart({
+      getDeliveryEvidence: async (sessionKey, sourceMsgId) => {
+        calls.push(`evidence:${sessionKey}:${sourceMsgId ?? 'null'}`);
+        return { safe: sessionKey === 'cli' };
+      },
+    });
+
+    assert.equal(pm.size, 0);
+    assert.deepEqual(calls.sort(), [
+      'evidence:cli:42',
+      'evidence:sdk:null',
+      'retire:cli',
+      'retire:sdk',
+    ]);
+    assert.deepEqual(snapshots, [
+      {
+        sessionKey: 'cli',
+        sourceMsgId: 42,
+        eligible: true,
+        reason: 'eligible',
+      },
+      {
+        sessionKey: 'sdk',
+        sourceMsgId: null,
+        eligible: false,
+        reason: 'unsupported-backend',
+      },
+    ]);
+  });
+
+  test('retireForCleanRestart propagates strict retirement failure and returns no snapshots', async () => {
+    class FailedRetirementProcess extends MockProcess {
+      async retireForCleanRestart() {
+        throw Object.assign(new Error('bridge close uncertain'), {
+          code: 'CLEAN_RESTART_RETIREMENT_FAILED',
+        });
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new FailedRetirementProcess({ sessionKey }),
+    });
+    await pm.getOrSpawn('cli');
+
+    await assert.rejects(
+      pm.retireForCleanRestart({
+        getDeliveryEvidence: async () => ({
+          outputAttempted: false,
+          pending: 0,
+          fenced: true,
+        }),
+      }),
+      (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+    );
+  });
+
+  test('retireForCleanRestart still retires every process after an admitted lifecycle failure', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const first = await pm.getOrSpawn('first');
+    const second = await pm.getOrSpawn('second');
+    pm._lifecycleGates.set('failed-gate', Promise.reject(new Error('admitted failed')));
+
+    await assert.rejects(
+      pm.retireForCleanRestart({
+        getDeliveryEvidence: async () => ({
+          outputAttempted: false,
+          pending: 0,
+          fenced: true,
+        }),
+      }),
+      /admitted failed/,
+    );
+
+    assert.deepEqual(first._killSpy, ['clean-restart']);
+    assert.deepEqual(second._killSpy, ['clean-restart']);
+    assert.equal(pm.size, 0);
+  });
+
+  test('retireForCleanRestart rejects when an unsupported process kill does not confirm closure', async () => {
+    class UnconfirmedProcess extends MockProcess {
+      async kill(reason) {
+        this._killSpy.push(reason);
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new UnconfirmedProcess({ sessionKey }),
+    });
+    const proc = await pm.getOrSpawn('sdk');
+
+    await assert.rejects(
+      pm.retireForCleanRestart({
+        getDeliveryEvidence: async () => ({
+          outputAttempted: false,
+          pending: 0,
+          fenced: true,
+        }),
+      }),
+      (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+    );
+    assert.deepEqual(proc._killSpy, ['clean-restart']);
+    assert.equal(pm.has('sdk'), true);
+  });
+
   test('kill removes from map + calls Process.kill', async () => {
     const pm = new ProcessManager({ processFactory: mockFactory() });
     await pm.getOrSpawn('sk', { chatId: 100 });
@@ -515,6 +695,100 @@ describe('ProcessManager — kill / killChat / shutdown', () => {
     );
     assert.equal(pm.has('sk'), false);
     assert.equal(pm._retirementIntents.has('sk'), false);
+  });
+});
+
+describe('ProcessManager — expected-process send precondition', () => {
+  test('rejects a replaced entry before the old process can accept input', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const expectedProcess = await pm.getOrSpawn('sk');
+    const replacement = new MockProcess({ sessionKey: 'sk' });
+    pm.procs.set('sk', replacement);
+
+    await assert.rejects(
+      pm.send('sk', 'must not reach replacement', { expectedProcess }),
+      (error) => error.code === 'PROCESS_PRECONDITION_FAILED',
+    );
+    assert.deepEqual(expectedProcess._sendSpy, []);
+    assert.deepEqual(replacement._sendSpy, []);
+  });
+
+  test('rejects an expected entry that is already closed', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const expectedProcess = await pm.getOrSpawn('sk');
+    expectedProcess.closed = true;
+
+    await assert.rejects(
+      pm.send('sk', 'must not reach closed process', { expectedProcess }),
+      (error) => error.code === 'PROCESS_PRECONDITION_FAILED',
+    );
+    assert.deepEqual(expectedProcess._sendSpy, []);
+  });
+
+  test('sends through the exact open entry without leaking expectedProcess', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const expectedProcess = await pm.getOrSpawn('sk');
+
+    const result = await pm.send('sk', 'safe input', {
+      expectedProcess,
+      sourceMsgId: 42,
+    });
+
+    assert.equal(result.text, 'mock reply');
+    assert.deepEqual(expectedProcess._sendSpy, [{
+      prompt: 'safe input',
+      opts: { sourceMsgId: 42 },
+    }]);
+  });
+});
+
+describe('ProcessManager — exact-process guarded retirement', () => {
+  test('retires and removes the exact current process', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const expectedProcess = await pm.getOrSpawn('sk');
+
+    assert.equal(
+      await pm.retireExpectedProcess('sk', expectedProcess, 'attestation-rejected'),
+      true,
+    );
+    assert.deepEqual(expectedProcess._killSpy, ['attestation-rejected']);
+    assert.equal(expectedProcess.closed, true);
+    assert.equal(pm.get('sk'), null);
+  });
+
+  test('refuses a replacement without killing or removing either process', async () => {
+    const pm = new ProcessManager({ processFactory: mockFactory() });
+    const expectedProcess = await pm.getOrSpawn('sk');
+    const replacement = new MockProcess({ sessionKey: 'sk' });
+    pm.procs.set('sk', replacement);
+
+    await assert.rejects(
+      pm.retireExpectedProcess('sk', expectedProcess, 'attestation-rejected'),
+      (error) => error.code === 'PROCESS_PRECONDITION_FAILED',
+    );
+    assert.deepEqual(expectedProcess._killSpy, []);
+    assert.deepEqual(replacement._killSpy, []);
+    assert.equal(pm.get('sk'), replacement);
+  });
+
+  test('fails loud and preserves the entry when exact retirement cannot complete', async () => {
+    class FailedRetirementProcess extends MockProcess {
+      async kill(reason) {
+        this._killSpy.push(reason);
+        throw new Error('retirement failed');
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new FailedRetirementProcess({ sessionKey }),
+    });
+    const expectedProcess = await pm.getOrSpawn('sk');
+
+    await assert.rejects(
+      pm.retireExpectedProcess('sk', expectedProcess, 'attestation-rejected'),
+      /retirement failed/,
+    );
+    assert.equal(pm.get('sk'), expectedProcess);
+    assert.equal(expectedProcess.closed, false);
   });
 });
 

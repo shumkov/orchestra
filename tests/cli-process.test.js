@@ -1273,6 +1273,47 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   assert.match(progressSection, /⏳/, 'shows the literal marker the agent should use');
   assert.match(progressSection, /Exactly one item/i,
     'only one item may carry the marker at a time');
+  // 2026-07-30 live failure: the agent worked a 5-item checklist, delivered the
+  // final report, and ended the turn with the bubble frozen at 4/5 — the last
+  // item still unticked and still carrying ⏳. "Tick after every step" never
+  // said the checklist must be CLOSED OUT, so the user was left looking at work
+  // that reads as abandoned one item from the end.
+  assert.match(progressSection, /final answer COMPLETES the last step|completes the last step/i,
+    'delivering the final answer IS the completion of the last step');
+  assert.match(progressSection, /zero ⏳|no ⏳|all `?- \[x\]`?, zero/i,
+    'pins the checklist\'s required final state: everything checked, marker gone');
+  assert.match(
+    progressSection,
+    /ends with a lingering ⏳.{0,90}CONTRACT VIOLATION/i,
+    'a turn ending on a leftover in-progress marker is named a CONTRACT VIOLATION');
+  // The close-out rule must not force a lie. If work stops early — a step fails,
+  // is skipped, or is blocked — "tick everything or be a named violation" leaves
+  // only two moves, and a model that obeys hard contracts will tick the lie.
+  // The unfinished item stays unticked and says WHY; the marker is what must go.
+  assert.match(progressSection, /NEVER tick an item you did not|MUST NOT be ticked/i,
+    'ticking work that was not actually completed is forbidden outright');
+  assert.match(progressSection, /name the reason|leave that item unticked/i,
+    'stopping early still closes out: marker gone, item unticked, reason on the line');
+  // Same live test: the final report used `- [ ]` for RECOMMENDATIONS addressed
+  // to the user ("decide the fate of X", "you could clean up Y") — items the
+  // agent will never close, in the same document where other recommendations
+  // were plain bullets. A checkbox is a commitment to tick it, not decoration:
+  // user-facing items masquerading as checkboxes also make the close-out rule
+  // above impossible to satisfy honestly.
+  assert.match(progressSection, /EXCLUSIVELY for your own work/i,
+    'checkboxes are reserved for the agent\'s own work items');
+  assert.match(progressSection, /commit(ment|ting) to tick it/i,
+    'writing a checkbox is stated as a commitment to tick it yourself');
+  // The production misuse was in the FINAL REPORT, not the progress checklist,
+  // so the rule has to say out loud that it is not scoped to the checklist.
+  assert.match(progressSection, /EVERY message you send.{0,40}final answer/i,
+    'the ownership rule covers every message, the final answer included');
+  assert.match(progressSection, /addressed to the USER/i,
+    'names the misuse case: items aimed at the user');
+  assert.match(progressSection, /recommendation/i,
+    'recommendations are the observed misuse and are named as such');
+  assert.match(progressSection, /plain bullet/i,
+    'user-facing recommendations must be plain bullets, never checkboxes');
   assert.match(progressSection, /re-?render/i, 'states that an edit re-renders (rich stays rich)');
   assert.match(progressSection, /whole list|full list|entire list/i,
     'an edit REPLACES the body, so a partial re-send would lose the rest of the list');

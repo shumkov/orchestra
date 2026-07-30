@@ -1284,8 +1284,16 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'pins the checklist\'s required final state: everything checked, marker gone');
   assert.match(
     progressSection,
-    /ends with an (unticked|unchecked) item or a lingering ⏳.{0,80}CONTRACT VIOLATION/i,
-    'a turn ending on an unticked item or a leftover marker is named a CONTRACT VIOLATION');
+    /ends with a lingering ⏳.{0,90}CONTRACT VIOLATION/i,
+    'a turn ending on a leftover in-progress marker is named a CONTRACT VIOLATION');
+  // The close-out rule must not force a lie. If work stops early — a step fails,
+  // is skipped, or is blocked — "tick everything or be a named violation" leaves
+  // only two moves, and a model that obeys hard contracts will tick the lie.
+  // The unfinished item stays unticked and says WHY; the marker is what must go.
+  assert.match(progressSection, /NEVER tick an item you did not|MUST NOT be ticked/i,
+    'ticking work that was not actually completed is forbidden outright');
+  assert.match(progressSection, /name the reason|leave that item unticked/i,
+    'stopping early still closes out: marker gone, item unticked, reason on the line');
   // Same live test: the final report used `- [ ]` for RECOMMENDATIONS addressed
   // to the user ("decide the fate of X", "you could clean up Y") — items the
   // agent will never close, in the same document where other recommendations
@@ -1296,8 +1304,14 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'checkboxes are reserved for the agent\'s own work items');
   assert.match(progressSection, /commit(ment|ting) to tick it/i,
     'writing a checkbox is stated as a commitment to tick it yourself');
-  assert.match(progressSection, /addressed to the USER.{0,3}recommendations|recommendations, follow-ups/i,
-    'names the misuse case: recommendations and follow-ups aimed at the user');
+  // The production misuse was in the FINAL REPORT, not the progress checklist,
+  // so the rule has to say out loud that it is not scoped to the checklist.
+  assert.match(progressSection, /EVERY message you send.{0,40}final answer/i,
+    'the ownership rule covers every message, the final answer included');
+  assert.match(progressSection, /addressed to the USER/i,
+    'names the misuse case: items aimed at the user');
+  assert.match(progressSection, /recommendation/i,
+    'recommendations are the observed misuse and are named as such');
   assert.match(progressSection, /plain bullet/i,
     'user-facing recommendations must be plain bullets, never checkboxes');
   assert.match(progressSection, /re-?render/i, 'states that an edit re-renders (rich stays rich)');

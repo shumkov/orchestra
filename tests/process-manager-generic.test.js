@@ -1068,6 +1068,18 @@ function runtimeManager({
   return { pm, constructions };
 }
 
+function containmentCleanupDetail(proc, overrides = {}) {
+  return Object.freeze({
+    kind: 'containment-cleanup-committed',
+    backend: 'codex',
+    generationId: proc.generationId,
+    hostIdentity: proc.hostIdentity,
+    bootSessionIdentity: proc.bootSessionIdentity,
+    containmentReason: 'test-containment',
+    ...overrides,
+  });
+}
+
 describe('ProcessManager — runtime identity and strict replacement', () => {
   test('omitted/null runtime is legacy Claude; explicit unknown fails before cache/factory', async () => {
     const { pm, constructions } = runtimeManager();
@@ -1941,8 +1953,8 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
     assert.equal(pm.has('good'), true);
   });
 
-  test('containment and generic close retain the lease', async (t) => {
-    for (const mode of ['containment', 'generic-close']) {
+  test('containment and generic or inexact close retain the exact map and lease', async (t) => {
+    for (const mode of ['containment', 'generic-close', 'copied-cleanup']) {
       await t.test(mode, async () => {
         const { pm, constructions } = runtimeManager();
         const proc = await pm.getOrSpawn('codex-a', {
@@ -1956,9 +1968,16 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
             generationId: proc.generationId,
           });
         } else {
+          const detail = mode === 'copied-cleanup'
+            ? containmentCleanupDetail(proc)
+            : { generationId: proc.generationId };
+          if (mode === 'copied-cleanup') {
+            proc.containmentCleanupCommitted = containmentCleanupDetail(proc);
+          }
           proc.closed = true;
-          proc.emit('close', { generationId: proc.generationId });
+          proc.emit('close', 1, detail);
         }
+        await new Promise((resolve) => setImmediate(resolve));
         await assert.rejects(
           pm.getOrSpawn('codex-b', {
             runtime: 'codex',
@@ -1967,8 +1986,104 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
           (error) => error.code === 'CODEX_DAEMON_GENERATION_BUSY',
         );
         assert.equal(constructions.length, 1);
+        assert.equal(pm.get('codex-a'), proc);
+        assert.equal(pm._codexLease?.proc, proc);
       });
     }
+  });
+
+  test('exact cleanup close releases only after the in-flight start settles', async () => {
+    const cleanupEmitted = deferred();
+    const releaseStart = deferred();
+    let construction = 0;
+    let failedProc;
+    const pm = new ProcessManager({
+      codexRecoveryState: { status: 'clear' },
+      codexHostIdentity: 'host-a',
+      codexBootSessionIdentity: 'boot-new',
+      processFactory: (sessionKey, ctx) => {
+        construction += 1;
+        const proc = new RuntimeProcess({ sessionKey }, {
+          runtime: 'codex',
+          spawnProfileId: ctx.spawnProfileId,
+          generationId: `generation-${construction}`,
+        });
+        if (construction === 1) {
+          failedProc = proc;
+          proc.start = async () => {
+            proc.state = 'ContainmentFailed';
+            proc.emit('containment-failed', {
+              kind: 'containment-failed',
+              generationId: proc.generationId,
+            });
+            const detail = containmentCleanupDetail(proc);
+            proc.containmentCleanupCommitted = detail;
+            proc.closed = true;
+            proc.state = 'Closed';
+            proc.emit('close', 1, detail);
+            cleanupEmitted.resolve();
+            await releaseStart.promise;
+            throw new Error('accepted startup failed after cleanup');
+          };
+        }
+        return proc;
+      },
+    });
+
+    const starting = pm.getOrSpawn('codex-a', {
+      runtime: 'codex',
+      spawnProfileId: 'workspace-a',
+    });
+    await cleanupEmitted.promise;
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pm.get('codex-a'), failedProc);
+    assert.equal(pm._codexLease?.proc, failedProc);
+
+    releaseStart.resolve();
+    await assert.rejects(starting, /accepted startup failed after cleanup/);
+    const replacement = await pm.getOrSpawn('codex-b', {
+      runtime: 'codex',
+      spawnProfileId: 'workspace-b',
+    });
+
+    assert.equal(pm.get('codex-a'), null);
+    assert.equal(pm.get('codex-b'), replacement);
+    assert.equal(pm._codexLease?.proc, replacement);
+    assert.equal(construction, 2);
+  });
+
+  test('late exact cleanup close cannot release a replacement map entry or lease', async () => {
+    const { pm } = runtimeManager();
+    const old = await pm.getOrSpawn('codex-a', {
+      runtime: 'codex',
+      spawnProfileId: 'workspace-a',
+    });
+    const replacement = new RuntimeProcess({ sessionKey: 'codex-a' }, {
+      runtime: 'codex',
+      spawnProfileId: 'workspace-b',
+      generationId: 'replacement-generation',
+    });
+    pm.procs.set('codex-a', replacement);
+    const replacementLease = {
+      kind: 'generation',
+      proc: replacement,
+      sessionKey: 'codex-a',
+      generationId: replacement.generationId,
+      hostIdentity: replacement.hostIdentity,
+      bootSessionIdentity: replacement.bootSessionIdentity,
+      quarantined: false,
+    };
+    pm._codexLease = replacementLease;
+
+    const detail = containmentCleanupDetail(old);
+    old.containmentCleanupCommitted = detail;
+    old.closed = true;
+    old.state = 'Closed';
+    old.emit('close', 1, detail);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(pm.get('codex-a'), replacement);
+    assert.equal(pm._codexLease, replacementLease);
   });
 
   test('healthy strict retirement requires the exact settlement event and closed transport', async (t) => {
@@ -2071,22 +2186,15 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
     assert.equal(constructions.length, 2);
   });
 
-  test('explicit recovery restore releases quarantine only on same host and a different boot', async (t) => {
+  test('explicit recovery restore keeps legacy quarantine fenced across boot changes', async (t) => {
     const held = {
       status: 'quarantined',
       hostIdentity: 'host-a',
       bootSessionIdentity: 'boot-old',
       generationId: 'persisted-generation',
     };
-    await t.test('same host, new boot', async () => {
-      const { pm } = runtimeManager({ recovery: held });
-      await pm.getOrSpawn('codex', {
-        runtime: 'codex',
-        spawnProfileId: 'profile',
-      });
-      assert.equal(pm.has('codex'), true);
-    });
     for (const [name, recovery] of [
+      ['same host, new boot', held],
       ['same boot', { ...held, bootSessionIdentity: 'boot-new' }],
       ['relocated host', { ...held, hostIdentity: 'host-b' }],
     ]) {
@@ -2101,6 +2209,14 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
         );
       });
     }
+    await t.test('explicit clear after external settlement', async () => {
+      const { pm } = runtimeManager({ recovery: { status: 'clear' } });
+      await pm.getOrSpawn('codex', {
+        runtime: 'codex',
+        spawnProfileId: 'profile',
+      });
+      assert.equal(pm.has('codex'), true);
+    });
   });
 
   test('Codex is pinned out of LRU eviction and soft-overflow selection', async () => {
@@ -2241,7 +2357,7 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
 
   test('a never-resolving retirement verifier times out with the exact generation still fenced', async () => {
     let verifierSignal = null;
-    const { pm } = runtimeManager({
+    const { pm, constructions } = runtimeManager({
       codexRetirementVerifier: ({ signal }) => {
         verifierSignal = signal;
         return new Promise(() => {});
@@ -2269,6 +2385,16 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
     assert.equal(lease.generationId, proc.generationId);
     assert.equal(lease.quarantined, true);
     assert.equal(verifierSignal?.aborted, true);
+    assert.equal(pm._retiring.has(proc), true);
+
+    const cleanupCommitted = containmentCleanupDetail(proc);
+    proc.containmentCleanupCommitted = cleanupCommitted;
+    proc.emit('close', 1, cleanupCommitted);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(pm._retiring.has(proc), true);
+    assert.equal(pm.get('codex-a'), proc);
+    assert.equal(pm._codexLease, lease);
     await assert.rejects(
       pm.send('codex-a', 'must remain fenced'),
       (error) => error.code === 'RUNTIME_SWITCH_IN_FLIGHT',
@@ -2282,6 +2408,8 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
       (error) => error.code === 'RUNTIME_SWITCH_IN_FLIGHT',
     );
     assert.equal(pm.get('codex-a'), proc);
+    assert.equal(pm._codexLease, lease);
+    assert.equal(constructions.length, 1);
   });
 
   test('a rejected retirement verifier returns a typed error without releasing or reviving ownership', async () => {
@@ -2310,6 +2438,79 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
     assert.equal(pm._codexLease, lease);
     assert.equal(lease.proc, proc);
     assert.equal(lease.quarantined, true);
+  });
+
+  test('expected-process retirement distinguishes durable verifier and containment failures', async (t) => {
+    await t.test('durable verifier failure retains the exact retiring fence', async () => {
+      const checkpointError = new Error('retirement checkpoint unavailable');
+      const { pm, constructions } = runtimeManager({
+        codexRetirementVerifier: async () => {
+          throw checkpointError;
+        },
+        codexRetirementTimeoutMs: 100,
+      });
+      const proc = await pm.getOrSpawn('codex-a', {
+        runtime: 'codex',
+        spawnProfileId: 'one',
+      });
+      const lease = pm._codexLease;
+
+      await assert.rejects(
+        pm.retireExpectedProcess(
+          'codex-a',
+          proc,
+          'expected-process-verification',
+        ),
+        (error) => (
+          error.code === 'CODEX_RETIREMENT_VERIFICATION_FAILED'
+          && error.cause === checkpointError
+        ),
+      );
+
+      assert.equal(pm._retiring.has(proc), true);
+      assert.equal(pm.get('codex-a'), proc);
+      assert.equal(pm._codexLease, lease);
+      await assert.rejects(
+        pm.getOrSpawn('codex-a', {
+          runtime: 'claude',
+          spawnProfileId: 'replacement',
+        }),
+        (error) => error.code === 'RUNTIME_SWITCH_IN_FLIGHT',
+      );
+      assert.equal(pm.get('codex-a'), proc);
+      assert.equal(pm._codexLease, lease);
+      assert.equal(constructions.length, 1);
+    });
+
+    await t.test('containment failure permits later exact cleanup', async () => {
+      const { pm } = runtimeManager({
+        processOptions: { containOnKill: true },
+      });
+      const proc = await pm.getOrSpawn('codex-a', {
+        runtime: 'codex',
+        spawnProfileId: 'one',
+      });
+
+      await assert.rejects(
+        pm.retireExpectedProcess(
+          'codex-a',
+          proc,
+          'expected-process-containment',
+        ),
+        (error) => error.code === 'CODEX_RETIREMENT_UNVERIFIED',
+      );
+      assert.equal(pm._retiring.has(proc), false);
+      assert.equal(pm.get('codex-a'), proc);
+      assert.equal(pm._codexLease?.proc, proc);
+
+      const cleanupCommitted = containmentCleanupDetail(proc);
+      proc.containmentCleanupCommitted = cleanupCommitted;
+      proc.emit('close', 1, cleanupCommitted);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(pm.get('codex-a'), null);
+      assert.equal(pm._codexLease, null);
+    });
   });
 
   test('shutdown fails within the retirement bound and retains the exact Codex fence', async () => {
@@ -2596,19 +2797,41 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
     assert.equal(constructions.length, 2);
   });
 
-  test('failed retirement never re-adds a process whose transport already closed', async () => {
-    const { pm } = runtimeManager({
-      processOptions: { containOnKill: true },
-    });
-    await pm.getOrSpawn('chat', {
-      runtime: 'codex',
-      spawnProfileId: 'profile',
-    });
-    await assert.rejects(
-      pm.kill('chat', 'test-close-race'),
-      (error) => error.code === 'CODEX_RETIREMENT_UNVERIFIED',
-    );
-    assert.equal(pm.has('chat'), false);
-    assert.notEqual(pm._codexLease, null, 'ownership remains quarantined');
+  test('failed retirement keeps a closed contained process and lease fenced', async (t) => {
+    for (const operation of ['kill', 'replacement']) {
+      await t.test(operation, async () => {
+        const { pm, constructions } = runtimeManager({
+          processOptions: { containOnKill: true },
+        });
+        const original = await pm.getOrSpawn('chat', {
+          runtime: 'codex',
+          spawnProfileId: 'profile',
+        });
+        const retirement = operation === 'kill'
+          ? pm.kill('chat', 'test-close-race')
+          : pm.getOrSpawn('chat', {
+              runtime: 'claude',
+              spawnProfileId: 'replacement',
+            });
+        await assert.rejects(
+          retirement,
+          (error) => (
+            error.code === (
+              operation === 'kill'
+                ? 'CODEX_RETIREMENT_UNVERIFIED'
+                : 'RUNTIME_SWITCH_EVICTION_FAILED'
+            )
+          ),
+        );
+        assert.equal(pm.get('chat'), original);
+        assert.equal(pm._codexLease?.proc, original);
+        assert.equal(pm._codexLease?.quarantined, true);
+        assert.equal(
+          constructions.length,
+          1,
+          'a replacement is never constructed before exact cleanup release',
+        );
+      });
+    }
   });
 });

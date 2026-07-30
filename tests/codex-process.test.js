@@ -492,9 +492,10 @@ test('resume preserves the provider thread; an active resumed thread is a recove
   const closes = [];
   fixture.proc.on('close', (...args) => closes.push(args));
   await fixture.proc.kill();
-  assert.equal(fixture.proc.state, 'ContainmentFailed');
-  assert.equal(fixture.proc.closed, false);
-  assert.deepEqual(closes, []);
+  assert.equal(fixture.proc.state, 'Closed');
+  assert.equal(fixture.proc.closed, true);
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0][1], fixture.proc.containmentCleanupCommitted);
 });
 
 test('Codex attachment accepts schema-optional effort without containment', async (t) => {
@@ -2292,7 +2293,7 @@ test('accepted thread followed by profile validation failure enters containment'
   const containment = [];
   const closes = [];
   fixture.proc.on('containment-failed', (event) => containment.push(event));
-  fixture.proc.on('close', (event) => closes.push(event));
+  fixture.proc.on('close', (...args) => closes.push(args));
 
   await assert.rejects(
     fixture.start(),
@@ -2301,11 +2302,8 @@ test('accepted thread followed by profile validation failure enters containment'
   assert.equal(fixture.proc.state, 'ContainmentFailed');
   assert.equal(containment.length, 1);
   await fixture.proc.kill();
-  assert.equal(
-    closes.length,
-    0,
-    'containment ownership must not be released through generic close',
-  );
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0][1], fixture.proc.containmentCleanupCommitted);
 });
 
 test('fresh thread policy requires every exact field and rejects every omission', async (t) => {
@@ -2571,8 +2569,23 @@ test('settings updates fail closed when collaboration mode disagrees with the ou
   assert.equal(settings.proc.containmentReason, 'thread-settings-drift');
 });
 
-test('containment remains manager-visible after kill and never emits generic close', async () => {
-  const fixture = makeProcess();
+test('containment closes only after managed cleanup and its durable acknowledgement', async () => {
+  const closeRelease = deferred();
+  const cleanupCheckpointEntered = deferred();
+  const cleanupCheckpointRelease = deferred();
+  const checkpoints = [];
+  const fixture = makeProcess({
+    handlers: {
+      close: async () => closeRelease.promise,
+    },
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (checkpoint.kind === 'containment-cleanup-completed') {
+        cleanupCheckpointEntered.resolve();
+        await cleanupCheckpointRelease.promise;
+      }
+    },
+  });
   const closes = [];
   fixture.proc.on('close', (...args) => closes.push(args));
   await fixture.start();
@@ -2583,11 +2596,138 @@ test('containment remains manager-visible after kill and never emits generic clo
     delta: 'foreign',
   });
 
-  await fixture.proc.kill();
-
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.client.closeCount, 1);
   assert.equal(fixture.proc.state, 'ContainmentFailed');
   assert.equal(fixture.proc.closed, false);
   assert.deepEqual(closes, []);
+  assert.equal(
+    checkpoints.some(({ kind }) => kind === 'containment-cleanup-completed'),
+    false,
+  );
+
+  closeRelease.resolve();
+  await cleanupCheckpointEntered.promise;
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.closed, false);
+  assert.deepEqual(closes, []);
+
+  cleanupCheckpointRelease.resolve();
+  await fixture.proc.containmentClosePromise;
+
+  assert.equal(fixture.proc.state, 'Closed');
+  assert.equal(fixture.proc.closed, true);
+  assert.equal(closes.length, 1);
+  const [code, detail] = closes[0];
+  assert.equal(code, 1);
+  assert.equal(detail, fixture.proc.containmentCleanupCommitted);
+  assert.equal(Object.isFrozen(detail), true);
+  assert.deepEqual(detail, {
+    kind: 'containment-cleanup-committed',
+    backend: 'codex',
+    generationId: fixture.proc.generationId,
+    hostIdentity: 'host-test',
+    bootSessionIdentity: 'boot-test',
+    containmentReason: 'cross-thread-notification',
+  });
+  const cleanup = checkpoints.find(
+    ({ kind }) => kind === 'containment-cleanup-completed',
+  );
+  assert.deepEqual(cleanup, {
+    kind: 'containment-cleanup-completed',
+    generationId: fixture.proc.generationId,
+    threadId: 'codex-thread',
+    turnId: null,
+    source: null,
+    clientUserMessageId: null,
+    hostIdentity: 'host-test',
+    bootSessionIdentity: 'boot-test',
+    reason: 'cross-thread-notification',
+    errorCode: 'CODEX_PROTOCOL_ERROR',
+  });
+});
+
+test('containment cleanup is self-sufficient when its first checkpoint fails', async () => {
+  const checkpoints = [];
+  const fixture = makeProcess({
+    handlers: {
+      start: async (client) => {
+        await client.fault();
+      },
+    },
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint.kind);
+      if (checkpoint.kind === 'containment-entered') {
+        throw new Error('first checkpoint unavailable');
+      }
+    },
+  });
+  const closes = [];
+  fixture.proc.on('close', (...args) => closes.push(args));
+
+  await assert.rejects(fixture.start());
+  await new Promise((resolve) => setImmediate(resolve));
+  await fixture.proc.containmentClosePromise;
+
+  assert.deepEqual(checkpoints, [
+    'containment-entered',
+    'containment-cleanup-completed',
+  ]);
+  assert.equal(fixture.client.closeCount, 1);
+  assert.equal(fixture.proc.state, 'Closed');
+  assert.equal(fixture.proc.closed, true);
+  assert.equal(closes.length, 1);
+  assert.equal(closes[0][1], fixture.proc.containmentCleanupCommitted);
+});
+
+test('containment close or cleanup checkpoint failure retains the failed fence', async (t) => {
+  for (const mode of ['close', 'checkpoint']) {
+    await t.test(mode, async () => {
+      const checkpoints = [];
+      const fixture = makeProcess({
+        handlers: mode === 'close'
+          ? {
+              close: async () => {
+                throw rpcError(
+                  'group not empty',
+                  'CODEX_PROCESS_CLEANUP_UNVERIFIED',
+                );
+              },
+            }
+          : {},
+        checkpointSink: async (checkpoint) => {
+          checkpoints.push(checkpoint.kind);
+          if (
+            mode === 'checkpoint'
+            && checkpoint.kind === 'containment-cleanup-completed'
+          ) {
+            throw new Error('cleanup acknowledgement unavailable');
+          }
+        },
+      });
+      const closes = [];
+      fixture.proc.on('close', (...args) => closes.push(args));
+      await fixture.start();
+      await fixture.client.notify('item/agentMessage/delta', {
+        threadId: 'foreign-thread',
+        turnId: 'foreign-turn',
+        itemId: 'foreign-item',
+        delta: 'foreign',
+      });
+
+      await new Promise((resolve) => setImmediate(resolve));
+      await assert.rejects(fixture.proc.containmentClosePromise);
+
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(fixture.proc.closed, false);
+      assert.equal(fixture.proc.containmentCleanupCommitted, null);
+      assert.deepEqual(closes, []);
+      assert.equal(
+        checkpoints.includes('containment-cleanup-completed'),
+        mode === 'checkpoint',
+      );
+    });
+  }
 });
 
 test('cross-thread notification is never delivered and faults the owned generation', async () => {
@@ -2636,7 +2776,12 @@ test('containment is checkpointed before lifecycle emit and closes transport aft
   await new Promise((resolve) => setImmediate(resolve));
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(fixture.client.closeCount, 1);
-  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.state, 'Closed');
+  assert.equal(fixture.proc.closed, true);
+  assert.equal(
+    fixture.proc.containmentCleanupCommitted.kind,
+    'containment-cleanup-committed',
+  );
 });
 
 test('kill from BackgroundWorking performs exact cleanup before ordinary close', async () => {
@@ -3559,7 +3704,7 @@ test('post-terminal probe continuation cannot emit output after containment', as
 
   await assert.rejects(send);
   await new Promise((resolve) => setImmediate(resolve));
-  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.state, 'Closed');
   assert.deepEqual(results, []);
 });
 
@@ -4100,7 +4245,7 @@ test('real U2 client checkpoints containment before closing on response durabili
           LC_ALL: 'C',
         },
         expectedConfigSha256,
-        requestTimeoutMs: 500,
+        requestTimeoutMs: 2_000,
         sinkTimeoutMs: 500,
         closeGraceMs: 100,
         closeKillMs: 200,

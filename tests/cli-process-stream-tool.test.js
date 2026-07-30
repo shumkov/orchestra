@@ -188,6 +188,12 @@ test('prompt: the stream contract section is present only when gated on', async 
       'each call replaces the preview — a partial snapshot would truncate the bubble');
     assert.match(section, /NEVER end a turn on a stream call/,
       'the preview/delivery boundary survives the rewrite');
+    assert.match(section, /(media|photos?|images?).{0,160}(own|separate).{0,40}(reply|message)/is,
+      'media goes in its own reply — a streamed bubble finalizes by edit and '
+      + 'an edited bubble can never gain media, so the exclusion belongs '
+      + 'here, where the streaming decision is made');
+    assert.match(section, /(never|not|do not).{0,80}stream.{0,80}(media|photos?|images?)|(media|photos?|images?).{0,120}(never|not|do not).{0,40}(enter|in|into).{0,40}stream/is,
+      'the exclusion is a prohibition, not a preference');
     assert.doesNotMatch(off, /__stream/,
       'a consumer without the capability must not be coached toward the tool');
   } finally {

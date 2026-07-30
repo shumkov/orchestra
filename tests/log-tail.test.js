@@ -186,6 +186,44 @@ describe('LogTail', () => {
     assert.deepEqual(lines, ['first', 'second', 'third']);
   });
 
+  test('drain reads exactly through a captured append watermark', async () => {
+    const p = tmpfile();
+    fs.writeFileSync(p, 'before\n');
+    let statCalls = 0;
+    const fsFacade = {
+      watch: fs.watch,
+      mkdirSync: fs.mkdirSync,
+      statSync: fs.statSync,
+      promises: {
+        stat: async (...args) => {
+          const stat = await fs.promises.stat(...args);
+          statCalls++;
+          if (statCalls === 1) fs.appendFileSync(p, 'after\n');
+          return stat;
+        },
+        open: fs.promises.open.bind(fs.promises),
+      },
+    };
+    const tail = new LogTail({
+      path: p,
+      intervalMs: 60_000,
+      useWatch: false,
+      fs: fsFacade,
+    });
+    const lines = [];
+    tail.on('line', line => lines.push(line));
+
+    const receipt = await tail.drain();
+
+    assert.equal(receipt.offset, Buffer.byteLength('before\n'));
+    assert.equal(receipt.watermark, receipt.offset);
+    assert.deepEqual(lines, ['before']);
+    await tail._readNew();
+    assert.deepEqual(lines, ['before', 'after']);
+    tail.close();
+    fs.unlinkSync(p);
+  });
+
   test('handles partial lines split across reads', async () => {
     const p = tmpfile();
     fs.writeFileSync(p, '');

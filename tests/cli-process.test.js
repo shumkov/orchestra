@@ -735,6 +735,13 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'ticking happens after every completed step, not at the end');
   assert.match(progressSection, /CONTRACT VIOLATION/i,
     'silent work then a dump is named a contract violation, not a style choice');
+  // The in-progress marker: trailing, single, at line END — a leading marker
+  // would break the checkbox column alignment (user-specified placement).
+  assert.match(progressSection, /trailing hourglass|END of that line/i,
+    'the current-item marker is specified as TRAILING, never leading');
+  assert.match(progressSection, /⏳/, 'shows the literal marker the agent should use');
+  assert.match(progressSection, /Exactly one item/i,
+    'only one item may carry the marker at a time');
   assert.match(progressSection, /re-?render/i, 'states that an edit re-renders (rich stays rich)');
   assert.match(progressSection, /whole list|full list|entire list/i,
     'an edit REPLACES the body, so a partial re-send would lose the rest of the list');

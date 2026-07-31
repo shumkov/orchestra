@@ -1081,6 +1081,48 @@ function containmentCleanupDetail(proc, overrides = {}) {
 }
 
 describe('ProcessManager — runtime identity and strict replacement', () => {
+  test('strict Codex recovery never reuses an unattested warm generation', async () => {
+    const { pm } = runtimeManager();
+    await pm.getOrSpawn('chat', {
+      runtime: 'codex',
+      spawnProfileId: 'profile',
+    });
+
+    await assert.rejects(
+      pm.getOrSpawn('chat', {
+        runtime: 'codex',
+        spawnProfileId: 'profile',
+        existingSessionId: 'thread-interrupted',
+        expectedInterruptedTurnId: 'turn-interrupted',
+        resumePolicy: 'require-interrupted-turn',
+      }),
+      (error) => error.code === 'CODEX_STRICT_RESUME_MISMATCH',
+    );
+  });
+
+  test('malformed Codex recovery controls never reuse a warm generation', async () => {
+    const { pm, constructions } = runtimeManager();
+    await pm.getOrSpawn('chat', {
+      runtime: 'codex',
+      spawnProfileId: 'profile',
+    });
+
+    for (const recoveryContext of [
+      { resumePolicy: 'require-interupted-turn' },
+      { expectedInterruptedTurnId: 'turn-without-policy' },
+    ]) {
+      await assert.rejects(
+        pm.getOrSpawn('chat', {
+          runtime: 'codex',
+          spawnProfileId: 'profile',
+          ...recoveryContext,
+        }),
+        (error) => error.code === 'CODEX_STRICT_RESUME_INVALID',
+      );
+    }
+    assert.equal(constructions.length, 1);
+  });
+
   test('omitted/null runtime is legacy Claude; explicit unknown fails before cache/factory', async () => {
     const { pm, constructions } = runtimeManager();
     const proc = await pm.getOrSpawn('chat', {});
@@ -2301,6 +2343,202 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
 });
 
 describe('ProcessManager — Codex retirement and callback fences', () => {
+  test('clean restart retires one exact interrupted Codex turn into an eligible snapshot', async () => {
+    const verifierCalls = [];
+    const { pm } = runtimeManager({
+      processOptions: {
+        settlementOverrides: {
+          terminalStatus: 'interrupted',
+          turnId: 'turn-clean-restart',
+        },
+      },
+      codexRetirementVerifier: async (input) => {
+        verifierCalls.push(input);
+        return Object.freeze({
+          committed: true,
+          disposition: 'stop-cancelled',
+          sessionKey: input.sessionKey,
+          generationId: input.generationId,
+          attemptId: 'attempt-clean-restart',
+          providerSessionId: 'thread-clean-restart',
+          providerTurnId: 'turn-clean-restart',
+          sourceMsgId: 44,
+        });
+      },
+    });
+    const proc = await pm.getOrSpawn('codex-a', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-clean-restart',
+    });
+    proc.captureCleanRestartCandidate = () => Object.freeze({
+      runtime: 'codex',
+      namespace: 'codex:app-server',
+      sessionKey: 'codex-a',
+      generationId: proc.generationId,
+      attemptId: 'attempt-clean-restart',
+      providerSessionId: 'thread-clean-restart',
+      providerTurnId: 'turn-clean-restart',
+      sourceMsgId: 44,
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      spawnProfileId: 'profile-clean-restart',
+    });
+    const evidenceCalls = [];
+
+    const snapshots = await pm.retireForCleanRestart({
+      getDeliveryEvidence: async (sessionKey, sourceMsgId) => {
+        evidenceCalls.push([sessionKey, sourceMsgId]);
+        return Object.freeze({
+          outputAttempted: false,
+          pending: 0,
+          fenced: true,
+        });
+      },
+    });
+
+    assert.deepEqual(evidenceCalls, [['codex-a', 44]]);
+    assert.equal(verifierCalls.length, 1);
+    assert.deepEqual(snapshots, [{
+      runtime: 'codex',
+      namespace: 'codex:app-server',
+      sessionKey: 'codex-a',
+      sourceMsgId: 44,
+      providerSessionId: 'thread-clean-restart',
+      providerTurnId: 'turn-clean-restart',
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      spawnProfileId: 'profile-clean-restart',
+      eligible: true,
+      reason: 'eligible',
+    }]);
+  });
+
+  test('clean restart rejects every inexact Codex retirement or delivery proof', async (t) => {
+    const cases = [
+      ['output already attempted', { evidence: { outputAttempted: true } }],
+      ['delivery still pending', { evidence: { pending: 1 } }],
+      ['delivery not fenced', { evidence: { fenced: false } }],
+      ['wrong disposition', { retirement: { disposition: 'completed' } }],
+      ['wrong session', { retirement: { sessionKey: 'codex-other' } }],
+      ['wrong generation', { retirement: { generationId: 'generation-other' } }],
+      ['wrong attempt', { retirement: { attemptId: 'attempt-other' } }],
+      ['wrong provider session', { retirement: { providerSessionId: 'thread-other' } }],
+      ['wrong provider turn', { retirement: { providerTurnId: 'turn-other' } }],
+      ['wrong source message', { retirement: { sourceMsgId: 45 } }],
+      ['wrong terminal status', { settlement: { terminalStatus: 'completed' } }],
+      ['wrong settled turn', { settlement: { turnId: 'turn-other' } }],
+    ];
+
+    for (const [name, overrides] of cases) {
+      await t.test(name, async () => {
+        const { pm } = runtimeManager({
+          processOptions: {
+            settlementOverrides: {
+              terminalStatus: 'interrupted',
+              turnId: 'turn-clean-restart',
+              ...overrides.settlement,
+            },
+          },
+          codexRetirementVerifier: async (input) => Object.freeze({
+            committed: true,
+            disposition: 'stop-cancelled',
+            sessionKey: input.sessionKey,
+            generationId: input.generationId,
+            attemptId: 'attempt-clean-restart',
+            providerSessionId: 'thread-clean-restart',
+            providerTurnId: 'turn-clean-restart',
+            sourceMsgId: 44,
+            ...overrides.retirement,
+          }),
+        });
+        const proc = await pm.getOrSpawn('codex-a', {
+          runtime: 'codex',
+          spawnProfileId: 'profile-clean-restart',
+        });
+        proc.captureCleanRestartCandidate = () => Object.freeze({
+          runtime: 'codex',
+          namespace: 'codex:app-server',
+          sessionKey: 'codex-a',
+          generationId: proc.generationId,
+          attemptId: 'attempt-clean-restart',
+          providerSessionId: 'thread-clean-restart',
+          providerTurnId: 'turn-clean-restart',
+          sourceMsgId: 44,
+          cwd: '/workspace',
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+          spawnProfileId: 'profile-clean-restart',
+        });
+
+        const [snapshot] = await pm.retireForCleanRestart({
+          getDeliveryEvidence: async () => Object.freeze({
+            outputAttempted: false,
+            pending: 0,
+            fenced: true,
+            ...overrides.evidence,
+          }),
+        });
+
+        assert.equal(snapshot.eligible, false);
+        assert.equal(proc.closed, true);
+        assert.equal(pm.size, 0);
+      });
+    }
+  });
+
+  test('clean restart retires Codex even when delivery evidence fails', async () => {
+    const { pm } = runtimeManager({
+      codexRetirementVerifier: async (input) => Object.freeze({
+        committed: true,
+        disposition: 'stop-cancelled',
+        sessionKey: input.sessionKey,
+        generationId: input.generationId,
+        attemptId: 'attempt-evidence-failure',
+        providerSessionId: 'thread-evidence-failure',
+        providerTurnId: 'turn-evidence-failure',
+        sourceMsgId: 45,
+      }),
+      processOptions: {
+        settlementOverrides: {
+          terminalStatus: 'interrupted',
+          turnId: 'turn-evidence-failure',
+        },
+      },
+    });
+    const proc = await pm.getOrSpawn('codex-a', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-evidence-failure',
+    });
+    proc.captureCleanRestartCandidate = () => Object.freeze({
+      runtime: 'codex',
+      namespace: 'codex:app-server',
+      sessionKey: 'codex-a',
+      generationId: proc.generationId,
+      attemptId: 'attempt-evidence-failure',
+      providerSessionId: 'thread-evidence-failure',
+      providerTurnId: 'turn-evidence-failure',
+      sourceMsgId: 45,
+      cwd: '/workspace',
+      model: 'gpt-5.6-sol',
+      effort: 'xhigh',
+      spawnProfileId: 'profile-evidence-failure',
+    });
+
+    await assert.rejects(
+      pm.retireForCleanRestart({
+        getDeliveryEvidence: async () => { throw new Error('evidence unavailable'); },
+      }),
+      /evidence unavailable/,
+    );
+
+    assert.equal(proc.interruptCount, 1);
+    assert.deepEqual(proc._killSpy, ['clean-restart']);
+    assert.equal(proc.closed, true);
+    assert.equal(pm.size, 0);
+  });
+
   test('Codex retirement keeps the daemon lease fenced until its durable consumer verifies disposal', async () => {
     const retirement = deferred();
     const calls = [];

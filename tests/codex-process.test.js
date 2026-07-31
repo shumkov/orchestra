@@ -498,6 +498,221 @@ test('resume preserves the provider thread; an active resumed thread is a recove
   assert.equal(closes[0][1], fixture.proc.containmentCleanupCommitted);
 });
 
+test('strict clean resume attests the exact idle thread and interrupted tail turn', async () => {
+  const fixture = makeProcess({
+    existingSessionId: 'thread-existing',
+    handlers: {
+      'thread/resume': async ({ threadId }) => {
+        const result = threadResult(threadId);
+        result.thread.ephemeral = false;
+        result.thread.turns = [{
+          id: 'turn-interrupted',
+          status: 'interrupted',
+          items: [],
+          error: null,
+        }];
+        return result;
+      },
+    },
+  });
+
+  await fixture.proc.start({
+    existingSessionId: 'thread-existing',
+    expectedInterruptedTurnId: 'turn-interrupted',
+    resumePolicy: 'require-interrupted-turn',
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
+  });
+
+  assert.deepEqual(fixture.proc.resumeAttestation, {
+    namespace: 'codex:app-server',
+    sessionId: 'thread-existing',
+    interruptedTurnId: 'turn-interrupted',
+    resumed: true,
+    freshFallback: false,
+    idle: true,
+  });
+  assert.equal(Object.isFrozen(fixture.proc.resumeAttestation), true);
+  await fixture.proc.kill();
+});
+
+test('strict clean resume fails closed for malformed policy options', async () => {
+  for (const options of [
+    { resumePolicy: 'require-interupted-turn' },
+    { expectedInterruptedTurnId: 'turn-without-policy' },
+  ]) {
+    const fixture = makeProcess({ existingSessionId: 'thread-existing' });
+    await assert.rejects(
+      fixture.proc.start({
+        existingSessionId: 'thread-existing',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+        ...options,
+      }),
+      (error) => error.code === 'CODEX_STRICT_RESUME_INVALID',
+    );
+  }
+});
+
+test('strict clean resume rejects every mismatched interrupted-tail attestation', async (t) => {
+  const cases = [
+    ['missing ephemeral marker', (result) => { delete result.thread.ephemeral; }],
+    ['ephemeral thread', (result) => { result.thread.ephemeral = true; }],
+    ['busy thread', (result) => { result.thread.status = { type: 'active' }; }],
+    ['wrong tail turn', (result) => { result.thread.turns[0].id = 'turn-other'; }],
+    ['non-interrupted tail', (result) => { result.thread.turns[0].status = 'completed'; }],
+  ];
+  for (const [name, mutate] of cases) {
+    await t.test(name, async () => {
+      const fixture = makeProcess({
+        existingSessionId: 'thread-existing',
+        handlers: {
+          'thread/resume': async ({ threadId }) => {
+            const result = threadResult(threadId);
+            result.thread.ephemeral = false;
+            result.thread.turns = [{
+              id: 'turn-interrupted',
+              status: 'interrupted',
+              items: [],
+              error: null,
+            }];
+            mutate(result);
+            return result;
+          },
+        },
+      });
+      await assert.rejects(
+        fixture.proc.start({
+          existingSessionId: 'thread-existing',
+          expectedInterruptedTurnId: 'turn-interrupted',
+          resumePolicy: 'require-interrupted-turn',
+          model: 'gpt-5.6-sol',
+          effort: 'xhigh',
+        }),
+        (error) => error.code === 'CODEX_STRICT_RESUME_MISMATCH',
+      );
+      assert.equal(fixture.proc.resumeAttestation, null);
+    });
+  }
+});
+
+test('strict clean resume rejects any non-empty background terminal page', async () => {
+  for (const background of [
+    { data: [{ id: 'terminal-live' }], nextCursor: null, count: 1 },
+    { data: [], nextCursor: 'page-2', count: 0 },
+  ]) {
+    const fixture = makeProcess({
+      existingSessionId: 'thread-existing',
+      handlers: {
+        'thread/resume': async ({ threadId }) => {
+          const result = threadResult(threadId);
+          result.thread.ephemeral = false;
+          result.thread.turns = [{
+            id: 'turn-interrupted',
+            status: 'interrupted',
+            items: [],
+            error: null,
+          }];
+          return result;
+        },
+        'thread/backgroundTerminals/list': async () => background,
+      },
+    });
+    await assert.rejects(
+      fixture.proc.start({
+        existingSessionId: 'thread-existing',
+        expectedInterruptedTurnId: 'turn-interrupted',
+        resumePolicy: 'require-interrupted-turn',
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      }),
+      (error) => error.code === 'CODEX_STRICT_RESUME_MISMATCH',
+    );
+    assert.equal(fixture.proc.resumeAttestation, null);
+  }
+});
+
+test('clean restart candidate captures one exact accepted active turn', async () => {
+  const fixture = makeProcess({
+    processOptions: { spawnProfileId: 'profile-clean-restart' },
+    handlers: {
+      'turn/start': async () => ({
+        turn: {
+          id: 'turn-clean-restart',
+          status: 'inProgress',
+          items: [],
+          error: null,
+        },
+      }),
+      'turn/interrupt': async (_params, client) => {
+        setImmediate(() => client.notify('turn/completed', {
+          threadId: 'codex-thread',
+          turn: {
+            id: 'turn-clean-restart',
+            status: 'interrupted',
+            items: [],
+            error: null,
+          },
+        }));
+        return {};
+      },
+    },
+  });
+  fixture.proc.spawnProfileId = 'profile-clean-restart';
+  await fixture.start();
+  const send = fixture.proc.send('survive restart', {
+    context: { sourceMsgId: 44 },
+  });
+  await fixture.client.notify('turn/started', {
+    threadId: 'codex-thread',
+    turn: { id: 'turn-clean-restart', status: 'inProgress' },
+  });
+  while (fixture.proc.state !== 'Active') {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+
+  const candidate = fixture.proc.captureCleanRestartCandidate();
+  assert.equal(candidate.providerSessionId, 'codex-thread');
+  assert.equal(candidate.providerTurnId, 'turn-clean-restart');
+  assert.equal(candidate.sourceMsgId, 44);
+  assert.equal(candidate.spawnProfileId, 'profile-clean-restart');
+  assert.match(candidate.generationId, /\S/);
+  assert.match(candidate.attemptId, /\S/);
+  assert.equal(Object.isFrozen(candidate), true);
+
+  const original = {
+    state: fixture.proc.state,
+    generationId: fixture.proc.generationId,
+    providerSessionId: fixture.proc.providerSessionId,
+    attemptId: fixture.proc.current.attemptId,
+    pendingSteerCount: fixture.proc.pendingSteerCount,
+    settled: fixture.proc.current.settled,
+  };
+  const ineligibleMutations = [
+    () => { fixture.proc.generationId = null; },
+    () => { fixture.proc.providerSessionId = null; },
+    () => { fixture.proc.current.attemptId = null; },
+    () => { fixture.proc.pendingSteerCount = 1; },
+    () => { fixture.proc.current.settled = true; },
+  ];
+  for (const mutate of ineligibleMutations) {
+    mutate();
+    assert.equal(fixture.proc.captureCleanRestartCandidate(), null);
+    Object.assign(fixture.proc, {
+      state: original.state,
+      generationId: original.generationId,
+      providerSessionId: original.providerSessionId,
+      pendingSteerCount: original.pendingSteerCount,
+    });
+    fixture.proc.current.attemptId = original.attemptId;
+    fixture.proc.current.settled = original.settled;
+  }
+
+  await fixture.proc.interrupt();
+  await send;
+  await fixture.proc.kill();
+});
+
 test('Codex attachment accepts schema-optional effort without containment', async (t) => {
   for (const method of ['thread/start', 'thread/resume']) {
     for (const absence of ['omitted', 'null']) {

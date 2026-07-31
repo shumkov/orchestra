@@ -9,6 +9,7 @@ const {
   chmodSync,
   existsSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -26,6 +27,8 @@ const {
   CodexAppServerClient,
   attestPinnedCodexBinary,
   attestPinnedCodexHome,
+  attestPinnedSessionLauncher,
+  characterizePinnedSessionLauncher,
   protocolSchema,
   resolveCodexTargetPin,
 } = require('../lib/codex/app-server-client');
@@ -679,6 +682,109 @@ test('owned supervisor preserves exact app-server argv, cwd, and filtered enviro
   assert.equal(observed.forbiddenEnvPresent, false);
 });
 
+test('owned supervisor launches Codex through the separately attested session launcher', async (t) => {
+  const harness = createHarness(t);
+  const calls = [];
+  const launcherSha256 = 'a'.repeat(64);
+  const client = harness.makeClient({
+    sessionLauncher: '/usr/bin/env',
+    expectedSessionLauncherSha256: launcherSha256,
+    attestSessionLauncherFn: async (launcher, expectedSha256) => ({
+      path: launcher,
+      sha256: expectedSha256,
+    }),
+    spawnFn: (...args) => {
+      calls.push(args);
+      return spawn(...args);
+    },
+  });
+
+  await client.start();
+
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0][1], [
+    SUPERVISOR,
+    '--group-term-grace-ms=100',
+    '--session-launcher=/usr/bin/env',
+    harness.directBinary,
+    'app-server',
+    '--strict-config',
+    '--stdio',
+  ]);
+  const observed = JSON.parse(readFileSync(harness.spawnLog, 'utf8'));
+  assert.deepEqual(
+    observed.argv,
+    ['app-server', '--strict-config', '--stdio'],
+  );
+});
+
+test('production session-launcher characterization is strict and hash-bound', async (t) => {
+  const launcher = realpathSync('/usr/bin/env');
+  const characterized = await characterizePinnedSessionLauncher(launcher);
+  assert.equal(characterized.path, launcher);
+  assert.match(characterized.sha256, /^[a-f0-9]{64}$/);
+  assert.ok(characterized.fingerprint);
+  assert.deepEqual(
+    await attestPinnedSessionLauncher(launcher, characterized.sha256),
+    characterized,
+  );
+  await assert.rejects(
+    attestPinnedSessionLauncher(launcher, '0'.repeat(64)),
+    (error) => error.code === 'CODEX_SESSION_LAUNCHER_MISMATCH',
+  );
+  await assert.rejects(
+    characterizePinnedSessionLauncher('/definitely/missing/session-launcher'),
+    (error) => error.code === 'CODEX_SESSION_LAUNCHER_MISMATCH',
+  );
+
+  const harness = createHarness(t);
+  const linked = path.join(harness.cwd, 'linked-launcher');
+  symlinkSync(launcher, linked);
+  await assert.rejects(
+    characterizePinnedSessionLauncher(linked),
+    (error) => error.code === 'CODEX_SESSION_LAUNCHER_MISMATCH',
+  );
+  await assert.rejects(
+    characterizePinnedSessionLauncher(harness.directBinary),
+    (error) => error.code === 'CODEX_SESSION_LAUNCHER_MISMATCH',
+  );
+});
+
+test('session-launcher replacement during spawn fails before initialization', async (t) => {
+  const harness = createHarness(t);
+  const launcher = harness.directBinary;
+  const stat = lstatSync(launcher, { bigint: true });
+  const fingerprint = {
+    dev: stat.dev.toString(),
+    ino: stat.ino.toString(),
+    size: stat.size.toString(),
+    mtimeNs: stat.mtimeNs.toString(),
+    ctimeNs: stat.ctimeNs.toString(),
+    mode: Number(stat.mode),
+    uid: Number(stat.uid),
+    nlink: Number(stat.nlink),
+  };
+  const launcherSha256 = 'a'.repeat(64);
+  const client = harness.makeClient({
+    sessionLauncher: launcher,
+    expectedSessionLauncherSha256: launcherSha256,
+    attestSessionLauncherFn: async () => ({
+      path: launcher,
+      sha256: launcherSha256,
+      fingerprint,
+    }),
+    spawnFn: (...args) => {
+      chmodSync(launcher, 0o711);
+      return spawn(...args);
+    },
+  });
+
+  await assert.rejects(
+    client.start(),
+    (error) => error.code === 'CODEX_SESSION_LAUNCHER_MISMATCH',
+  );
+});
+
 test('the pinned positive request allowlist accepts only required U2 methods', async (t) => {
   const harness = createHarness(t);
   const client = harness.makeClient();
@@ -696,6 +802,9 @@ test('the pinned positive request allowlist accepts only required U2 methods', a
       spec.stateChanging ? mutationOptions(events) : { timeoutMs: 500 },
     );
     assert.ok(result && typeof result === 'object', `${method} returned`);
+    if (method === 'thread/resume') {
+      assert.equal(result.thread.ephemeral, false);
+    }
     assert.deepEqual(
       events.map((event) => event.type),
       spec.stateChanging

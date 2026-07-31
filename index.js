@@ -21,6 +21,8 @@ const {
 } = require('./lib/codex/preflight');
 const {
   attestPinnedCodexHome,
+  attestPinnedSessionLauncher,
+  characterizePinnedSessionLauncher,
   buildCodexAppServerEnv,
   CodexAppServerClient,
   CodexAppServerError,
@@ -53,7 +55,7 @@ const approvalsStore = require('./lib/approvals/store');
 
 module.exports = {
   // pool + driver
-  Process, UnsupportedOperationError, ProcessManager, CALLBACK_TO_EVENT, CliProcess, CodexProcess, CodexAppServerClient, CodexAppServerError, CodexPreflightError, SdkProcess, extractAssistantText, sumUsage, makeInputController, createProcessFactory, pickBackend, preflightCodexRuntime, reattestCodexStaticPolicy, createCodexSpawnProfile, assertCodexSpawnProfile, attestPinnedCodexHome, buildCodexAppServerEnv, resolveCodexTargetPin, codexProtocolSchema,
+  Process, UnsupportedOperationError, ProcessManager, CALLBACK_TO_EVENT, CliProcess, CodexProcess, CodexAppServerClient, CodexAppServerError, CodexPreflightError, SdkProcess, extractAssistantText, sumUsage, makeInputController, createProcessFactory, pickBackend, preflightCodexRuntime, reattestCodexStaticPolicy, createCodexSpawnProfile, assertCodexSpawnProfile, attestPinnedCodexHome, attestPinnedSessionLauncher, characterizePinnedSessionLauncher, buildCodexAppServerEnv, resolveCodexTargetPin, codexProtocolSchema,
   // channels bridge (MCP injection protocol)
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle

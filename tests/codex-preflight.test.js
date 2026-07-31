@@ -371,6 +371,14 @@ test('preflight attests static policy before auth/model and returns frozen redac
   }]);
   assert.equal(result.attestation.layerCount, 1);
   assert.equal(Object.hasOwn(result.attestation, 'target'), false);
+  assert.equal(
+    Object.hasOwn(result.attestation, 'sessionLauncherPathSha256'),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(result.attestation, 'sessionLauncherSha256'),
+    false,
+  );
   assert.equal(result.attestation.permissionProfile.allowed, true);
   assert.match(
     result.attestation.permissionProfile.idSha256,
@@ -434,6 +442,41 @@ test('model and effort selection do not change the static spawn fingerprint', as
 
   assert.equal(receipts[0].spawnProfileId, receipts[1].spawnProfileId);
   assert.deepEqual(receipts[0].modelCatalog, receipts[1].modelCatalog);
+});
+
+test('session launcher identity is forwarded to preflight and changes the spawn fingerprint', async () => {
+  const directProfile = expectedProfile();
+  const containedProfile = expectedProfile({
+    sessionLauncher: '/usr/local/libexec/session-scope-launcher',
+    sessionLauncherSha256: 'a'.repeat(64),
+  });
+  const clientOptions = [];
+  const receipts = [];
+  for (const profile of [directProfile, containedProfile]) {
+    const result = await preflightCodexRuntime(profile, {
+      clientFactory: (options) => {
+        clientOptions.push(options);
+        return new FakeClient(staticResults(profile));
+      },
+    });
+    receipts.push(createCodexSpawnProfile(profile, result));
+  }
+
+  assert.equal(clientOptions[0].sessionLauncher, null);
+  assert.equal(clientOptions[0].expectedSessionLauncherSha256, null);
+  assert.equal(
+    clientOptions[1].sessionLauncher,
+    containedProfile.sessionLauncher,
+  );
+  assert.equal(
+    clientOptions[1].expectedSessionLauncherSha256,
+    containedProfile.sessionLauncherSha256,
+  );
+  assert.notEqual(receipts[0].spawnProfileId, receipts[1].spawnProfileId);
+  assert.equal(
+    Object.hasOwn(receipts[0].expectedStaticProfile, 'sessionLauncher'),
+    true,
+  );
 });
 
 test('preflight runs through the real U2 client without issuing a mutation', async (t) => {
@@ -1111,9 +1154,24 @@ test('spawn profile receipt rejects incomplete, extra, or forged preflight data'
   assert.throws(
     () => createCodexSpawnProfile({
       ...profile,
-      sessionLauncher: '/attacker/launcher',
+      unexpectedStaticField: '/attacker/value',
     }, result),
     /unexpected static profile field/,
+  );
+  assert.throws(
+    () => createCodexSpawnProfile({
+      ...profile,
+      sessionLauncher: '/attacker/launcher',
+    }, result),
+    /path and SHA-256 must be paired/,
+  );
+  assert.throws(
+    () => createCodexSpawnProfile({
+      ...profile,
+      sessionLauncher: '/attacker/launcher',
+      sessionLauncherSha256: 'a'.repeat(64),
+    }, result),
+    { code: 'CODEX_PREFLIGHT_RECEIPT_INVALID' },
   );
   const incomplete = { ...profile };
   delete incomplete.ownedConfigSha256;

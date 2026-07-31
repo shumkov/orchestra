@@ -670,6 +670,25 @@ test('runtime:codex starts from a catalog-valid dynamic model pair', async () =>
   }
 });
 
+test('runtime:codex rejects an interrupted turn without strict recovery policy', async () => {
+  const spawnProfile = await codexSpawnProfile();
+  const factory = await makeCodexFactory({ codexSpawnProfile: spawnProfile });
+
+  assert.throws(
+    () => factory('codex-orphaned-turn', {
+      runtime: 'codex',
+      spawnProfileId: spawnProfile.spawnProfileId,
+      modelSettings: {
+        model: 'gpt-5.6-sol',
+        effort: 'xhigh',
+      },
+      existingSessionId: 'thread-existing',
+      expectedInterruptedTurnId: 'turn-without-policy',
+    }),
+    (error) => error?.code === 'CODEX_BACKEND_NOT_CONFIGURED',
+  );
+});
+
 test('runtime:codex rejects raw launcher, environment, and policy context', async () => {
   const spawnProfile = await codexSpawnProfile();
   let clientFactoryCalls = 0;

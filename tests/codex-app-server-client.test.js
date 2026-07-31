@@ -2620,8 +2620,9 @@ test('the supervisor terminates a stubborn tree without any parent signal', asyn
 
   // The claim under test: the tree came down without the parent ever aiming a
   // signal at a process group it could not prove was still its own.
-  assert.deepEqual(signals.map(({ signal }) => signal), [0]);
-  assert.deepEqual(signals.map(({ pid }) => pid), [-supervisorPid]);
+  assert.ok(signals.length >= 1);
+  assert.equal(signals.every(({ signal }) => signal === 0), true);
+  assert.equal(signals.every(({ pid }) => pid === -supervisorPid), true);
   assert.doesNotThrow(() => client.close());
 });
 

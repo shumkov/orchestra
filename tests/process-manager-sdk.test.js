@@ -1051,6 +1051,31 @@ describe('ProcessManagerSdk — interrupt + drainQueue (D8)', () => {
   });
 });
 
+test('normal SDK iterator exhaustion reports an abnormal provider termination', async () => {
+  const fq = makeFakeQuery();
+  const terminations = [];
+  const pm = buildPm({
+    spawnFn: () => fq.query,
+    db: mockDb(),
+    logger: { error() {}, log() {} },
+    callbacks: {
+      onAbnormalTermination: (_sessionKey, evidence) => {
+        terminations.push(evidence);
+      },
+    },
+  });
+  await pm.getOrSpawn('sdk-eof');
+
+  fq.emitEnd();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(terminations.length, 1);
+  assert.equal(terminations[0].event, 'close');
+  assert.equal(terminations[0].backend, 'sdk');
+  assert.equal(terminations[0].exitCode, 0);
+  await pm.shutdown();
+});
+
 describe('ProcessManagerSdk — mid-session config (D3, D4)', () => {
   let pm;
   let fq;

@@ -588,6 +588,71 @@ describe('ProcessManager — kill / killChat / shutdown', () => {
     assert.deepEqual(closes, [['sk', { reason: 'explicit' }]]);
   });
 
+  test('reports a spontaneous provider close exactly once', async () => {
+    const terminations = [];
+    const pm = new ProcessManager({
+      processFactory: mockFactory(),
+      callbacks: {
+        onAbnormalTermination: (sessionKey, evidence, proc) => {
+          terminations.push({ sessionKey, evidence, proc });
+        },
+      },
+    });
+    const proc = await pm.getOrSpawn('sk');
+
+    proc.closed = true;
+    proc.emit('close', 137);
+    proc.emit('close', 137);
+
+    assert.equal(terminations.length, 1);
+    assert.equal(terminations[0].sessionKey, 'sk');
+    assert.equal(terminations[0].proc, proc);
+    assert.deepEqual(terminations[0].evidence, {
+      event: 'close',
+      backend: 'mock',
+      generationId: null,
+      exitCode: 137,
+    });
+    assert.equal(Object.isFrozen(terminations[0].evidence), true);
+  });
+
+  test('intentional provider closes do not report abnormal termination', async () => {
+    const terminations = [];
+    const pm = new ProcessManager({
+      processFactory: mockFactory(),
+      callbacks: {
+        onAbnormalTermination: (...args) => terminations.push(args),
+      },
+    });
+    await pm.getOrSpawn('killed');
+    await pm.kill('killed', 'explicit');
+    await pm.getOrSpawn('shutdown');
+    await pm.shutdown();
+
+    assert.deepEqual(terminations, []);
+  });
+
+  test('reports a Channels bridge loss before controlled cleanup closes it', async () => {
+    const terminations = [];
+    const pm = new ProcessManager({
+      processFactory: mockFactory(),
+      callbacks: {
+        onAbnormalTermination: (_sessionKey, evidence) => {
+          terminations.push(evidence);
+        },
+      },
+      logger: { warn() {}, error() {} },
+    });
+    const proc = await pm.getOrSpawn('sk');
+
+    proc.emit('bridge-disconnected');
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.equal(terminations.length, 1);
+    assert.equal(terminations[0].event, 'bridge-disconnected');
+    assert.equal(terminations[0].exitCode, null);
+  });
+
   test('Claude onClose remains observable during LRU eviction', async () => {
     const closes = [];
     const pm = new ProcessManager({
@@ -2973,10 +3038,14 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
 
   test('Codex start rejection releases only with the narrow startupReleaseSafe + closed contract', async () => {
     let construction = 0;
+    const terminations = [];
     const pm = new ProcessManager({
       codexRecoveryState: { status: 'clear' },
       codexHostIdentity: 'host-a',
       codexBootSessionIdentity: 'boot-new',
+      callbacks: {
+        onAbnormalTermination: (...args) => terminations.push(args),
+      },
       processFactory: (sessionKey, ctx) => {
         construction += 1;
         const proc = new RuntimeProcess({ sessionKey }, {
@@ -2988,6 +3057,12 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
           proc.start = () => {
             proc.startupReleaseSafe = true;
             proc.closed = true;
+            proc.state = 'Closed';
+            proc.emit('close', 1, {
+              backend: 'codex',
+              generationId: proc.generationId,
+              reason: null,
+            });
             throw new Error('safe startup rejection');
           };
         }
@@ -3003,11 +3078,54 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
     );
     assert.equal(pm.get('first'), null);
     assert.equal(pm._codexLease, null);
+    assert.deepEqual(terminations, []);
     await pm.getOrSpawn('second', {
       runtime: 'codex',
       spawnProfileId: 'second-profile',
     });
     assert.equal(construction, 2);
+  });
+
+  test('Codex ambiguous startup close reports abnormal termination', async () => {
+    const terminations = [];
+    const pm = new ProcessManager({
+      codexRecoveryState: { status: 'clear' },
+      codexHostIdentity: 'host-a',
+      codexBootSessionIdentity: 'boot-new',
+      callbacks: {
+        onAbnormalTermination: (_sessionKey, evidence) => {
+          terminations.push(evidence);
+        },
+      },
+      processFactory: (sessionKey, ctx) => {
+        const proc = new RuntimeProcess({ sessionKey }, {
+          runtime: 'codex',
+          spawnProfileId: ctx.spawnProfileId,
+          generationId: 'generation-unsafe',
+        });
+        proc.start = () => {
+          proc.closed = true;
+          proc.state = 'ContainmentFailed';
+          proc.emit('close', 1, {
+            backend: 'codex',
+            generationId: proc.generationId,
+            reason: 'startup-close-unverified',
+          });
+          throw new Error('unsafe startup rejection');
+        };
+        return proc;
+      },
+    });
+
+    await assert.rejects(
+      pm.getOrSpawn('unsafe', {
+        runtime: 'codex',
+        spawnProfileId: 'profile-unsafe',
+      }),
+      /unsafe startup rejection/,
+    );
+    assert.equal(terminations.length, 1);
+    assert.equal(terminations[0].event, 'close');
   });
 
   test('concurrent replacement and kill serialize without double-retiring or reviving a closed generation', async () => {

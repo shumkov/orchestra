@@ -1266,13 +1266,18 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'ticking happens after every completed step, not at the end');
   assert.match(progressSection, /CONTRACT VIOLATION/i,
     'silent work then a dump is named a contract violation, not a style choice');
-  // The in-progress marker: trailing, single, at line END — a leading marker
-  // would break the checkbox column alignment (user-specified placement).
-  assert.match(progressSection, /trailing hourglass|END of that line/i,
-    'the current-item marker is specified as TRAILING, never leading');
-  assert.match(progressSection, /⏳/, 'shows the literal marker the agent should use');
+  // The in-progress marker is BOLD on the item text (user-chosen over the
+  // earlier trailing ⏳: styling reads instantly, needs no stripping at
+  // close-out, and the server renders styled checklist items — probe-verified
+  // 2026-08-01). Exactly one item is bold at a time.
+  assert.match(progressSection, /\*\*bold\*\*|bold/i,
+    'the current-item marker is BOLD styling on the item text');
+  assert.match(progressSection, /\*\*[^*]+\*\*/,
+    'shows the literal **…** authoring the agent should use');
+  assert.doesNotMatch(progressSection, /⏳/,
+    'the hourglass marker is gone from the contract — bold replaced it');
   assert.match(progressSection, /Exactly one item/i,
-    'only one item may carry the marker at a time');
+    'only one item may be bold at a time');
   // 2026-07-30 live failure: the agent worked a 5-item checklist, delivered the
   // final report, and ended the turn with the bubble frozen at 4/5 — the last
   // item still unticked and still carrying ⏳. "Tick after every step" never
@@ -1280,12 +1285,12 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   // that reads as abandoned one item from the end.
   assert.match(progressSection, /final answer COMPLETES the last step|completes the last step/i,
     'delivering the final answer IS the completion of the last step');
-  assert.match(progressSection, /zero ⏳|no ⏳|all `?- \[x\]`?, zero/i,
-    'pins the checklist\'s required final state: everything checked, marker gone');
+  assert.match(progressSection, /no bold|nothing bold|bold (is |)gone|un-?bold/i,
+    'pins the checklist\'s required final state: everything checked, no bold left');
   assert.match(
     progressSection,
-    /ends with a lingering ⏳.{0,90}CONTRACT VIOLATION/i,
-    'a turn ending on a leftover in-progress marker is named a CONTRACT VIOLATION');
+    /lingering bold.{0,90}CONTRACT VIOLATION|still bold.{0,90}CONTRACT VIOLATION/i,
+    'a turn ending on a leftover bold item is named a CONTRACT VIOLATION');
   // The close-out rule must not force a lie. If work stops early — a step fails,
   // is skipped, or is blocked — "tick everything or be a named violation" leaves
   // only two moves, and a model that obeys hard contracts will tick the lie.
@@ -1293,7 +1298,7 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
   assert.match(progressSection, /NEVER tick an item you did not|MUST NOT be ticked/i,
     'ticking work that was not actually completed is forbidden outright');
   assert.match(progressSection, /name the reason|leave that item unticked/i,
-    'stopping early still closes out: marker gone, item unticked, reason on the line');
+    'stopping early still closes out: bold gone, item unticked, reason on the line');
   // Same live test: the final report used `- [ ]` for RECOMMENDATIONS addressed
   // to the user ("decide the fate of X", "you could clean up Y") — items the
   // agent will never close, in the same document where other recommendations

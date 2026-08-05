@@ -2844,6 +2844,10 @@ test('containment closes only after managed cleanup and its durable acknowledgem
     hostIdentity: 'host-test',
     bootSessionIdentity: 'boot-test',
     containmentReason: 'cross-thread-notification',
+    clientRootErrorCode: 'CODEX_PROTOCOL_ERROR',
+    clientFaultClass: 'protocol',
+    notificationMethod: 'item/agentMessage/delta',
+    observedProcessState: 'Idle',
   });
   const cleanup = checkpoints.find(
     ({ kind }) => kind === 'containment-cleanup-completed',
@@ -2859,6 +2863,10 @@ test('containment closes only after managed cleanup and its durable acknowledgem
     bootSessionIdentity: 'boot-test',
     reason: 'cross-thread-notification',
     errorCode: 'CODEX_PROTOCOL_ERROR',
+    clientRootErrorCode: 'CODEX_PROTOCOL_ERROR',
+    clientFaultClass: 'protocol',
+    notificationMethod: 'item/agentMessage/delta',
+    observedProcessState: 'Idle',
   });
 });
 
@@ -2946,7 +2954,10 @@ test('containment close or cleanup checkpoint failure retains the failed fence',
 });
 
 test('cross-thread notification is never delivered and faults the owned generation', async () => {
-  const fixture = makeProcess();
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+  });
   const chunks = [];
   fixture.proc.on('stream-chunk', (chunk) => chunks.push(chunk));
   await fixture.start();
@@ -2961,7 +2972,87 @@ test('cross-thread notification is never delivered and faults the owned generati
   assert.deepEqual(chunks, []);
   assert.equal(fixture.proc.state, 'ContainmentFailed');
   assert.equal(fixture.proc.containmentReason, 'cross-thread-notification');
+  const entered = checkpoints.find(({ kind }) => kind === 'containment-entered');
+  assert.equal(entered.notificationMethod, 'item/agentMessage/delta');
+  assert.equal(entered.observedProcessState, 'Idle');
+  assert.equal(Object.hasOwn(entered, 'threadId'), true);
+  assert.equal(Object.hasOwn(entered, 'turnId'), true);
+  assert.equal(Object.hasOwn(entered, 'foreignThreadId'), false);
+  assert.equal(Object.hasOwn(entered, 'payload'), false);
+  await fixture.proc.containmentClosePromise;
+  const cleanup = checkpoints.find(({ kind }) => kind === 'containment-cleanup-completed');
+  assert.equal(cleanup.notificationMethod, 'item/agentMessage/delta');
+  assert.equal(cleanup.observedProcessState, 'Idle');
   await fixture.proc.kill();
+});
+
+test('cross-thread containment records each allowlisted method and pre-transition state only', async (t) => {
+  for (const method of [
+    'error',
+    'thread/status/changed',
+    'thread/settings/updated',
+    'turn/started',
+    'turn/completed',
+    'item/started',
+    'item/completed',
+    'item/agentMessage/delta',
+  ]) {
+    await t.test(method, async (subtest) => {
+      const checkpoints = [];
+      const fixture = makeProcess({
+        checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+      });
+      subtest.after(() => fixture.proc.kill());
+      await fixture.start();
+      await fixture.client.notify(method, {
+        threadId: 'foreign-thread',
+        turnId: 'foreign-turn',
+        payload: 'must not persist',
+      });
+
+      const entered = checkpoints.find(({ kind }) => kind === 'containment-entered');
+      assert.equal(entered.notificationMethod, method);
+      assert.equal(entered.observedProcessState, 'Idle');
+      assert.equal(JSON.stringify(entered).includes('foreign-thread'), false);
+      assert.equal(JSON.stringify(entered).includes('must not persist'), false);
+      await fixture.proc.containmentClosePromise;
+    });
+  }
+});
+
+test('containment cleanup retains immutable client provenance after first checkpoint failure', async () => {
+  const checkpoints = [];
+  const outcome = {
+    boundary: 'post-spawn',
+    containment: 'unverified',
+    cleanup: 'completed',
+    errorCode: 'CODEX_RPC_OUTCOME_UNKNOWN',
+    clientRootErrorCode: 'CODEX_RPC_TIMEOUT',
+    clientFaultClass: 'rpc-timeout',
+  };
+  const fixture = makeProcess({
+    handlers: {
+      start: async (client) => {
+        await client.fault(outcome);
+        outcome.clientRootErrorCode = 'CODEX_PROCESS_EXITED';
+        outcome.clientFaultClass = 'process-exit';
+      },
+    },
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (checkpoint.kind === 'containment-entered') {
+        throw new Error('first checkpoint unavailable');
+      }
+    },
+  });
+
+  await assert.rejects(fixture.start());
+  await fixture.proc.containmentClosePromise;
+
+  const cleanup = checkpoints.find(({ kind }) => kind === 'containment-cleanup-completed');
+  assert.equal(cleanup.clientRootErrorCode, 'CODEX_RPC_TIMEOUT');
+  assert.equal(cleanup.clientFaultClass, 'rpc-timeout');
+  assert.equal(Object.isFrozen(fixture.proc.containmentProvenance), true);
 });
 
 test('containment is checkpointed before lifecycle emit and closes transport after notification unwind', async () => {

@@ -420,6 +420,218 @@ describe('ProcessManager — delivery-work eviction pin', () => {
 });
 
 describe('ProcessManager — kill / killChat / shutdown', () => {
+  test('clean retirement captures an active session before an unrelated spawn gate settles', async () => {
+    const spawnEntered = deferred();
+    const releaseSpawn = deferred();
+    class SlowStartProcess extends MockProcess {
+      async start(opts) {
+        this._startSpy.push(opts);
+        spawnEntered.resolve();
+        await releaseSpawn.promise;
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => (
+        sessionKey === 'slow'
+          ? new SlowStartProcess({ sessionKey })
+          : new MockProcess({ sessionKey })
+      ),
+    });
+    const active = await pm.getOrSpawn('active');
+    const slowSpawn = pm.getOrSpawn('slow');
+    await spawnEntered.promise;
+
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.deepEqual(
+      active._killSpy,
+      ['clean-restart'],
+      'an unrelated unresolved spawn must not delay active-session retirement',
+    );
+
+    releaseSpawn.resolve();
+    await Promise.allSettled([slowSpawn, retirement]);
+    assert.deepEqual(active._killSpy, ['clean-restart']);
+  });
+
+  test('clean retirement closes every public lifecycle-gate entry after the fence', async () => {
+    const retirementEntered = deferred();
+    const releaseRetirement = deferred();
+    class HoldingProcess extends MockProcess {
+      async retireForCleanRestart(options) {
+        retirementEntered.resolve();
+        await releaseRetirement.promise;
+        return super.retireForCleanRestart(options);
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey, ctx) => new HoldingProcess({
+        sessionKey,
+        chatId: ctx?.chatId,
+      }),
+    });
+    await pm.getOrSpawn('active', { chatId: 'active' });
+    const expectedProcess = pm.get('active');
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    await retirementEntered.promise;
+
+    await assert.rejects(pm.getOrSpawn('new'), /shutdown/);
+    await assert.rejects(pm.kill('active'), /shutdown/);
+    await assert.rejects(
+      pm.retireExpectedProcess('active', expectedProcess),
+      /shutdown/,
+    );
+    await assert.rejects(pm.getModelSettingsStatus('active'), /shutdown/);
+    await assert.rejects(
+      pm.selectModelSettings('active', { model: 'm', effort: 'e' }),
+      /shutdown/,
+    );
+    await assert.rejects(
+      pm.replaceRuntime('active', { runtime: 'claude', spawnProfileId: 'new' }),
+      /shutdown/,
+    );
+    await assert.rejects(pm.resetSession('active'));
+    const killChatResults = await pm.killChat('active');
+    assert.equal(killChatResults.length, 1);
+    assert.equal(killChatResults[0].status, 'rejected');
+    assert.equal(pm._lifecycleGates.has('active'), false);
+
+    releaseRetirement.resolve();
+    await retirement;
+  });
+
+  test('clean retirement fence rejects public interrupt without reaching the process', async () => {
+    const retirementEntered = deferred();
+    const releaseRetirement = deferred();
+    class HoldingProcess extends MockProcess {
+      async retireForCleanRestart(options) {
+        retirementEntered.resolve();
+        await releaseRetirement.promise;
+        return super.retireForCleanRestart(options);
+      }
+
+      async interrupt() {
+        this.interruptCount = (this.interruptCount ?? 0) + 1;
+        return true;
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new HoldingProcess({ sessionKey }),
+    });
+    const proc = await pm.getOrSpawn('active');
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    await retirementEntered.promise;
+
+    const [interruptResult] = await Promise.allSettled([pm.interrupt('active')]);
+    releaseRetirement.resolve();
+    await retirement;
+
+    assert.equal(interruptResult.status, 'rejected');
+    assert.match(interruptResult.reason.message, /shutdown/);
+    assert.equal(proc.interruptCount ?? 0, 0);
+  });
+
+  test('clean retirement retires a process published by an admitted gate that rejects', async () => {
+    const startEntered = deferred();
+    const releaseStart = deferred();
+    const startError = new Error('admitted start failed');
+    class RejectingStartProcess extends MockProcess {
+      async start(opts) {
+        this._startSpy.push(opts);
+        startEntered.resolve();
+        await releaseStart.promise;
+        throw startError;
+      }
+
+      async retireForCleanRestart() {
+        this._killSpy.push('clean-restart');
+        this.closed = true;
+        return { sourceMsgId: null, eligible: false, reason: 'no-active-turn' };
+      }
+    }
+    const proc = new RejectingStartProcess({ sessionKey: 'same-session' });
+    const pm = new ProcessManager({ processFactory: () => proc });
+    const start = pm.getOrSpawn('same-session');
+    await startEntered.promise;
+
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    releaseStart.resolve();
+
+    await assert.rejects(start, /admitted start failed/);
+    await assert.rejects(retirement, /admitted start failed/);
+    assert.deepEqual(proc._killSpy, ['clean-restart']);
+    assert.equal(pm._cleanRetirementCandidates.has('same-session'), false);
+  });
+
+  test('failed clean retirement retains an admitted rejecting start for fallback shutdown', async () => {
+    const startEntered = deferred();
+    const releaseStart = deferred();
+    class RejectingStartProcess extends MockProcess {
+      async start(opts) {
+        this._startSpy.push(opts);
+        startEntered.resolve();
+        await releaseStart.promise;
+        throw new Error('admitted start failed');
+      }
+
+      async retireForCleanRestart() {
+        this._killSpy.push('clean-restart');
+        throw Object.assign(new Error('clean retirement failed'), {
+          code: 'CLEAN_RESTART_RETIREMENT_FAILED',
+        });
+      }
+    }
+    const proc = new RejectingStartProcess({ sessionKey: 'same-session' });
+    const pm = new ProcessManager({ processFactory: () => proc });
+    const start = pm.getOrSpawn('same-session');
+    await startEntered.promise;
+
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    releaseStart.resolve();
+
+    await assert.rejects(start, /admitted start failed/);
+    await assert.rejects(retirement, /admitted start failed/);
+    assert.equal(proc.closed, false);
+    assert.equal(pm.get('same-session'), proc);
+
+    await pm.shutdown();
+
+    assert.deepEqual(proc._killSpy, ['clean-restart', 'shutdown']);
+    assert.equal(proc.closed, true);
+    assert.equal(pm.has('same-session'), false);
+    assert.equal(pm._cleanRetirementCandidates.has('same-session'), false);
+  });
+
   test('retireForCleanRestart fences, strictly retires every process, and returns per-session snapshots', async () => {
     const calls = [];
     class RetiringProcess extends MockProcess {
@@ -562,6 +774,40 @@ describe('ProcessManager — kill / killChat / shutdown', () => {
     );
     assert.deepEqual(proc._killSpy, ['clean-restart']);
     assert.equal(pm.has('sdk'), true);
+  });
+
+  test('fallback shutdown kills an unclosed process after clean retirement fails', async () => {
+    class FailedRetirementProcess extends MockProcess {
+      async retireForCleanRestart() {
+        this._killSpy.push('clean-restart');
+        throw Object.assign(new Error('clean retirement failed'), {
+          code: 'CLEAN_RESTART_RETIREMENT_FAILED',
+        });
+      }
+    }
+    const pm = new ProcessManager({
+      processFactory: (sessionKey) => new FailedRetirementProcess({ sessionKey }),
+    });
+    const proc = await pm.getOrSpawn('sdk');
+
+    await assert.rejects(
+      pm.retireForCleanRestart({
+        getDeliveryEvidence: async () => ({
+          outputAttempted: false,
+          pending: 0,
+          fenced: true,
+        }),
+      }),
+      (error) => error.code === 'CLEAN_RESTART_RETIREMENT_FAILED',
+    );
+    assert.equal(proc.closed, false);
+    assert.equal(pm.get('sdk'), proc);
+
+    await pm.shutdown();
+
+    assert.deepEqual(proc._killSpy, ['clean-restart', 'shutdown']);
+    assert.equal(proc.closed, true);
+    assert.equal(pm.has('sdk'), false);
   });
 
   test('kill removes from map + calls Process.kill', async () => {

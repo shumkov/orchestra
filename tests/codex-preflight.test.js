@@ -1065,6 +1065,8 @@ test('late terminal client fault prevents a successful preflight result', async 
     cleanup: 'completed',
     errorCode: 'CODEX_PROTOCOL_ERROR',
     cleanupErrorCode: null,
+    clientRootErrorCode: 'CODEX_PROTOCOL_ERROR',
+    clientFaultClass: 'protocol',
     mutationOutcomeUnknown: false,
   });
   const client = new FakeClient(staticResults(profile), { faultOutcome });
@@ -1080,6 +1082,8 @@ test('late terminal client fault prevents a successful preflight result', async 
   assert.equal(error.clientFaultErrorCode, 'CODEX_PROTOCOL_ERROR');
   assert.equal(error.clientFaultBoundary, 'post-spawn');
   assert.equal(error.clientFaultContainment, 'unverified');
+  assert.equal(error.clientRootErrorCode, 'CODEX_PROTOCOL_ERROR');
+  assert.equal(error.clientFaultClass, 'protocol');
   assert.equal(client.closed, 1);
   assert.equal(client.faultWaits, 1);
 });

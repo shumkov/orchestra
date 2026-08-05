@@ -2161,6 +2161,245 @@ test('oversized, malformed, partial, and stderr failures reject pending work wit
   }
 });
 
+test('gradual cumulative stderr failure after a clean mutation is content-free and classified', async (t) => {
+  const harness = createHarness(t, {
+    methods: {
+      'thread/backgroundTerminals/clean': {
+        stderr: 'x'.repeat(6),
+      },
+    },
+  });
+  let observed;
+  const client = harness.makeClient({
+    maxStderrBytes: 10,
+    onFault: async (outcome) => {
+      observed = outcome;
+    },
+  });
+  await client.start();
+  const options = mutationOptions();
+
+  await client.request(
+    'thread/backgroundTerminals/clean',
+    { threadId: 'thread-1' },
+    options,
+  );
+  await assert.rejects(
+    client.request(
+      'thread/backgroundTerminals/clean',
+      { threadId: 'thread-1' },
+      options,
+    ),
+    (error) => (
+      error.code === 'CODEX_RPC_OUTCOME_UNKNOWN'
+      && error.clientRootErrorCode === 'CODEX_PROTOCOL_ERROR'
+      && error.clientFaultClass === 'stderr-limit'
+    ),
+  );
+
+  const outcome = await client.waitForFault();
+  assert.equal(outcome.clientRootErrorCode, 'CODEX_PROTOCOL_ERROR');
+  assert.equal(outcome.clientFaultClass, 'stderr-limit');
+  assert.equal(JSON.stringify(outcome).includes('xxxxxxxx'), false);
+  assert.equal(Object.getOwnPropertyDescriptor(outcome, 'clientRootErrorCode').writable, false);
+  assert.equal(Object.getOwnPropertyDescriptor(outcome, 'clientFaultClass').writable, false);
+});
+
+test('mutation wrappers preserve normalized root provenance through outcome-unknown fault', async (t) => {
+  const harness = createHarness(t, {
+    methods: {
+      'thread/backgroundTerminals/clean': {
+        closeAfterRead: true,
+      },
+    },
+  });
+  let observed;
+  const client = harness.makeClient({
+    onFault: async (outcome) => {
+      observed = outcome;
+    },
+  });
+  await client.start();
+
+  const error = await client.request(
+    'thread/backgroundTerminals/clean',
+    { threadId: 'thread-1' },
+    mutationOptions(),
+  ).then(() => null, (caught) => caught);
+  assert.equal(error.code, 'CODEX_RPC_OUTCOME_UNKNOWN');
+  assert.equal(error.clientRootErrorCode, 'CODEX_PROTOCOL_ERROR');
+  assert.equal(error.clientFaultClass, 'protocol');
+  assert.equal(Object.getOwnPropertyDescriptor(error, 'clientRootErrorCode').writable, false);
+  assert.equal(Object.getOwnPropertyDescriptor(error, 'clientFaultClass').writable, false);
+
+  const outcome = await client.waitForFault();
+  assert.deepEqual(observed, outcome);
+  assert.equal(outcome.clientRootErrorCode, 'CODEX_PROTOCOL_ERROR');
+  assert.equal(outcome.clientFaultClass, 'protocol');
+});
+
+test('raw transport write failures normalize before mutation wrapping', async (t) => {
+  const harness = createHarness(t);
+  let observed;
+  const client = harness.makeClient({
+    onFault: async (outcome) => {
+      observed = outcome;
+    },
+  });
+  await client.start();
+  const stdin = client.child.stdin;
+  const rawTransportError = Object.assign(new Error('EPIPE'), { code: 'EPIPE' });
+  stdin.write = (_line, callback) => callback(rawTransportError);
+
+  const error = await client.request(
+    'thread/backgroundTerminals/clean',
+    { threadId: 'thread-1' },
+    mutationOptions(),
+  ).then(() => null, (caught) => caught);
+  assert.equal(error.code, 'CODEX_RPC_OUTCOME_UNKNOWN');
+  assert.equal(error.clientRootErrorCode, 'CODEX_TRANSPORT_ERROR');
+  assert.equal(error.clientFaultClass, 'transport');
+  const outcome = await client.waitForFault();
+  assert.deepEqual(observed, outcome);
+  assert.equal(outcome.clientRootErrorCode, 'CODEX_TRANSPORT_ERROR');
+  assert.equal(outcome.clientFaultClass, 'transport');
+});
+
+test('fault provenance fallback is bounded and cycle-safe', async (t) => {
+  const harness = createHarness(t);
+  const client = harness.makeClient();
+  await client.start();
+  const cyclic = new Error('SECRET_CYCLIC_FAULT');
+  cyclic.code = 'NOT_AN_ALLOWLISTED_CODE';
+  cyclic.cause = cyclic;
+  client._fault(cyclic);
+
+  const outcome = await client.waitForFault();
+  assert.equal(outcome.clientRootErrorCode, 'unknown');
+  assert.equal(outcome.clientFaultClass, 'unknown');
+  assert.equal(JSON.stringify(outcome).includes('SECRET_CYCLIC_FAULT'), false);
+});
+
+test('fault containment survives errors that cannot accept provenance fields', async (t) => {
+  await t.test('frozen notification sink error', async (subtest) => {
+    const harness = createHarness(subtest, {
+      methods: {
+        'config/read': {
+          beforeResponseMessages: [{
+            method: 'thread/status/changed',
+            params: {
+              threadId: 'thread-1',
+              status: { type: 'active', activeFlags: [] },
+            },
+          }],
+          hold: true,
+        },
+      },
+    });
+    const sinkError = Object.freeze(new Error(
+      'SECRET_FROZEN_NOTIFICATION_PAYLOAD',
+    ));
+    const client = harness.makeClient({
+      onNotification: () => {
+        throw sinkError;
+      },
+    });
+    await client.start();
+
+    const requestError = await rejectedWithinWithCode(
+      client.request('config/read', {
+        cwd: harness.cwd,
+        includeLayers: true,
+      }),
+      'CODEX_PROTOCOL_ERROR',
+      1_000,
+    );
+    assert.notEqual(requestError, sinkError);
+    assert.equal(requestError.cause, sinkError);
+    assert.equal(requestError.message, 'app-server fault could not be annotated');
+    assert.equal(requestError.clientRootErrorCode, 'unknown');
+    assert.equal(requestError.clientFaultClass, 'unknown');
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(requestError, 'clientRootErrorCode'),
+      {
+        value: 'unknown',
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+    );
+    assert.deepEqual(
+      Object.getOwnPropertyDescriptor(requestError, 'clientFaultClass'),
+      {
+        value: 'unknown',
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+    );
+
+    const outcome = await client.waitForFault();
+    assert.equal(client.state, 'closed');
+    assert.equal(outcome.boundary, 'post-spawn');
+    assert.equal(outcome.containment, 'unverified');
+    assert.equal(outcome.cleanup, 'completed');
+    assert.equal(outcome.errorCode, 'CODEX_PROTOCOL_ERROR');
+    assert.equal(outcome.clientRootErrorCode, 'unknown');
+    assert.equal(outcome.clientFaultClass, 'unknown');
+    assert.equal(
+      JSON.stringify(outcome).includes('SECRET_FROZEN_NOTIFICATION_PAYLOAD'),
+      false,
+    );
+  });
+
+  await t.test('conflicting immutable provenance descriptors', async (subtest) => {
+    const harness = createHarness(subtest);
+    const client = harness.makeClient();
+    await client.start();
+    const conflicting = new Error('SECRET_CONFLICTING_FAULT_PAYLOAD');
+    Object.defineProperties(conflicting, {
+      code: {
+        value: 'SECRET_RAW_ERROR_CODE',
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+      clientRootErrorCode: {
+        value: 'SECRET_ROOT_ERROR_CODE',
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+      clientFaultClass: {
+        value: 'SECRET_FAULT_CLASS',
+        enumerable: true,
+        writable: false,
+        configurable: false,
+      },
+    });
+
+    assert.doesNotThrow(() => client._fault(conflicting));
+    const outcome = await client.waitForFault();
+    assert.equal(client.state, 'closed');
+    assert.notEqual(client.protocolError, conflicting);
+    assert.equal(client.protocolError.cause, conflicting);
+    assert.equal(client.protocolError.code, 'CODEX_PROTOCOL_ERROR');
+    assert.equal(client.protocolError.clientRootErrorCode, 'unknown');
+    assert.equal(client.protocolError.clientFaultClass, 'unknown');
+    assert.equal(outcome.boundary, 'post-spawn');
+    assert.equal(outcome.containment, 'unverified');
+    assert.equal(outcome.cleanup, 'completed');
+    assert.equal(outcome.errorCode, 'CODEX_PROTOCOL_ERROR');
+    assert.equal(outcome.clientRootErrorCode, 'unknown');
+    assert.equal(outcome.clientFaultClass, 'unknown');
+    const serialized = JSON.stringify(outcome);
+    assert.equal(serialized.includes('SECRET_CONFLICTING_FAULT_PAYLOAD'), false);
+    assert.equal(serialized.includes('SECRET_RAW_ERROR_CODE'), false);
+    assert.equal(serialized.includes('SECRET_ROOT_ERROR_CODE'), false);
+    assert.equal(serialized.includes('SECRET_FAULT_CLASS'), false);
+  });
+});
+
 test('queued valid response is processed before a following stdout EOF fault', async (t) => {
   const harness = createHarness(t, {
     methods: {
@@ -2497,6 +2736,8 @@ test('fault handoff distinguishes safe pre-spawn failure from quarantined post-s
       cleanup: 'completed',
       errorCode: 'CODEX_BINARY_MISMATCH',
       cleanupErrorCode: null,
+      clientRootErrorCode: 'unknown',
+      clientFaultClass: 'unknown',
       mutationOutcomeUnknown: false,
     });
   });

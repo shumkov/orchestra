@@ -1,9 +1,11 @@
 'use strict';
 
+const { createHash } = require('node:crypto');
 const { test, describe, beforeEach } = require('node:test');
 const assert = require('node:assert/strict');
 const { ProcessManager } = require('../lib/process/process-manager');
 const { Process, UnsupportedOperationError } = require('../lib/process/process');
+const { CodexProcess } = require('../lib/process/codex-process');
 
 // ── Mock Process ─────────────────────────────────────────────────────
 
@@ -420,7 +422,7 @@ describe('ProcessManager — delivery-work eviction pin', () => {
 });
 
 describe('ProcessManager — kill / killChat / shutdown', () => {
-  test('clean retirement captures an active session before an unrelated spawn gate settles', async () => {
+  test('clean retirement waits for an unrelated admitted spawn gate before retiring active sessions', async () => {
     const spawnEntered = deferred();
     const releaseSpawn = deferred();
     class SlowStartProcess extends MockProcess {
@@ -451,8 +453,8 @@ describe('ProcessManager — kill / killChat / shutdown', () => {
     await new Promise((resolve) => setTimeout(resolve, 25));
     assert.deepEqual(
       active._killSpy,
-      ['clean-restart'],
-      'an unrelated unresolved spawn must not delay active-session retirement',
+      [],
+      'an unrelated admitted spawn gate must delay every retirement',
     );
 
     releaseSpawn.resolve();
@@ -733,7 +735,9 @@ describe('ProcessManager — kill / killChat / shutdown', () => {
     const pm = new ProcessManager({ processFactory: mockFactory() });
     const first = await pm.getOrSpawn('first');
     const second = await pm.getOrSpawn('second');
-    pm._lifecycleGates.set('failed-gate', Promise.reject(new Error('admitted failed')));
+    pm._withInternalLifecycleGate('failed-gate', async () => {
+      throw new Error('admitted failed');
+    });
 
     await assert.rejects(
       pm.retireForCleanRestart({
@@ -1338,6 +1342,81 @@ class RuntimeProcess extends MockProcess {
         });
       }
     }
+  }
+}
+
+const QUALIFICATION_THREAD_POLICY = Object.freeze({
+  model: 'gpt-5.6-sol',
+  effort: 'xhigh',
+  modelProvider: 'openai',
+  approvalPolicy: 'never',
+  approvalsReviewer: 'user',
+  sandbox: Object.freeze({ type: 'workspaceWrite' }),
+  permissionProfile: Object.freeze({
+    id: 'polygram-session',
+    extends: null,
+  }),
+});
+
+const QUALIFICATION_MODEL_CATALOG = Object.freeze([Object.freeze({
+  model: 'gpt-5.6-sol',
+  supportedReasoningEfforts: Object.freeze(['xhigh']),
+})]);
+
+class QualificationCodexProcess extends CodexProcess {
+  constructor({ sessionKey, spawnProfileId, listBackgroundTerminals }) {
+    super({
+      sessionKey,
+      chatId: sessionKey,
+      threadId: null,
+      label: `qualification-${sessionKey}`,
+      cwd: '/workspace',
+      clientFactory: () => {
+        throw new Error('test start installs the qualification client');
+      },
+      checkpointSink: async () => {},
+      hostIdentity: 'host-a',
+      bootSessionIdentity: 'boot-new',
+      generationIdFactory: () => `generation-${sessionKey}`,
+      expectedThreadPolicy: QUALIFICATION_THREAD_POLICY,
+      modelCatalog: QUALIFICATION_MODEL_CATALOG,
+      logger: { debug() {}, error() {}, info() {}, log() {}, warn() {} },
+    });
+    this.spawnProfileId = spawnProfileId;
+    this.listBackgroundTerminals = listBackgroundTerminals;
+  }
+
+  async start() {
+    this.client = {
+      request: async (method, params) => {
+        assert.equal(method, 'thread/backgroundTerminals/list');
+        return this.listBackgroundTerminals(params);
+      },
+    };
+    this.providerSessionId = 'codex-thread';
+    this.state = 'Idle';
+  }
+
+  async interrupt() {
+    this.state = 'Quiescing';
+    this.state = 'Stopped';
+    this.emit('codex-settled', {
+      kind: 'stopped',
+      generationId: this.generationId,
+      hostIdentity: this.hostIdentity,
+      bootSessionIdentity: this.bootSessionIdentity,
+      trackedTerminalCleanupAccepted: true,
+      freshRegistryObservedEmpty: true,
+      terminalStatus: null,
+      turnId: null,
+    });
+    return true;
+  }
+
+  async kill(reason) {
+    this.closed = true;
+    this.state = 'Closed';
+    this.emit('close', { reason, generationId: this.generationId });
   }
 }
 
@@ -2654,6 +2733,741 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
 });
 
 describe('ProcessManager — Codex retirement and callback fences', () => {
+  test('qualification expectations are closed objects and retirement requires both fence values', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-expectation', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-expectation',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => ({
+      outcome: 'qualified',
+      reason: 'eligible',
+      generationDigest,
+      activityEpoch: 0,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 100,
+    });
+
+    const standaloneResult = await pm.inspectCleanRestartQualification();
+    assert.equal(standaloneResult.reason, 'eligible');
+    assert.equal(standaloneResult.observedAtMs, 100);
+    assert.equal(
+      (await pm.inspectCleanRestartQualification({})).outcome,
+      'qualified',
+    );
+    for (const invalid of [
+      null,
+      1,
+      'digest',
+      [],
+      { expectedGenerationDigest: generationDigest },
+      { expectedActivityEpoch: 0 },
+      { expectedGenerationDigest: generationDigest, extra: true },
+    ]) {
+      const result = await pm.inspectCleanRestartQualification(invalid);
+      assert.equal(result.outcome, 'mismatch');
+      assert.equal(result.reason, 'invalid-expectation');
+    }
+
+    const partialSnapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: { expectedGenerationDigest: generationDigest },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+    const [retirement] = partialSnapshots;
+    assert.equal(retirement.eligible, false);
+    assert.equal(retirement.reason, 'no-active-turn');
+    assert.equal(retirement.qualification, undefined);
+    assert.equal(partialSnapshots.qualification.outcome, 'mismatch');
+    assert.equal(partialSnapshots.qualification.reason, 'invalid-expectation');
+
+    const { pm: emptyExpectationPm } = runtimeManager();
+    const emptyExpectationProc = await emptyExpectationPm.getOrSpawn(
+      'codex-empty-retirement-expectation',
+      { runtime: 'codex', spawnProfileId: 'profile-empty-retirement-expectation' },
+    );
+    emptyExpectationProc.activityEpoch = 0;
+    const emptyGenerationDigest = createHash('sha256')
+      .update(emptyExpectationProc.generationId)
+      .digest('hex');
+    emptyExpectationProc.inspectCleanRestartQualification = async () => ({
+      outcome: 'qualified',
+      reason: 'eligible',
+      generationDigest: emptyGenerationDigest,
+      activityEpoch: 0,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 101,
+    });
+    const emptySnapshots = await emptyExpectationPm.retireForCleanRestart({
+      qualificationExpectation: {},
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+    assert.equal(emptySnapshots.qualification.outcome, 'mismatch');
+    assert.equal(emptySnapshots.qualification.reason, 'invalid-expectation');
+    await pm.shutdown();
+    await emptyExpectationPm.shutdown();
+  });
+
+  test('retirement exposes one request qualification independently of its Codex snapshot', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-qualification-channel', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-qualification-channel',
+    });
+    proc.activityEpoch = 0;
+    const expectedGenerationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => ({
+      outcome: 'mismatch',
+      reason: 'activity-epoch-drift',
+      generationDigest: expectedGenerationDigest,
+      activityEpoch: 2,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 200,
+    });
+    proc.activityEpoch = 2;
+
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest,
+        expectedActivityEpoch: 2,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+
+    assert.equal(Object.hasOwn(snapshots, 'qualification'), true);
+    assert.equal(snapshots.qualification.outcome, 'mismatch');
+    assert.equal(snapshots.qualification.observedAtMs, 200);
+    assert.equal(Number.isSafeInteger(snapshots.qualification.observedAtMs), true);
+    assert.equal(snapshots.qualification.observedAtMs >= 0, true);
+    assert.equal(snapshots[0].qualification, undefined);
+  });
+
+  test('qualification normalizes an incoherent qualified response to a bounded mismatch', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-incoherent', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-incoherent',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => ({
+      outcome: 'qualified',
+      reason: 'eligible',
+      generationDigest,
+      activityEpoch: 0,
+      processState: 'Idle',
+      activeTurnCount: 1,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 300,
+    });
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest: generationDigest,
+        expectedActivityEpoch: 0,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+    const [snapshot] = snapshots;
+    assert.equal(snapshot.eligible, false);
+    assert.equal(snapshots.qualification.reason, 'incoherent');
+    assert.equal(snapshots.qualification.observedAtMs, 300);
+  });
+
+  test('qualification rejects missing and extra result fields as inspection failures', async (t) => {
+    for (const [name, mutate] of [
+      ['missing field', (result) => {
+        delete result.reason;
+      }],
+      ['extra field', (result) => {
+        result.providerSessionId = 'must-not-escape';
+      }],
+    ]) {
+      await t.test(name, async () => {
+        const { pm } = runtimeManager();
+        const proc = await pm.getOrSpawn(`codex-malformed-${name}`, {
+          runtime: 'codex',
+          spawnProfileId: `profile-malformed-${name}`,
+        });
+        proc.activityEpoch = 0;
+        const generationDigest = createHash('sha256')
+          .update(proc.generationId)
+          .digest('hex');
+        proc.inspectCleanRestartQualification = async () => {
+          const result = {
+            outcome: 'qualified',
+            reason: 'eligible',
+            generationDigest,
+            activityEpoch: 0,
+            processState: 'Idle',
+            activeTurnCount: 0,
+            pendingDeliveryCount: 0,
+            backgroundOwnerCount: 0,
+            backgroundTerminalCount: 0,
+            backgroundTerminalRegistryComplete: true,
+            observedAtMs: 350,
+          };
+          mutate(result);
+          return result;
+        };
+
+        const result = await pm.inspectCleanRestartQualification({
+          expectedGenerationDigest: generationDigest,
+          expectedActivityEpoch: 0,
+        });
+
+        assert.equal(result.outcome, 'mismatch');
+        assert.equal(result.reason, 'inspection-failed');
+        assert.equal(result.providerSessionId, undefined);
+        await pm.shutdown();
+      });
+    }
+  });
+
+  test('qualification remains one bounded result when the Codex lease disappears', async () => {
+    const inspectionEntered = deferred();
+    const releaseInspection = deferred();
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-lease-loss', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-lease-loss',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => {
+      inspectionEntered.resolve();
+      await releaseInspection.promise;
+      return {
+        outcome: 'qualified',
+        reason: 'eligible',
+        generationDigest,
+        activityEpoch: 0,
+        processState: 'Idle',
+        activeTurnCount: 0,
+        pendingDeliveryCount: 0,
+        backgroundOwnerCount: 0,
+        backgroundTerminalCount: 0,
+        backgroundTerminalRegistryComplete: true,
+        observedAtMs: 400,
+      };
+    };
+    const inspection = pm.inspectCleanRestartQualification({
+      expectedGenerationDigest: generationDigest,
+      expectedActivityEpoch: 0,
+    });
+    await inspectionEntered.promise;
+    pm._codexLease = null;
+    releaseInspection.resolve();
+    const result = await inspection;
+    assert.equal(result.outcome, 'mismatch');
+    assert.equal(result.reason, 'lease-drift');
+    assert.equal(result.generationDigest, generationDigest);
+  });
+
+  test('real Codex qualification preserves lease drift during the registry read', async () => {
+    const listEntered = deferred();
+    const releaseList = deferred();
+    const { pm } = runtimeManager({
+      processFactory: (sessionKey, ctx) => new QualificationCodexProcess({
+        sessionKey,
+        spawnProfileId: ctx.spawnProfileId,
+        listBackgroundTerminals: async () => {
+          listEntered.resolve();
+          await releaseList.promise;
+          return { count: 0, nextCursor: null };
+        },
+      }),
+    });
+    const proc = await pm.getOrSpawn('codex-real-lease-loss', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-real-lease-loss',
+    });
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    const inspection = pm.inspectCleanRestartQualification({
+      expectedGenerationDigest: generationDigest,
+      expectedActivityEpoch: 0,
+    });
+    await listEntered.promise;
+    pm._codexLease = null;
+    releaseList.resolve();
+
+    const result = await inspection;
+
+    assert.equal(result.outcome, 'mismatch');
+    assert.equal(result.reason, 'lease-drift');
+    await proc.kill('test-cleanup');
+  });
+
+  test('real Codex registry failure becomes a bounded inspection mismatch', async () => {
+    const { pm } = runtimeManager({
+      processFactory: (sessionKey, ctx) => new QualificationCodexProcess({
+        sessionKey,
+        spawnProfileId: ctx.spawnProfileId,
+        listBackgroundTerminals: async () => {
+          throw new Error('registry unavailable');
+        },
+      }),
+    });
+    const proc = await pm.getOrSpawn('codex-real-registry-failure', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-real-registry-failure',
+    });
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+
+    const result = await pm.inspectCleanRestartQualification({
+      expectedGenerationDigest: generationDigest,
+      expectedActivityEpoch: 0,
+    });
+
+    assert.equal(result.outcome, 'mismatch');
+    assert.equal(result.reason, 'inspection-failed');
+    await pm.shutdown();
+  });
+
+  test('qualification fails closed when activity advances at the manager promise boundary', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-manager-fence-race', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-manager-fence-race',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => {
+      queueMicrotask(() => {
+        proc.activityEpoch += 1;
+        proc.state = 'BackgroundWorking';
+      });
+      return {
+        outcome: 'qualified',
+        reason: 'eligible',
+        generationDigest,
+        activityEpoch: 0,
+        processState: 'Idle',
+        activeTurnCount: 0,
+        pendingDeliveryCount: 0,
+        backgroundOwnerCount: 0,
+        backgroundTerminalCount: 0,
+        backgroundTerminalRegistryComplete: true,
+        observedAtMs: 450,
+      };
+    };
+
+    const result = await pm.inspectCleanRestartQualification({
+      expectedGenerationDigest: generationDigest,
+      expectedActivityEpoch: 0,
+    });
+
+    assert.equal(result.outcome, 'mismatch');
+    assert.equal(result.reason, 'fence-drift');
+    assert.equal(result.generationDigest, generationDigest);
+    assert.equal(result.activityEpoch, 0);
+  });
+
+  test('retirement rechecks a qualified generation at the quiesce boundary', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-retirement-fence-race', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-retirement-fence-race',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => ({
+      outcome: 'qualified',
+      reason: 'eligible',
+      generationDigest,
+      activityEpoch: 0,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 475,
+    });
+    const inspectQualification = pm.inspectCleanRestartQualification.bind(pm);
+    pm.inspectCleanRestartQualification = async (...args) => {
+      const result = await inspectQualification(...args);
+      queueMicrotask(() => {
+        proc.activityEpoch += 1;
+        proc.state = 'BackgroundWorking';
+      });
+      return result;
+    };
+
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest: generationDigest,
+        expectedActivityEpoch: 0,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+
+    assert.equal(snapshots.qualification.outcome, 'mismatch');
+    assert.equal(snapshots.qualification.reason, 'fence-drift');
+    assert.equal(snapshots.qualification.generationDigest, generationDigest);
+    assert.equal(snapshots.qualification.activityEpoch, 0);
+  });
+
+  test('retirement downgrades qualification when its target disappears before lookup', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-disappearing-target', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-disappearing-target',
+    });
+    proc.activityEpoch = 0;
+    const generationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async () => ({
+      outcome: 'qualified',
+      reason: 'eligible',
+      generationDigest,
+      activityEpoch: 0,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 480,
+    });
+    const inspectQualification = pm.inspectCleanRestartQualification.bind(pm);
+    pm.inspectCleanRestartQualification = async (...args) => {
+      const result = await inspectQualification(...args);
+      queueMicrotask(() => {
+        pm.procs.delete(proc.sessionKey);
+        pm._codexLease = null;
+      });
+      return result;
+    };
+
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest: generationDigest,
+        expectedActivityEpoch: 0,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+
+    assert.deepEqual(snapshots, []);
+    assert.equal(snapshots.qualification.outcome, 'mismatch');
+    assert.equal(snapshots.qualification.reason, 'lease-drift');
+    await proc.kill('test-cleanup');
+  });
+
+  test('strict retirement is rejection-observed before delivery evidence can settle', async () => {
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-retirement-rejection-observer', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-retirement-rejection-observer',
+    });
+    const deliveryEvidence = deferred();
+    const strictRetirement = deferred();
+    let rejectionObserved = false;
+    const retirementThenable = {
+      then(onFulfilled, onRejected) {
+        return strictRetirement.promise.then(onFulfilled, onRejected);
+      },
+      catch(onRejected) {
+        rejectionObserved = true;
+        strictRetirement.promise.catch(onRejected);
+        return this;
+      },
+    };
+    pm._strictRetire = () => retirementThenable;
+
+    const retirement = pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => deliveryEvidence.promise,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+
+    try {
+      assert.equal(rejectionObserved, true);
+    } finally {
+      deliveryEvidence.resolve({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      });
+      proc.closed = true;
+      strictRetirement.resolve({ committed: false });
+      await retirement;
+    }
+  });
+
+  test('no Codex generation still returns one bounded retirement qualification', async () => {
+    const { pm } = runtimeManager();
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest: 'a'.repeat(64),
+        expectedActivityEpoch: 0,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+    assert.deepEqual(snapshots, []);
+    assert.equal(Object.hasOwn(snapshots, 'qualification'), true);
+    assert.deepEqual(snapshots.qualification, {
+      outcome: 'mismatch',
+      reason: 'no-codex-generation',
+      generationDigest: null,
+      activityEpoch: null,
+      processState: 'unknown',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: false,
+      observedAtMs: snapshots.qualification.observedAtMs,
+    });
+    assert.equal(Number.isSafeInteger(snapshots.qualification.observedAtMs), true);
+  });
+
+  test('clean restart qualification preflight runs before retirement and preserves mismatch result', async () => {
+    const order = [];
+    let observedOptions = null;
+    const { pm } = runtimeManager();
+    const proc = await pm.getOrSpawn('codex-qualification', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-qualification',
+    });
+    proc.activityEpoch = 2;
+    const expectedGenerationDigest = createHash('sha256')
+      .update(proc.generationId)
+      .digest('hex');
+    proc.inspectCleanRestartQualification = async (options) => {
+      observedOptions = options;
+      order.push('qualification');
+      return Object.freeze({
+        outcome: 'mismatch',
+        reason: 'activity-epoch-drift',
+        generationDigest: expectedGenerationDigest,
+        activityEpoch: 2,
+        processState: 'Idle',
+        activeTurnCount: 0,
+        pendingDeliveryCount: 0,
+        backgroundOwnerCount: 0,
+        backgroundTerminalCount: 0,
+        backgroundTerminalRegistryComplete: true,
+        observedAtMs: 500,
+      });
+    };
+    const publicResult = await pm.inspectCleanRestartQualification({
+      expectedGenerationDigest,
+      expectedActivityEpoch: 2,
+    });
+    assert.equal(publicResult.outcome, 'mismatch');
+    assert.equal(publicResult.generationDigest, expectedGenerationDigest);
+    order.length = 0;
+    const interrupt = proc.interrupt.bind(proc);
+    proc.interrupt = async () => {
+      order.push('interrupt');
+      return interrupt();
+    };
+    const kill = proc.kill.bind(proc);
+    proc.kill = async (reason) => {
+      order.push('kill');
+      return kill(reason);
+    };
+
+    const gate = deferred();
+    pm._withInternalLifecycleGate('admitted-gate', async () => {
+      order.push('admitted-gate');
+      await gate.promise;
+      pm._withInternalLifecycleGate('chained-gate', async () => {
+        order.push('chained-gate');
+      });
+    });
+    const restart = pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest,
+        expectedActivityEpoch: 2,
+      },
+      getDeliveryEvidence: async () => ({
+        ...(order.push('evidence'), {}),
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(order, ['admitted-gate']);
+    gate.resolve();
+    const snapshots = await restart;
+    const [snapshot] = snapshots;
+
+    assert.deepEqual(order, [
+      'admitted-gate',
+      'chained-gate',
+      'qualification',
+      'interrupt',
+      'evidence',
+      'kill',
+    ]);
+    assert.equal(observedOptions.expectedGenerationDigest, expectedGenerationDigest);
+    assert.equal(observedOptions.expectedActivityEpoch, 2);
+    assert.equal(observedOptions.expectedGenerationId, undefined);
+    assert.equal(typeof observedOptions.assertLease, 'function');
+    assert.equal(snapshot.qualification, undefined);
+    assert.deepEqual(snapshots.qualification, {
+      outcome: 'mismatch',
+      reason: 'activity-epoch-drift',
+      generationDigest: expectedGenerationDigest,
+      activityEpoch: 2,
+      processState: 'Idle',
+      activeTurnCount: 0,
+      pendingDeliveryCount: 0,
+      backgroundOwnerCount: 0,
+      backgroundTerminalCount: 0,
+      backgroundTerminalRegistryComplete: true,
+      observedAtMs: 500,
+    });
+    assert.equal(proc.closed, true);
+  });
+
+  test('aged idle real Codex qualifies while foreground Claude alone remains resumable', async () => {
+    const order = [];
+    const { pm } = runtimeManager({
+      processFactory: (sessionKey, ctx = {}) => {
+        if (ctx.runtime === 'codex') {
+          const proc = new QualificationCodexProcess({
+            sessionKey,
+            spawnProfileId: ctx.spawnProfileId,
+            listBackgroundTerminals: async () => {
+              order.push('qualification');
+              return { count: 0, nextCursor: null };
+            },
+          });
+          const interrupt = proc.interrupt.bind(proc);
+          proc.interrupt = async () => {
+            order.push('codex-retire');
+            return interrupt();
+          };
+          return proc;
+        }
+        const proc = new RuntimeProcess({ sessionKey }, {
+          runtime: 'claude',
+          generationId: `generation-${sessionKey}`,
+        });
+        proc.backend = 'cli';
+        proc.retireForCleanRestart = async () => {
+          order.push('claude-retire');
+          proc.closed = true;
+          return { sourceMsgId: 88, eligible: true, reason: 'eligible' };
+        };
+        return proc;
+      },
+    });
+    const codex = await pm.getOrSpawn('codex-aged-idle', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-aged-idle',
+    });
+    codex.activityEpoch = 0;
+    await pm.getOrSpawn('claude-foreground', { runtime: 'claude' });
+    const expectedGenerationDigest = createHash('sha256')
+      .update(codex.generationId)
+      .digest('hex');
+
+    const snapshots = await pm.retireForCleanRestart({
+      qualificationExpectation: {
+        expectedGenerationDigest,
+        expectedActivityEpoch: codex.activityEpoch,
+      },
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+
+    assert.equal(order[0], 'qualification');
+    assert.equal(order.includes('codex-retire'), true);
+    assert.equal(order.includes('claude-retire'), true);
+    assert.equal(order.indexOf('qualification') < order.indexOf('codex-retire'), true);
+    assert.equal(order.indexOf('qualification') < order.indexOf('claude-retire'), true);
+    assert.equal(snapshots.qualification.outcome, 'qualified');
+    assert.equal(snapshots.qualification.reason, 'eligible');
+    assert.deepEqual(
+      snapshots.find((snapshot) => snapshot.sessionKey === 'codex-aged-idle'),
+      {
+        sessionKey: 'codex-aged-idle',
+        sourceMsgId: null,
+        eligible: false,
+        reason: 'no-active-turn',
+      },
+    );
+    assert.deepEqual(
+      snapshots.find((snapshot) => snapshot.sessionKey === 'claude-foreground'),
+      {
+        sessionKey: 'claude-foreground',
+        sourceMsgId: 88,
+        eligible: true,
+        reason: 'eligible',
+      },
+    );
+  });
+
   test('clean restart retires one exact interrupted Codex turn into an eligible snapshot', async () => {
     const verifierCalls = [];
     const { pm } = runtimeManager({

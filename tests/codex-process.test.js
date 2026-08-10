@@ -713,6 +713,242 @@ test('clean restart candidate captures one exact accepted active turn', async ()
   await fixture.proc.kill();
 });
 
+test('activity epoch advances before a send durability checkpoint can fail', async () => {
+  let epochAtCheckpoint = null;
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind === 'request-prepared' && checkpoint.method === 'turn/start') {
+        epochAtCheckpoint = fixture.proc.activityEpoch;
+        throw new Error('send checkpoint unavailable');
+      }
+    },
+  });
+  await fixture.start();
+  const before = fixture.proc.activityEpoch;
+
+  await assert.rejects(
+    fixture.proc.send('epoch-fenced send'),
+    (error) => error.code === 'CODEX_DURABILITY_FAILED',
+  );
+  assert.equal(fixture.proc.activityEpoch, before + 1);
+  assert.equal(epochAtCheckpoint, before + 1);
+  await fixture.proc.kill();
+});
+
+test('activity epoch advances before an admitted steer durability checkpoint can fail', async () => {
+  let epochAtCheckpoint = null;
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind === 'request-prepared' && checkpoint.method === 'turn/steer') {
+        epochAtCheckpoint = fixture.proc.activityEpoch;
+        throw new Error('steer checkpoint unavailable');
+      }
+    },
+    handlers: {
+      'turn/start': async () => ({
+        turn: { id: 'turn-epoch-steer', status: 'inProgress', items: [], error: null },
+      }),
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('keep a turn active').catch(() => {});
+  await fixture.client.notify('turn/started', {
+    threadId: 'codex-thread',
+    turn: { id: 'turn-epoch-steer', status: 'inProgress' },
+  });
+  while (fixture.proc.state !== 'Active') {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const before = fixture.proc.activityEpoch;
+
+  await assert.rejects(
+    fixture.proc.steerTurn('epoch-fenced steer'),
+    (error) => error.code === 'CODEX_DURABILITY_FAILED',
+  );
+  assert.equal(fixture.proc.activityEpoch, before + 1);
+  assert.equal(epochAtCheckpoint, before + 1);
+  await fixture.proc.kill();
+  void send;
+});
+
+test('background ownership activation advances the activity epoch', async () => {
+  const fixture = makeProcess();
+  await fixture.start();
+  const before = fixture.proc.activityEpoch;
+
+  await fixture.client.notify('thread/status/changed', {
+    threadId: 'codex-thread',
+    status: { type: 'active' },
+  });
+
+  assert.equal(fixture.proc.state, 'BackgroundWorking');
+  assert.equal(fixture.proc.activityEpoch, before + 1);
+  await fixture.proc.kill();
+});
+
+test('background status advances the epoch before its durability checkpoint and transitions once', async () => {
+  const checkpointEntered = deferred();
+  const releaseCheckpoint = deferred();
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind !== 'thread-status-changed') return;
+      checkpointEntered.resolve({
+        epoch: fixture.proc.activityEpoch,
+        state: fixture.proc.state,
+      });
+      await releaseCheckpoint.promise;
+    },
+  });
+  await fixture.start();
+  const before = fixture.proc.activityEpoch;
+  const notification = fixture.client.notify('thread/status/changed', {
+    threadId: 'codex-thread',
+    status: { type: 'active' },
+  });
+
+  assert.deepEqual(await checkpointEntered.promise, {
+    epoch: before + 1,
+    state: 'Idle',
+  });
+  assert.equal(fixture.proc.state, 'Idle');
+  releaseCheckpoint.resolve();
+  await notification;
+  assert.equal(fixture.proc.state, 'BackgroundWorking');
+  assert.equal(fixture.proc.activityEpoch, before + 1);
+  await fixture.proc.kill();
+});
+
+test('clean restart qualification reads a complete empty registry without mutation', async () => {
+  const requests = [];
+  const fixture = makeProcess({
+    handlers: {
+      'thread/backgroundTerminals/list': async (params) => {
+        requests.push(params);
+        return { count: 0, nextCursor: null };
+      },
+      'thread/backgroundTerminals/clean': async () => {
+        throw new Error('qualification must not clean');
+      },
+    },
+  });
+  await fixture.start();
+
+  const result = await fixture.proc.inspectCleanRestartQualification({
+    expectedActivityEpoch: fixture.proc.activityEpoch,
+  });
+
+  assert.deepEqual(result, {
+    outcome: 'qualified',
+    reason: 'eligible',
+    generationDigest: createHash('sha256')
+      .update(fixture.proc.generationId)
+      .digest('hex'),
+    activityEpoch: 0,
+    processState: 'Idle',
+    activeTurnCount: 0,
+    pendingDeliveryCount: 0,
+    backgroundOwnerCount: 0,
+    backgroundTerminalCount: 0,
+    backgroundTerminalRegistryComplete: true,
+    observedAtMs: result.observedAtMs,
+  });
+  assert.equal(Number.isSafeInteger(result.observedAtMs), true);
+  assert.equal(result.observedAtMs >= 0, true);
+  assert.deepEqual(requests, [{
+    threadId: 'codex-thread',
+    limit: 100,
+  }]);
+  await fixture.proc.kill();
+});
+
+test('clean restart qualification fails on concurrent epoch and background drift', async () => {
+  const listEntered = deferred();
+  const releaseList = deferred();
+  const fixture = makeProcess({
+    handlers: {
+      'thread/backgroundTerminals/list': async () => {
+        listEntered.resolve();
+        await releaseList.promise;
+        return { count: 0, nextCursor: null };
+      },
+    },
+  });
+  await fixture.start();
+  const inspection = fixture.proc.inspectCleanRestartQualification({
+    expectedActivityEpoch: fixture.proc.activityEpoch,
+  });
+  await listEntered.promise;
+  fixture.proc.state = 'BackgroundWorking';
+  fixture.proc.activityEpoch += 1;
+  releaseList.resolve();
+
+  await assert.rejects(
+    inspection,
+    (error) => error.code === 'CODEX_QUALIFICATION_FENCE',
+  );
+  await fixture.proc.kill();
+});
+
+test('clean restart qualification rejects nonzero and incomplete terminal registries with one read', async (t) => {
+  for (const [name, page, reason, expectedCalls, expectedComplete] of [
+    ['nonzero registry', { count: 1, nextCursor: null }, 'background-terminals', 1, true],
+    ['nonzero registry with cursor', { count: 1, nextCursor: 'page-2' }, 'background-terminals', 1, false],
+    ['incomplete pagination', { count: 0, nextCursor: 'page-2' }, 'pagination-incomplete', 1, false],
+  ]) {
+    await t.test(name, async () => {
+      let calls = 0;
+      const fixture = makeProcess({
+        handlers: {
+          'thread/backgroundTerminals/list': async (params) => {
+            calls += 1;
+            assert.equal(params.cursor, undefined);
+            return page;
+          },
+        },
+      });
+      await fixture.start();
+
+      const result = await fixture.proc.inspectCleanRestartQualification({
+        expectedActivityEpoch: fixture.proc.activityEpoch,
+      });
+
+      assert.equal(result.outcome, 'mismatch');
+      assert.equal(Number.isSafeInteger(result.observedAtMs), true);
+      assert.equal(result.reason, reason);
+      assert.equal(result.backgroundTerminalRegistryComplete, expectedComplete);
+      assert.equal(calls, expectedCalls);
+      await fixture.proc.kill();
+    });
+  }
+});
+
+test('clean restart qualification rejects failed and malformed terminal registry reads', async (t) => {
+  for (const [name, handler] of [
+    ['request failure', async () => {
+      throw new Error('registry unavailable');
+    }],
+    ['non-integer count', async () => ({ count: '0', nextCursor: null })],
+    ['non-string cursor', async () => ({ count: 0, nextCursor: 1 })],
+  ]) {
+    await t.test(name, async (subtest) => {
+      const fixture = makeProcess({
+        handlers: {
+          'thread/backgroundTerminals/list': handler,
+        },
+      });
+      subtest.after(() => fixture.proc.kill());
+      await fixture.start();
+
+      await assert.rejects(
+        fixture.proc.inspectCleanRestartQualification({
+          expectedActivityEpoch: fixture.proc.activityEpoch,
+        }),
+        (error) => error.code === 'CODEX_QUALIFICATION_FAILED',
+      );
+    });
+  }
+});
+
 test('Codex attachment accepts schema-optional effort without containment', async (t) => {
   for (const method of ['thread/start', 'thread/resume']) {
     for (const absence of ['omitted', 'null']) {

@@ -1465,6 +1465,75 @@ test('notifications are projected, noisy methods are dropped, and sensitive fiel
   assert.doesNotMatch(JSON.stringify(notifications), new RegExp(secret));
 });
 
+// Codex emits these whenever the active config enables hooks. Orchestra
+// deliberately does not consume hook detail — turn status stays the
+// authoritative signal — so the run summary is dropped before projection
+// instead of faulting an otherwise healthy turn. The payloads below carry the
+// pinned `HookRunSummary` shape, with the operator-controlled handler path and
+// hook output text standing in for the sensitive fields a real run exposes.
+test('Codex hook lifecycle notifications drop instead of faulting the turn', async (t) => {
+  const secret = 'SECRET_HOOK_PATH_AND_OUTPUT';
+  const notifications = [];
+  const hookRun = {
+    id: 'hook-run-1',
+    displayOrder: 0,
+    eventName: 'preToolUse',
+    executionMode: 'sync',
+    handlerType: 'command',
+    scope: 'turn',
+    source: 'user',
+    sourcePath: `/Users/example/.codex/hooks/${secret}.toml`,
+    // Hook run timestamps are epoch seconds; only the `*Ms` fields are millis.
+    startedAt: 1_785_226_000,
+  };
+  const harness = createHarness(t, {
+    methods: {
+      'config/read': {
+        beforeResponseMessages: [{
+          method: 'hook/started',
+          emittedAtMs: 1_785_226_000_000,
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            run: { ...hookRun, status: 'running', entries: [] },
+          },
+        }, {
+          method: 'hook/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            run: {
+              ...hookRun,
+              status: 'completed',
+              statusMessage: secret,
+              completedAt: 1_785_226_002,
+              durationMs: 1_500,
+              entries: [
+                { kind: 'context', text: secret },
+                { kind: 'warning', text: secret },
+              ],
+            },
+          },
+        }],
+      },
+    },
+  });
+  const client = harness.makeClient({
+    onNotification: async (notification) => {
+      notifications.push(notification);
+    },
+  });
+  await client.start();
+  const result = await client.request('config/read', {
+    cwd: harness.cwd,
+    includeLayers: true,
+  });
+
+  assert.ok(result);
+  assert.deepEqual(notifications, []);
+  client.assertHealthy();
+});
+
 test('notification envelope rejects malformed timestamps and unknown fields', async (t) => {
   const cases = [{
     name: 'string timestamp',
@@ -1996,36 +2065,45 @@ test('an unknown server request faults while a client RPC is pending', async (t)
 });
 
 test('unknown notifications fault without exposing their payload', async (t) => {
-  const harness = createHarness(t, {
-    methods: {
-      'config/read': {
-        beforeResponseMessages: [{
-          method: 'thread/experimental/unknown',
-          params: {
-            command: 'SECRET_UNKNOWN_COMMAND',
-            cwd: 'SECRET_UNKNOWN_CWD',
+  // The `hook/` case pins that dropping the two known hook notifications did
+  // not widen into tolerance for the whole namespace.
+  for (const method of [
+    'thread/experimental/unknown',
+    'hook/experimental/unknown',
+  ]) {
+    await t.test(method, async (subtest) => {
+      const harness = createHarness(subtest, {
+        methods: {
+          'config/read': {
+            beforeResponseMessages: [{
+              method,
+              params: {
+                command: 'SECRET_UNKNOWN_COMMAND',
+                cwd: 'SECRET_UNKNOWN_CWD',
+              },
+            }],
+            hold: true,
           },
-        }],
-        hold: true,
-      },
-    },
-  });
-  const client = harness.makeClient();
-  await client.start();
-  const error = await client.request('config/read', {
-    cwd: harness.cwd,
-    includeLayers: true,
-  }).then(
-    () => null,
-    (caught) => caught,
-  );
-  assert.ok(error);
-  assert.equal(error.code, 'CODEX_PROTOCOL_ERROR');
-  assert.doesNotMatch(
-    `${error.message} ${error.cause?.message ?? ''}`,
-    /SECRET_UNKNOWN_COMMAND|SECRET_UNKNOWN_CWD/,
-  );
-  assert.throws(() => client.assertHealthy());
+        },
+      });
+      const client = harness.makeClient();
+      await client.start();
+      const error = await client.request('config/read', {
+        cwd: harness.cwd,
+        includeLayers: true,
+      }).then(
+        () => null,
+        (caught) => caught,
+      );
+      assert.ok(error);
+      assert.equal(error.code, 'CODEX_PROTOCOL_ERROR');
+      assert.doesNotMatch(
+        `${error.message} ${error.cause?.message ?? ''}`,
+        /SECRET_UNKNOWN_COMMAND|SECRET_UNKNOWN_CWD/,
+      );
+      assert.throws(() => client.assertHealthy());
+    });
+  }
 });
 
 test('pending request cap rejects before writing another request', async (t) => {

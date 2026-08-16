@@ -740,3 +740,162 @@ prepared/write-attempted/response-observed ledger, Codex-owned retry rule,
 unknown-effect non-replay rule, immutable model/effort thread policy, exact
 profile provenance, one-live daemon lease, and accepted quarantine contract.
 No Orchestra backend or Claude behavior has been changed by U1.
+
+## Credential-free hook notification probe passed
+
+Codex 0.145.0 emits `hook/started` and `hook/completed` whenever the active
+configuration enables hooks. `lib/codex/protocol-schema.json` lists both as
+dropped server notifications and `lib/codex/app-server-client.js` enforces that
+drop. The characterization allowlist in `scripts/spikes/codex-app-server-rpc.mjs`
+admits the same two methods without retaining them. Every other `hook/*` method
+remains an exact-match fail-closed protocol fault; that is proved
+deterministically by "Codex U1a faults a well-formed but unlisted hook
+notification" in `tests/codex-app-server-spike.test.js` rather than by a live
+peer.
+
+`scripts/spikes/codex-app-server-hook-probe.mjs` is the reproducible gate:
+
+```sh
+node scripts/spikes/codex-app-server-hook-probe.mjs \
+  --binary /absolute/versioned/path/to/codex \
+  --probe-root /absolute/non-temporary/probe-root
+```
+
+It exits 0 only when every gate check passes, and deliberately exits 1
+otherwise, including on a thrown failure.
+
+Containment holds on the complete successful envelope, not only on failure, and
+it is a closed-key projection rather than denylist filtering. Every emitted
+object is built key by key from an approved name list with an approved scalar
+type; no evidence-derived object is ever spread. An unapproved key is therefore
+dropped and cannot be emitted whatever it contains, including benign plain text
+no regex would catch. An approved slot holding a wrong type or an
+off-enum value collapses the whole result to a content-free `STOP` with a
+category. Raw turn ids are stripped from both lanes. The trailing
+content-free assertion is retained as defense in depth, not as the mechanism.
+
+Nothing raw is persisted. The hook handler parses stdin in place and writes only
+closed fields — event name, whether a `turn_id` was supplied, and its SHA-256 —
+so the user prompt, cwd, and transcript path never reach disk, and no raw turn
+id is stored. The raw JSON-RPC lane routes each response directly to its pending
+request and keeps no session-wide result cache; a result exists only as a local
+value for the duration of that request, and callers digest or project what they
+need and discard the rest. Only bounded closed-field summaries survive the
+request.
+
+### What the authoritative lane is
+
+The hooks-on and hooks-off lanes drive the production `CodexAppServerClient`
+with the real `attestPinnedCodexBinary` target-pin attestation, an isolated
+mode-0700 owned `codexHome`, the exact `expectedConfigSha256`, and the
+production delivery-checkpoint ledger. Each lane awaits an actual delivered
+`turn/completed` rather than sleeping. The gate therefore fails if the
+production schema-backed boundary breaks, even when a raw stdio session would
+still have completed.
+
+The hooks-off control lane is held to the same predicates as hooks-on —
+completed status, an assistant item, no fault, and the same three-way
+start/started/completed identity equality — and additionally must see no hook
+traffic at all.
+
+A raw stdio session remains only as a secondary characterization of the payloads
+the production client intentionally drops. Its outcome can never satisfy
+authoritative completion: the gate requires
+`authoritative.source === 'production-client'`.
+
+That session enforces the same exact envelope key sets the production client
+accepts — `{id, result}` / `{id, error}` for responses and
+`{method, params, emittedAtMs}` for notifications. Ambiguous response and
+notification shapes, arbitrary extra top-level members, unlisted notification
+methods, and unexpected response ids all fail closed. It bounds stdout lines,
+undelimited partials, aggregate bytes, message count and stderr bytes; on stream
+end it flushes the decoder and fails on a trailing partial or on EOF with
+requests still pending. Its terminal failure is re-checked **after** child
+teardown and stream drain, so malformed bytes that arrive while the child is
+being killed cannot be reported as success. Cleanup signals the owned process
+group, and proves the group is empty by enumerating it with
+`/bin/ps -axo pid=,pgid=` — the same mechanism the U1b effect proxy uses —
+rather than trusting leader exit alone; an exit or a non-empty group that cannot
+be proved is a `cleanup` failure.
+
+Close-time faults count. The production lane reads its settled fault outcome
+**after** `client.close()`, so a fault the client delivers during close cannot
+be lost, and a close failure is reported rather than swallowed. Loopback
+provider shutdown force-closes idle and active connections under a bound; a
+provider close rejection or timeout yields a content-free `cleanup` STOP even
+when the lanes themselves passed. Probe-root creation and provider acquisition
+both sit inside nested guards so scratch removal always runs.
+
+The turn completes against a loopback Responses provider declaring
+`requires_openai_auth = false`, inside homes that contain no `auth.json`.
+Credential-free is a property of that construction, gated on those two concrete
+conditions, not an observation of file reads. No product credential is read,
+copied, or required, and no existing Codex home is touched.
+
+### Observed
+
+- both lanes reached delivered `turn/completed` status `completed` with an
+  assistant item and no fault;
+- the `turn/start` response id, the single delivered `turn/started.params.turn.id`,
+  and the completed turn id were equal;
+- no `hook/*` method reached the production delivered notification sink in
+  either lane;
+- the exact configured event multiset (`sessionStart`, `userPromptSubmit`)
+  appeared, each with exactly one `hook/started` (`running`) followed by one
+  `hook/completed` (`completed`), all timestamps 10-digit epoch seconds;
+- exactly one hook stdin capture existed per configured event, counted from
+  per-invocation capture files rather than a last-writer-wins name, so a
+  repeated invocation fails the gate;
+- the owned `config.toml` digest was byte-identical across each lane run;
+- removing only the two schema drop entries flipped the gate to `STOP` with
+  `authoritative.faultCategory` `protocol` and exit 1, while the hooks-off
+  control stayed fault-free;
+- no probe directory or child process survived either a passing or a failing
+  run.
+
+### Two distinct turn identities
+
+App-server notification `params.turnId` and hook stdin `turn_id` are different
+surfaces and must not be conflated.
+
+- `params.turnId` rides on the `hook/started` and `hook/completed`
+  notifications, which the production client drops. It is characterized only in
+  the secondary raw lane, which runs its own separate turn: the probe emits
+  `notificationTurnIdMatchesRawTurn`, a boolean comparing the digest of each
+  hook notification's `params.turnId` against the digest of *that lane's* own
+  `turn/start` turn id. It is deliberately not compared against the
+  authoritative lane's turn, which belongs to a different turn entirely.
+- Hook stdin `turn_id` is supplied to the hook process itself. The probe proves
+  from the authoritative lane's own captures that `userPromptSubmit` stdin
+  `turn_id` equals the authoritative turn id. It is **absent** for
+  `sessionStart`, whose stdin carries `cwd`, `hook_event_name`, `model`,
+  `permission_mode`, `session_id`, `source`, and `transcript_path` but no
+  `turn_id`. Hook stdin identifies the thread as `session_id`, not `thread_id`.
+
+The probe requires the `sessionStart` capture to exist while omitting
+`turn_id`; a missing capture fails. It records that event as
+`present-without-turn-id`, never as a satisfied equality. Any receipt design
+keyed on hook stdin `turn_id` must select an event that supplies one; a
+`sessionStart` hook cannot discharge that correlation.
+
+### What the config digest does and does not attest
+
+The probe drives the full drift sequence and gates every step: hooks are
+discovered `untrusted`, rendered `trusted`, then the hook handler is mutated.
+After mutation `hooks/list` reports a new `currentHash` and `trustStatus:
+modified` **while `config.toml` and its digest are unchanged**. Only after the
+new trusted hash is re-rendered does the owned-config digest change and the hook
+return to `trusted`/enabled.
+
+Digest-only attestation therefore does not detect an un-rendered hook-file
+mutation; the `trustStatus` returned by `hooks/list` is the signal that does.
+
+Scope limits. This is a protocol-boundary and correlation result, not a hosted
+product result: the completed turn is served by a loopback provider, not by the
+real model backend. `CodexProcess` is not exercised; `CodexAppServerClient` is
+the smallest production boundary for this two-method change. The named-profile
+checker (`scripts/spikes/codex-app-server-real.mjs`) still rejects any
+configuration where `effective.hooks != null`, so the reviewed hook-free
+validation profile above is unchanged and was not re-run with hooks. A
+hook-enabled authenticated run against the hosted backend, and the
+wrapper/absolute-binary-path rejection, remain unproved here.

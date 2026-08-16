@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import readline from 'node:readline';
+import { StringDecoder } from 'node:string_decoder';
 
 const RPC_TIMEOUT_MS = 20_000;
 const MAX_SERVER_LINE_BYTES = 1024 * 1024;
@@ -57,6 +57,8 @@ const ALLOWED_SERVER_NOTIFICATION_METHODS = new Set([
   'item/reasoning/summaryTextDelta',
   'item/reasoning/summaryPartAdded',
   'item/reasoning/textDelta',
+  'hook/started',
+  'hook/completed',
   'command/exec/outputDelta',
   'process/outputDelta',
   'process/exited',
@@ -387,16 +389,21 @@ export class AppServerConnection {
     this.onRetainedNotification = onRetainedNotification;
     this.characterizeExperimentalSettings = characterizeExperimentalSettings;
     this.retainTurnStarted = retainTurnStarted;
-    this.lines = readline.createInterface({ input: this.child.stdout });
+    // Decoded per chunk rather than per line: a line-oriented reader applies
+    // its size bound only once a newline arrives, so an undelimited payload
+    // could grow the buffer without limit before any check ran.
+    this.stdoutDecoder = new StringDecoder('utf8');
+    this.stdoutBuffer = '';
     this.outputClosed = new Promise((resolvePromise) => {
-      this.lines.once('close', () => {
+      this.child.stdout.once('end', () => {
+        this.stdoutBuffer += this.stdoutDecoder.end();
         resolvePromise();
         if (!this.closing && !this.closed) {
           this.#failProtocol(new Error('app-server output closed'));
         }
       });
     });
-    this.lines.on('line', (line) => this.#handleLine(line));
+    this.child.stdout.on('data', (chunk) => this.#onStdoutData(chunk));
     this.child.stderr.on('data', () => {
       this.stderrSeen = true;
     });
@@ -455,6 +462,27 @@ export class AppServerConnection {
       }
     }
     this.child.kill(signal);
+  }
+
+  #onStdoutData(chunk) {
+    if (this.closed || this.protocolError) return;
+    this.stdoutBuffer += typeof chunk === 'string'
+      ? chunk
+      : this.stdoutDecoder.write(chunk);
+    let newline;
+    while ((newline = this.stdoutBuffer.indexOf('\n')) !== -1) {
+      let line = this.stdoutBuffer.slice(0, newline);
+      this.stdoutBuffer = this.stdoutBuffer.slice(newline + 1);
+      if (line.endsWith('\r')) line = line.slice(0, -1);
+      this.#handleLine(line);
+      if (this.protocolError) return;
+    }
+    if (Buffer.byteLength(this.stdoutBuffer) > MAX_SERVER_LINE_BYTES) {
+      this.stdoutBuffer = '';
+      this.#failProtocol(
+        new Error('app-server partial line exceeded the size limit'),
+      );
+    }
   }
 
   #handleLine(line) {

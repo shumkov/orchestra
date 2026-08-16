@@ -4233,6 +4233,50 @@ test('Codex U1a rejects oversized server lines without retaining their payload',
   assert.equal(connection.notifications.length, 0);
 });
 
+// A line-oriented reader only applies its bound once a newline arrives, so a
+// peer that never sends one can grow the buffer without limit. The bound has to
+// hold on the undelimited partial too, matching the production client.
+test('Codex U1a rejects an oversized partial line that never terminates', async (t) => {
+  const { AppServerConnection } = await import(spikeUrl);
+  const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-partial-line-test-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const fakeServer = path.join(scratch, 'fake-app-server.mjs');
+  writeFileSync(
+    fakeServer,
+    [
+      "import readline from 'node:readline';",
+      'const lines = readline.createInterface({ input: process.stdin });',
+      "lines.once('line', () => {",
+      // Deliberately newline-free: the payload must be rejected on its own.
+      "  process.stdout.write(`{\"method\":\"warning\",\"params\":{\"message\":\"SECRET_${'X'.repeat(1_100_000)}`);",
+      '});',
+      'setInterval(() => {}, 1_000);',
+      '',
+    ].join('\n'),
+  );
+  const connection = new AppServerConnection(
+    {
+      binary: fakeServer,
+      launcher: process.execPath,
+      workspace: scratch,
+    },
+    { PATH: process.env.PATH ?? '' },
+  );
+  t.after(() => connection.close());
+
+  const error = await connection.request('config/read', {
+    cwd: scratch,
+    includeLayers: true,
+  }, 4_000).then(
+    () => null,
+    (caught) => caught,
+  );
+  assert.ok(error);
+  assert.match(error.message, /partial line exceeded the size limit/);
+  assert.doesNotMatch(error.message, /SECRET_/);
+  assert.equal(connection.notifications.length, 0);
+});
+
 test('Codex U1a characterizes ordered semantic steering and definite stale rejection', async () => {
   const { characterizeActiveTurnSteering } = await import(spikeUrl);
   const pendingSteers = [];

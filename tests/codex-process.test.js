@@ -5880,3 +5880,54 @@ test('real U2 client checkpoints containment before closing on response durabili
     `U2 closed before U3 made containment visible: ${order}`,
   );
 });
+
+// The durable `turn-accepted` checkpoint is the record a hook-trust design has
+// to position itself against: it is recorded after the turn/start response is
+// validated and before the turn/started confirmation is awaited. Delivering
+// turn/started only after the checkpoint has been observed is what proves the
+// checkpoint does not wait on it — if the two were reordered, this test would
+// deadlock rather than merely disagree.
+test('turn-accepted is checkpointed after the turn/start response and before the turn/started await', async () => {
+  const order = [];
+  const checkpointed = deferred();
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind !== 'turn-accepted') return;
+      order.push(`turn-accepted:${checkpoint.turnId}`);
+      checkpointed.resolve();
+    },
+    handlers: {
+      'turn/start': async () => {
+        order.push('turn-start-response');
+        return {
+          turn: {
+            id: 'turn-ordering',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('ordering');
+  const reached = await Promise.race([
+    checkpointed.promise.then(() => 'checkpointed'),
+    new Promise((resolve) => setTimeout(() => resolve('not-checkpointed'), 2_000)),
+  ]);
+  assert.equal(
+    reached,
+    'checkpointed',
+    'turn-accepted must be durable before turn/started is awaited',
+  );
+  order.push('turn-started-delivered');
+  await startTurnAndComplete(fixture.client, { turnId: 'turn-ordering' });
+  await send;
+  assert.deepEqual(order, [
+    'turn-start-response',
+    'turn-accepted:turn-ordering',
+    'turn-started-delivered',
+  ]);
+  await fixture.proc.kill();
+});

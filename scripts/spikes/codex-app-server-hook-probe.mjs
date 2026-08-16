@@ -468,7 +468,7 @@ export function buildResultEnvelope(evidence) {
 
 const wait = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 
-function startLoopbackProvider() {
+export function startLoopbackProvider() {
   const sse = (type, payload) => `event: ${type}\ndata: ${JSON.stringify(payload)}\n\n`;
   const server = createServer((request, response) => {
     let body = 0;
@@ -678,8 +678,16 @@ export async function withRawSession(
       const request = pending.get(message.id);
       if (!request) return fail('framing', 'raw-unexpected-response-id');
       pending.delete(message.id);
-      if (hasError) request.reject(probeFailure('protocol', request.stage));
-      else request.resolve(message.result);
+      if (hasError) {
+        const rejection = probeFailure('protocol', request.stage);
+        // The numeric JSON-RPC code distinguishes an unlisted method from a
+        // rejected params shape. Only a validated integer is carried; the
+        // peer's message and data are discarded with this frame.
+        rejection.rpcErrorCode = Number.isSafeInteger(message.error?.code)
+          ? message.error.code
+          : null;
+        request.reject(rejection);
+      } else request.resolve(message.result);
       return undefined;
     }
     if (!hasMethod) return fail('framing', 'raw-unknown-envelope');

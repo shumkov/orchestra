@@ -1094,3 +1094,51 @@ test('trusted hook state renders each discovered hook and refuses incomplete inp
     /missing its key or current hash/,
   );
 });
+
+// A rejected request has to be distinguishable by cause — an unlisted method
+// is a different fact from a rejected params shape — but the peer's message
+// and data are free text and must not survive the frame that carried them.
+test('a rejected request carries its numeric code and none of the peer text', async (t) => {
+  const { withRawSession, categorizeFailure } = await import(probeUrl);
+  const { scratch, peer } = rawPeerSession(t, [
+    "import readline from 'node:readline';",
+    'const lines = readline.createInterface({ input: process.stdin });',
+    "lines.once('line', (line) => {",
+    '  const message = JSON.parse(line);',
+    "  process.stdout.write(JSON.stringify({ id: message.id, error: { code: -32602, message: 'SENTINEL_RPC_MESSAGE /Users/example/x.toml', data: { detail: 'SENTINEL_RPC_DATA' } } }) + '\\n');",
+    '});',
+    'setInterval(() => {}, 1_000);',
+  ]);
+  const error = await withRawSession(
+    rawPeerOptions(scratch, peer),
+    async (session) => session.request('hooks/list', {}, 'test', 4_000),
+  ).then(() => null, (caught) => caught);
+  assert.ok(error, 'an error response must reject its request');
+  assert.equal(categorizeFailure(error), 'protocol');
+  assert.equal(error.rpcErrorCode, -32602, 'the numeric code identifies the cause');
+  assert.doesNotMatch(
+    JSON.stringify({ message: error.message, stage: error.probeStage, ...error }),
+    /SENTINEL_|Users|x\.toml/,
+    'no peer-supplied message or data may survive the rejection',
+  );
+});
+
+test('a rejection without a usable numeric code reports no code rather than a guess', async (t) => {
+  const { withRawSession } = await import(probeUrl);
+  const { scratch, peer } = rawPeerSession(t, [
+    "import readline from 'node:readline';",
+    'const lines = readline.createInterface({ input: process.stdin });',
+    "lines.once('line', (line) => {",
+    '  const message = JSON.parse(line);',
+    "  process.stdout.write(JSON.stringify({ id: message.id, error: { code: 'SENTINEL_CODE', message: 'nope' } }) + '\\n');",
+    '});',
+    'setInterval(() => {}, 1_000);',
+  ]);
+  const error = await withRawSession(
+    rawPeerOptions(scratch, peer),
+    async (session) => session.request('hooks/list', {}, 'test', 4_000),
+  ).then(() => null, (caught) => caught);
+  assert.ok(error);
+  assert.equal(error.rpcErrorCode, null, 'a non-integer code is not carried');
+  assert.doesNotMatch(JSON.stringify({ ...error, message: error.message }), /SENTINEL_/);
+});

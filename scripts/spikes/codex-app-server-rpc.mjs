@@ -57,6 +57,8 @@ const ALLOWED_SERVER_NOTIFICATION_METHODS = new Set([
   'item/reasoning/summaryTextDelta',
   'item/reasoning/summaryPartAdded',
   'item/reasoning/textDelta',
+  'hook/started',
+  'hook/completed',
   'command/exec/outputDelta',
   'process/outputDelta',
   'process/exited',

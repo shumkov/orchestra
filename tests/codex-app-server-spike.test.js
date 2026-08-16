@@ -4154,6 +4154,50 @@ test('Codex U1a faults an unknown inbound experimental notification without leak
   assert.doesNotMatch(error.message, /SECRET_METHOD|SECRET_COMMAND|SECRET_CWD/);
 });
 
+// The case above carries a newline, so it is rejected as a malformed method
+// before the allowlist is consulted. This one is a syntactically valid method
+// name, so it reaches the allowlist and pins that admitting the two known hook
+// notifications did not admit the whole `hook/` namespace.
+test('Codex U1a faults a well-formed but unlisted hook notification', async (t) => {
+  const { AppServerConnection } = await import(spikeUrl);
+  const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-hook-allowlist-test-'));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const fakeServer = path.join(scratch, 'fake-app-server.mjs');
+  writeFileSync(
+    fakeServer,
+    [
+      "import readline from 'node:readline';",
+      'const lines = readline.createInterface({ input: process.stdin });',
+      "lines.once('line', () => {",
+      '  process.stdout.write(`${JSON.stringify({',
+      "    method: 'hook/experimental/unknown',",
+      "    params: { command: 'SECRET_HOOK_COMMAND', cwd: 'SECRET_HOOK_CWD' },",
+      '  })}\\n`);',
+      '});',
+      '',
+    ].join('\n'),
+  );
+  const connection = new AppServerConnection(
+    {
+      binary: fakeServer,
+      launcher: process.execPath,
+      workspace: scratch,
+    },
+    { PATH: process.env.PATH ?? '' },
+  );
+  t.after(() => connection.close());
+
+  const error = await connection.request('config/read', {
+    cwd: scratch,
+    includeLayers: true,
+  }, 1_000).then(
+    () => null,
+    (caught) => caught,
+  );
+  assert.match(error.message, /unexpected server notification/);
+  assert.doesNotMatch(error.message, /SECRET_HOOK_COMMAND|SECRET_HOOK_CWD/);
+});
+
 test('Codex U1a drops noisy notification payloads', async (t) => {
   const { AppServerConnection } = await import(spikeUrl);
   const scratch = mkdtempSync(path.join(tmpdir(), 'orchestra-codex-u1a-notification-bound-test-'));
@@ -4170,6 +4214,19 @@ test('Codex U1a drops noisy notification payloads', async (t) => {
       "    method: 'item/commandExecution/outputDelta',",
       "    params: { delta: 'SECRET_OUTPUT', threadId: 'thread-1', turnId: 'turn-1' },",
       '  })}\\n`);',
+      // Hook runs are allowed but never retained, so an enabled-hook turn must
+      // neither fault the spike nor land its handler path in the evidence.
+      "  const run = { id: 'hook-run-1', displayOrder: 0, eventName: 'preToolUse',",
+      "    executionMode: 'sync', handlerType: 'command', scope: 'turn',",
+      "    source: 'user', sourcePath: '/Users/example/.codex/hooks/SECRET_HOOK.toml',",
+      '    startedAt: 1785226000 };',
+      "  for (const [method, status] of [['hook/started', 'running'], ['hook/completed', 'completed']]) {",
+      '    process.stdout.write(`${JSON.stringify({',
+      '      method,',
+      "      params: { threadId: 'thread-1', turnId: 'turn-1', run: { ...run, status,",
+      "        entries: [{ kind: 'context', text: 'SECRET_HOOK_OUTPUT' }] } },",
+      '    })}\\n`);',
+      '  }',
       '  process.stdout.write(`${JSON.stringify({ id: request.id, result: {} })}\\n`);',
       '});',
       '',
@@ -4189,7 +4246,16 @@ test('Codex U1a drops noisy notification payloads', async (t) => {
     cwd: scratch,
     includeLayers: true,
   }, 1_000), {});
-  assert.doesNotMatch(JSON.stringify(connection.notifications), /SECRET_OUTPUT/);
+  assert.doesNotMatch(
+    JSON.stringify(connection.notifications),
+    /SECRET_OUTPUT|SECRET_HOOK/,
+  );
+  assert.deepEqual(
+    connection.notifications
+      .map((notification) => notification.method)
+      .filter((method) => method.startsWith('hook/')),
+    [],
+  );
 });
 
 test('Codex U1a rejects oversized server lines without retaining their payload', async (t) => {

@@ -157,6 +157,8 @@
     "item/reasoning/summaryTextDelta",
     "item/reasoning/summaryPartAdded",
     "item/reasoning/textDelta",
+    "hook/started",
+    "hook/completed",
     "warning",
     "deprecationNotice",
     "configWarning",

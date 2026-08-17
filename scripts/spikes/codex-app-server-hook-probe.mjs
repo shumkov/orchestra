@@ -755,12 +755,10 @@ export async function withRawSession(
   // holding the descriptor — including any inherited grandchild — to close it.
   let stdoutDrained = false;
   const stdoutDrain = new Promise((resolvePromise) => {
-    const settle = () => {
+    child.stdout.once('end', () => {
       stdoutDrained = true;
       resolvePromise();
-    };
-    child.stdout.once('end', settle);
-    child.stdout.once('close', settle);
+    });
   });
   child.stdout.on('end', () => {
     // Flush the decoder: a trailing partial or unfinished work at EOF is a

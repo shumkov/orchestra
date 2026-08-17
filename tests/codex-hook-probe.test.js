@@ -824,10 +824,10 @@ test('the raw session rejects unsupported envelope keys and versions', async (t)
 // session; a body that already resolved cannot mask it.
 test('the raw session fails closed on malformed bytes that arrive during teardown', async (t) => {
   const { withRawSession, categorizeFailure } = await import(probeUrl);
-  // Scheduling-independent by construction: a grandchild inherits stdout and
-  // writes strictly after the session child has exited, so the bytes cannot be
-  // caught by waiting on child exit plus a fixed number of event-loop ticks.
-  // Only awaiting a real stdout end/drain observes them.
+  // Scheduling-independent by construction: a detached grandchild inherits
+  // stdout and writes strictly after the session child has exited. Keeping it
+  // outside the owned process group prevents teardown from killing the test
+  // writer before it can exercise the stdout-drain boundary.
   const { scratch, peer } = rawPeerSession(t, [
     "import readline from 'node:readline';",
     "import { spawn } from 'node:child_process';",
@@ -835,8 +835,8 @@ test('the raw session fails closed on malformed bytes that arrive during teardow
     "lines.once('line', () => {",
     "  process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');",
     "  process.on('SIGTERM', () => {",
-    "    spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setTimeout(() => { require('node:fs').writeSync(1, 'garbage after exit\\\\n'); process.exit(0); }, 250);\"], { stdio: ['ignore', 'inherit', 'ignore'], detached: false });",
-    '    process.exit(0);',
+    "    const writer = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setTimeout(() => { require('node:fs').writeSync(1, 'garbage after exit\\\\n'); process.exit(0); }, 250);\"], { stdio: ['ignore', 'inherit', 'ignore'], detached: true });",
+    "    writer.once('spawn', () => process.exit(0));",
     '  });',
     '});',
     'setInterval(() => {}, 1_000);',

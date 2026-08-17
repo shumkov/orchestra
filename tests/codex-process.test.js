@@ -2434,7 +2434,7 @@ test('a checkpoint failure after dispatch is typed, non-replayable, and refuses 
   await fixture.proc.kill();
 });
 
-test('prepared and write-attempt checkpoint failures are safe-not-sent but block later work', async (t) => {
+test('rollback-proven preparation and write-attempt failures block later work', async (t) => {
   for (const failedKind of ['request-prepared', 'request-write-attempted']) {
     await t.test(failedKind, async () => {
       let failTurn = false;
@@ -2445,7 +2445,11 @@ test('prepared and write-attempt checkpoint failures are safe-not-sent but block
             && checkpoint.method === 'turn/start'
             && checkpoint.kind === failedKind
           ) {
-            throw new Error('durability unavailable');
+            const error = new Error('durability unavailable');
+            if (failedKind === 'request-prepared') {
+              error.checkpointDisposition = 'not-committed';
+            }
+            throw error;
           }
         },
       });
@@ -3904,9 +3908,15 @@ test('stop during a prepared turn start durably cancels without dispatching the 
   const send = fixture.proc.send('cancel before dispatch');
   await prepared.promise;
 
-  assert.equal(await fixture.proc.interrupt(), true);
-  await assert.rejects(send, (error) => error.code === 'INTERRUPTED');
+  let stopSettled = false;
+  const stop = fixture.proc.interrupt().finally(() => {
+    stopSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stopSettled, false);
   releasePrepared.resolve();
+  assert.equal(await stop, true);
+  await assert.rejects(send, (error) => error.code === 'INTERRUPTED');
   await new Promise((resolve) => setImmediate(resolve));
 
   assert.equal(
@@ -3914,6 +3924,489 @@ test('stop during a prepared turn start durably cancels without dispatching the 
     false,
   );
   assert.equal(fixture.proc.state, 'Stopped');
+  await fixture.proc.kill();
+});
+
+test('clean restart interrupts a turn still attesting without inventing a durable attempt', async () => {
+  const attestorEntered = deferred();
+  const releaseAttestor = deferred();
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (checkpoint.kind === 'active-start-cancelled') {
+        const error = new Error('cannot cancel a missing prepared attempt');
+        error.code = 'MISSING_PREPARED_ATTEMPT';
+        throw error;
+      }
+    },
+    processOptions: {
+      staticPolicyAttestor: async () => {
+        attestorEntered.resolve();
+        await releaseAttestor.promise;
+      },
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('cancel during policy attestation');
+  const sendRejected = assert.rejects(
+    send,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  await attestorEntered.promise;
+
+  assert.equal(await fixture.proc.interrupt('clean-restart'), true);
+  await sendRejected;
+  assert.equal(fixture.proc.state, 'Stopped');
+  assert.equal(fixture.proc.current, null);
+  assert.equal(
+    checkpoints.some(
+      ({ kind, method }) => kind === 'request-prepared' && method === 'turn/start',
+    ),
+    false,
+  );
+  assert.equal(
+    checkpoints.some(({ kind }) => kind === 'active-start-cancelled'),
+    false,
+  );
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+
+  releaseAttestor.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fixture.proc.state, 'Stopped');
+  assert.equal(fixture.proc.current, null);
+  assert.equal(
+    checkpoints.some(
+      ({ kind, method }) => kind === 'request-prepared' && method === 'turn/start',
+    ),
+    false,
+  );
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+  await fixture.proc.kill();
+});
+
+test('clean restart waits for a committed turn preparation before cancelling it', async () => {
+  const preparationEntered = deferred();
+  const releasePreparation = deferred();
+  let preparationCommitted = false;
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (
+        checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        preparationEntered.resolve();
+        await releasePreparation.promise;
+        preparationCommitted = true;
+      }
+      if (
+        checkpoint.kind === 'active-start-cancelled'
+        && !preparationCommitted
+      ) {
+        throw new Error('attempt cancellation preceded preparation commit');
+      }
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('cancel after preparation commits');
+  const sendRejected = assert.rejects(
+    send,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  await preparationEntered.promise;
+  let stopSettled = false;
+  const stop = fixture.proc.interrupt('clean-restart').finally(() => {
+    stopSettled = true;
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(stopSettled, false);
+  releasePreparation.resolve();
+  assert.equal(await stop, true);
+  await sendRejected;
+  assert.equal(
+    checkpoints.filter(({ kind }) => kind === 'active-start-cancelled').length,
+    1,
+  );
+  assert.equal(
+    checkpoints.find(({ kind }) => kind === 'active-start-cancelled').reason,
+    'clean-restart',
+  );
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+  await fixture.proc.kill();
+});
+
+test('turn preparation distinguishes rollback proof from an unknown checkpoint outcome', async (t) => {
+  for (const [name, checkpointDisposition, expectedState] of [
+    ['explicit not-committed', 'not-committed', 'DurabilityBlocked'],
+    ['untyped rejection', undefined, 'ContainmentFailed'],
+  ]) {
+    await t.test(name, async () => {
+      const preparationEntered = deferred();
+      const releasePreparation = deferred();
+      const checkpoints = [];
+      const rootCause = new Error(`${name} root cause`);
+      if (checkpointDisposition) {
+        rootCause.checkpointDisposition = checkpointDisposition;
+      }
+      const fixture = makeProcess({
+        checkpointSink: async (checkpoint) => {
+          checkpoints.push(checkpoint);
+          if (
+            checkpoint.kind === 'request-prepared'
+            && checkpoint.method === 'turn/start'
+          ) {
+            preparationEntered.resolve();
+            await releasePreparation.promise;
+            throw rootCause;
+          }
+        },
+      });
+      await fixture.start();
+      const send = fixture.proc.send(`checkpoint outcome: ${name}`);
+      send.catch(() => {});
+      await preparationEntered.promise;
+      const stop = fixture.proc.interrupt('clean-restart');
+      stop.catch(() => {});
+      releasePreparation.resolve();
+
+      await assert.rejects(stop, (error) => {
+        let current = error;
+        for (let depth = 0; current && depth < 8; depth += 1) {
+          if (current === rootCause) return true;
+          current = current.cause;
+        }
+        return false;
+      });
+      await assert.rejects(send);
+      assert.equal(fixture.proc.state, expectedState);
+      assert.equal(
+        checkpoints.some(({ kind }) => kind === 'active-start-cancelled'),
+        false,
+      );
+      await fixture.proc.kill();
+    });
+  }
+});
+
+test('a turn preparation with no acknowledgement enters containment on interrupt', async () => {
+  const preparationEntered = deferred();
+  const releasePreparation = deferred();
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (
+        checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        preparationEntered.resolve();
+        await releasePreparation.promise;
+      }
+    },
+    processOptions: { turnStartTimeoutMs: 10 },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('checkpoint acknowledgement is lost');
+  send.catch(() => {});
+  await preparationEntered.promise;
+
+  await assert.rejects(
+    fixture.proc.interrupt('clean-restart'),
+    (error) => error.code === 'CODEX_TURN_START_TIMEOUT',
+  );
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(
+    checkpoints.some(({ kind }) => kind === 'active-start-cancelled'),
+    false,
+  );
+  releasePreparation.resolve();
+  await assert.rejects(send);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+  await fixture.proc.kill();
+});
+
+test('interrupt in the preparation commit callback gap waits for committed proof', async () => {
+  const interruptStarted = deferred();
+  const checkpoints = [];
+  let stop;
+  let fixture;
+  fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push({
+        checkpoint,
+        deliveryState: fixture.proc.current?.startDeliveryState ?? null,
+      });
+      if (
+        checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        queueMicrotask(() => {
+          stop = fixture.proc.interrupt('clean-restart');
+          interruptStarted.resolve();
+        });
+      }
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('commit callback gap');
+  const sendRejected = assert.rejects(
+    send,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  await interruptStarted.promise;
+
+  assert.equal(await stop, true);
+  await sendRejected;
+  const [cancellation] = checkpoints.filter(
+    ({ checkpoint }) => checkpoint.kind === 'active-start-cancelled',
+  );
+  assert.equal(cancellation.checkpoint.deliveryState, 'definitely-not-sent');
+  assert.equal(cancellation.checkpoint.method, 'turn/start');
+  assert.equal(cancellation.checkpoint.reason, 'clean-restart');
+  assert.equal(
+    fixture.client.requests.some(({ method }) => method === 'turn/start'),
+    false,
+  );
+  await fixture.proc.kill();
+});
+
+test('clean restart captures an active head and durably drains queued followers in order', async () => {
+  const checkpoints = [];
+  const fixture = makeProcess({
+    processOptions: { spawnProfileId: 'profile-clean-restart' },
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+    handlers: {
+      'turn/start': async () => ({
+        turn: {
+          id: 'turn-with-followers',
+          status: 'inProgress',
+          items: [],
+          error: null,
+        },
+      }),
+      'turn/interrupt': async (_params, client) => {
+        setImmediate(() => client.notify('turn/completed', {
+          threadId: 'codex-thread',
+          turn: {
+            id: 'turn-with-followers',
+            status: 'interrupted',
+            items: [],
+            error: null,
+          },
+        }));
+        return {};
+      },
+    },
+  });
+  fixture.proc.spawnProfileId = 'profile-clean-restart';
+  await fixture.start();
+  const active = fixture.proc.send('active', {
+    context: { sourceMsgId: 44 },
+  });
+  await fixture.client.notify('turn/started', {
+    threadId: 'codex-thread',
+    turn: { id: 'turn-with-followers', status: 'inProgress' },
+  });
+  while (fixture.proc.state !== 'Active') {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const firstFollower = fixture.proc.send('first follower', {
+    context: { sourceMsgId: 45 },
+  });
+  const secondFollower = fixture.proc.send('second follower', {
+    context: { sourceMsgId: 46 },
+  });
+
+  const candidate = fixture.proc.captureCleanRestartCandidate();
+  assert.equal(candidate.sourceMsgId, 44);
+  assert.equal(candidate.providerTurnId, 'turn-with-followers');
+  assert.throws(
+    () => fixture.proc.kill(null),
+    /bounded interruption reason/,
+  );
+  await assert.rejects(
+    fixture.proc.interrupt(null),
+    /bounded interruption reason/,
+  );
+  assert.equal(fixture.proc.pendingQueue.length, 3);
+  const follower = fixture.proc.pendingQueue[1];
+  const followerIdentity = {
+    clientUserMessageId: follower.clientUserMessageId,
+    sourceMsgId: follower.context.sourceMsgId,
+    startDeliveryState: follower.startDeliveryState,
+    startedAt: follower.startedAt,
+    settled: follower.settled,
+    terminal: follower.terminal,
+    turnId: follower.turnId,
+    attemptId: follower.attemptId,
+  };
+  for (const mutate of [
+    () => { follower.context.sourceMsgId = null; },
+    () => { follower.startDeliveryState = 'preparing'; },
+    () => { follower.startedAt = Date.now(); },
+    () => { follower.settled = true; },
+    () => { follower.terminal = { status: 'completed' }; },
+    () => { follower.turnId = 'turn-started-too-soon'; },
+    () => { follower.attemptId = ''; },
+    () => {
+      follower.attemptId = fixture.proc.pendingQueue[2].attemptId;
+    },
+    () => {
+      follower.clientUserMessageId = fixture.proc.pendingQueue[2]
+        .clientUserMessageId;
+    },
+  ]) {
+    mutate();
+    assert.equal(fixture.proc.captureCleanRestartCandidate(), null);
+    follower.clientUserMessageId = followerIdentity.clientUserMessageId;
+    follower.context.sourceMsgId = followerIdentity.sourceMsgId;
+    follower.startDeliveryState = followerIdentity.startDeliveryState;
+    follower.startedAt = followerIdentity.startedAt;
+    follower.settled = followerIdentity.settled;
+    follower.terminal = followerIdentity.terminal;
+    follower.turnId = followerIdentity.turnId;
+    follower.attemptId = followerIdentity.attemptId;
+  }
+  const firstRejected = assert.rejects(
+    firstFollower,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  const secondRejected = assert.rejects(
+    secondFollower,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  assert.equal(await fixture.proc.interrupt('clean-restart'), true);
+  await Promise.all([firstRejected, secondRejected]);
+  await active;
+
+  assert.deepEqual(
+    checkpoints
+      .filter(({ kind }) => kind === 'queued-send-cancelled')
+      .map(({ source, method, reason }) => [source, method, reason]),
+    [
+      [45, 'queued/send', 'clean-restart'],
+      [46, 'queued/send', 'clean-restart'],
+    ],
+  );
+  await fixture.proc.kill();
+});
+
+test('kill preserves its reason on every queued cancellation checkpoint', async () => {
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+    handlers: {
+      'turn/start': async () => ({
+        turn: {
+          id: 'turn-kill-reason',
+          status: 'inProgress',
+          items: [],
+          error: null,
+        },
+      }),
+      'turn/interrupt': async (_params, client) => {
+        setImmediate(() => client.notify('turn/completed', {
+          threadId: 'codex-thread',
+          turn: {
+            id: 'turn-kill-reason',
+            status: 'interrupted',
+            items: [],
+            error: null,
+          },
+        }));
+        return {};
+      },
+    },
+  });
+  await fixture.start();
+  const active = fixture.proc.send('active');
+  await fixture.client.notify('turn/started', {
+    threadId: 'codex-thread',
+    turn: { id: 'turn-kill-reason', status: 'inProgress' },
+  });
+  while (fixture.proc.state !== 'Active') {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  const follower = fixture.proc.send('queued', {
+    context: { sourceMsgId: 47 },
+  });
+  const followerRejected = assert.rejects(
+    follower,
+    (error) => error.code === 'KILLED',
+  );
+
+  await fixture.proc.kill('shutdown');
+  await Promise.all([active, followerRejected]);
+
+  assert.deepEqual(
+    checkpoints
+      .filter(({ kind }) => kind === 'queued-send-cancelled')
+      .map(({ cancellationCode, method, reason, source }) => ({
+        cancellationCode,
+        method,
+        reason,
+        source,
+      })),
+    [{
+      cancellationCode: 'KILLED',
+      method: 'queued/send',
+      reason: 'shutdown',
+      source: 47,
+    }],
+  );
+});
+
+test('the first interrupt owner cannot be relabelled by a later clean restart', async () => {
+  const preparationEntered = deferred();
+  const releasePreparation = deferred();
+  const checkpoints = [];
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      checkpoints.push(checkpoint);
+      if (
+        checkpoint.kind === 'request-prepared'
+        && checkpoint.method === 'turn/start'
+      ) {
+        preparationEntered.resolve();
+        await releasePreparation.promise;
+      }
+    },
+  });
+  await fixture.start();
+  const send = fixture.proc.send('first owner wins');
+  const sendRejected = assert.rejects(
+    send,
+    (error) => error.code === 'INTERRUPTED',
+  );
+  await preparationEntered.promise;
+  const timeoutStop = fixture.proc.interrupt('timeout');
+  const deployStop = fixture.proc.interrupt('clean-restart');
+  releasePreparation.resolve();
+
+  assert.equal(await timeoutStop, true);
+  assert.equal(await deployStop, true);
+  await sendRejected;
+  assert.equal(
+    checkpoints.find(({ kind }) => kind === 'active-start-cancelled').reason,
+    'timeout',
+  );
   await fixture.proc.kill();
 });
 
@@ -4619,14 +5112,17 @@ test('active start cancellation checkpoint failure enters DurabilityBlocked', as
   const send = fixture.proc.send('active cancellation durability');
   const sendRejected = assert.rejects(
     send,
-    (error) => error.code === 'CODEX_DURABILITY_FAILED',
+    (error) => error.code === 'INTERRUPTED',
   );
   await prepared.promise;
 
-  await assert.rejects(fixture.proc.interrupt());
+  const stop = fixture.proc.interrupt();
+  stop.catch(() => {});
+  await new Promise((resolve) => setImmediate(resolve));
+  releasePrepared.resolve();
+  await assert.rejects(stop);
   await sendRejected;
   assert.equal(fixture.proc.state, 'DurabilityBlocked');
-  releasePrepared.resolve();
   await fixture.proc.kill();
 });
 

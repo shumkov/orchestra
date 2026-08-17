@@ -774,6 +774,12 @@ test('activity epoch advances before an admitted steer durability checkpoint can
 test('background ownership activation advances the activity epoch', async () => {
   const fixture = makeProcess();
   await fixture.start();
+  const deadlineAt = Date.now() + 60_000;
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-late-background-status',
+    status: 'completed',
+    deadlineAt,
+  };
   const before = fixture.proc.activityEpoch;
 
   await fixture.client.notify('thread/status/changed', {
@@ -783,6 +789,12 @@ test('background ownership activation advances the activity epoch', async () => 
 
   assert.equal(fixture.proc.state, 'BackgroundWorking');
   assert.equal(fixture.proc.activityEpoch, before + 1);
+  assert.deepEqual(fixture.proc.backgroundOwner, {
+    turnId: 'turn-late-background-status',
+    deadlineAt,
+  });
+  assert.equal(Object.isFrozen(fixture.proc.backgroundOwner), true);
+  assert.equal(fixture.proc.backgroundWatchdogDeadlineAt, deadlineAt);
   await fixture.proc.kill();
 });
 
@@ -800,6 +812,11 @@ test('background status advances the epoch before its durability checkpoint and 
     },
   });
   await fixture.start();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-checkpointed-background-status',
+    status: 'completed',
+    deadlineAt: Date.now() + 60_000,
+  };
   const before = fixture.proc.activityEpoch;
   const notification = fixture.client.notify('thread/status/changed', {
     threadId: 'codex-thread',
@@ -816,6 +833,175 @@ test('background status advances the epoch before its durability checkpoint and 
   assert.equal(fixture.proc.state, 'BackgroundWorking');
   assert.equal(fixture.proc.activityEpoch, before + 1);
   await fixture.proc.kill();
+});
+
+test('background status cannot promote a terminal replaced during its durability checkpoint', async () => {
+  const checkpointEntered = deferred();
+  const releaseCheckpoint = deferred();
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind !== 'thread-status-changed') return;
+      checkpointEntered.resolve();
+      await releaseCheckpoint.promise;
+    },
+    handlers: {
+      'turn/start': async (_params, client) => {
+        setImmediate(() => startTurnAndComplete(client, {
+          turnId: 'turn-replacement-during-status-checkpoint',
+          text: 'newer foreground completed',
+        }));
+        return {
+          turn: {
+            id: 'turn-replacement-during-status-checkpoint',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+    },
+  });
+  await fixture.start();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-background-status-candidate',
+    status: 'completed',
+    deadlineAt: Date.now() + 60_000,
+  };
+  const notification = fixture.client.notify('thread/status/changed', {
+    threadId: 'codex-thread',
+    status: { type: 'active' },
+  });
+  await checkpointEntered.promise;
+
+  await fixture.proc.send('replace the candidate before status commits');
+  assert.equal(
+    fixture.proc.lastTerminal.turnId,
+    'turn-replacement-during-status-checkpoint',
+  );
+  releaseCheckpoint.resolve();
+  await notification;
+
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.backgroundOwner, null);
+  assert.equal(
+    fixture.proc.containmentReason,
+    'background-ownership-unknown',
+  );
+  assert.equal(
+    fixture.proc.containmentErrorCode,
+    'CODEX_BACKGROUND_OWNERSHIP_UNKNOWN',
+  );
+  await fixture.proc.kill();
+});
+
+test('background status contains when a new turn starts during its durability checkpoint', async (t) => {
+  const checkpointEntered = deferred();
+  const releaseCheckpoint = deferred();
+  const turnStartEntered = deferred();
+  const releaseTurnStart = deferred();
+  let send = null;
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => {
+      if (checkpoint.kind !== 'thread-status-changed') return;
+      checkpointEntered.resolve();
+      await releaseCheckpoint.promise;
+    },
+    handlers: {
+      'turn/start': async (_params, client) => {
+        turnStartEntered.resolve();
+        await releaseTurnStart.promise;
+        setImmediate(() => startTurnAndComplete(client, {
+          turnId: 'turn-started-during-status-checkpoint',
+          text: 'new foreground turn',
+        }));
+        return {
+          turn: {
+            id: 'turn-started-during-status-checkpoint',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+    },
+  });
+  t.after(async () => {
+    releaseCheckpoint.resolve();
+    releaseTurnStart.resolve();
+    await send?.catch(() => {});
+    await fixture.proc.kill();
+  });
+  await fixture.start();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-background-status-candidate',
+    status: 'completed',
+    deadlineAt: Date.now() + 60_000,
+  };
+  const notification = fixture.client.notify('thread/status/changed', {
+    threadId: 'codex-thread',
+    status: { type: 'active' },
+  });
+  await checkpointEntered.promise;
+
+  send = fixture.proc.send('start while status durability is pending');
+  send.catch(() => {});
+  await turnStartEntered.promise;
+  assert.equal(fixture.proc.state, 'StartingTurn');
+  assert.notEqual(fixture.proc.current, null);
+
+  releaseCheckpoint.resolve();
+  await notification;
+
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(fixture.proc.current, null);
+  assert.equal(fixture.proc.backgroundOwner, null);
+  assert.equal(
+    fixture.proc.containmentReason,
+    'background-ownership-unknown',
+  );
+  assert.equal(
+    fixture.proc.containmentErrorCode,
+    'CODEX_BACKGROUND_OWNERSHIP_UNKNOWN',
+  );
+  await assert.rejects(
+    send,
+    (error) => error.code === 'CODEX_CONTAINMENT_FAILED',
+  );
+});
+
+test('unsolicited active background status without a live terminal owner contains', async (t) => {
+  for (const [name, lastTerminal] of [
+    ['missing terminal', null],
+    ['expired terminal', {
+      turnId: 'turn-expired-background-status',
+      status: 'completed',
+      deadlineAt: Date.now() - 1,
+    }],
+  ]) {
+    await t.test(name, async () => {
+      const fixture = makeProcess();
+      await fixture.start();
+      fixture.proc.lastTerminal = lastTerminal;
+      const before = fixture.proc.activityEpoch;
+
+      await fixture.client.notify('thread/status/changed', {
+        threadId: 'codex-thread',
+        status: { type: 'active' },
+      });
+
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(fixture.proc.activityEpoch, before + 1);
+      assert.equal(
+        fixture.proc.containmentReason,
+        'background-ownership-unknown',
+      );
+      assert.equal(
+        fixture.proc.containmentErrorCode,
+        'CODEX_BACKGROUND_OWNERSHIP_UNKNOWN',
+      );
+      await fixture.proc.kill();
+    });
+  }
 });
 
 test('clean restart qualification reads a complete empty registry without mutation', async () => {
@@ -886,6 +1072,7 @@ test('clean restart qualification fails on concurrent epoch and background drift
     inspection,
     (error) => error.code === 'CODEX_QUALIFICATION_FENCE',
   );
+  fixture.proc.state = 'Idle';
   await fixture.proc.kill();
 });
 
@@ -2403,6 +2590,194 @@ test('interrupt waits for exact terminal, clean, fresh empty page, and durable s
   await fixture.proc.kill();
 });
 
+test('idle retirement ignores an expired historical turn deadline', async () => {
+  const cleanupTimeouts = [];
+  const fixture = makeProcess({
+    processOptions: {
+      interruptTimeoutMs: 500,
+      cleanupTimeoutMs: 500,
+    },
+    handlers: {
+      'turn/start': async (_params, client) => {
+        setImmediate(() => startTurnAndComplete(client, {
+          turnId: 'turn-idle-history',
+          text: 'finished before deploy',
+        }));
+        return {
+          turn: {
+            id: 'turn-idle-history',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+      'thread/backgroundTerminals/clean': async (_params, _client, record) => {
+        cleanupTimeouts.push(record.options.timeoutMs);
+        if (record.options.timeoutMs <= 1) {
+          throw rpcError('expired cleanup budget', 'CODEX_RPC_TIMEOUT');
+        }
+        return {};
+      },
+    },
+  });
+  await fixture.start();
+  await fixture.proc.send('ordinary foreground turn');
+  assert.equal(fixture.proc.state, 'Idle');
+  fixture.proc.lastTerminal.deadlineAt = Date.now() - 60_000;
+
+  assert.equal(await fixture.proc.interrupt('clean-restart'), true);
+
+  assert.equal(fixture.proc.state, 'Stopped');
+  assert.equal(cleanupTimeouts.length, 1);
+  assert.ok(cleanupTimeouts[0] > 500);
+  assert.ok(cleanupTimeouts[0] <= 1_000);
+  await fixture.proc.kill();
+});
+
+test('background retirement preserves the exact owner deadline', async (t) => {
+  for (const state of ['BackgroundWorking', 'BackgroundSettling']) {
+    await t.test(state, async () => {
+      const cleanupTimeouts = [];
+      const fixture = makeProcess({
+        processOptions: {
+          interruptTimeoutMs: 50,
+          cleanupTimeoutMs: 50,
+        },
+        handlers: {
+          'thread/backgroundTerminals/clean': async (
+            _params,
+            _client,
+            record,
+          ) => {
+            cleanupTimeouts.push(record.options.timeoutMs);
+            return {};
+          },
+        },
+      });
+      await fixture.start();
+      const deadlineAt = Date.now() + 10_000;
+      fixture.proc.lastTerminal = {
+        turnId: `turn-${state}`,
+        status: 'completed',
+        deadlineAt,
+      };
+      fixture.proc.backgroundOwner = Object.freeze({
+        turnId: `turn-${state}`,
+        deadlineAt,
+      });
+      fixture.proc.state = state;
+
+      assert.equal(
+        await fixture.proc.interrupt('clean-restart'),
+        true,
+      );
+
+      assert.equal(fixture.proc.state, 'Stopped');
+      assert.equal(cleanupTimeouts.length, 1);
+      assert.ok(cleanupTimeouts[0] > 5_000);
+      assert.ok(cleanupTimeouts[0] <= 10_000);
+      assert.equal(fixture.proc.backgroundOwner, null);
+      await fixture.proc.kill();
+    });
+  }
+});
+
+test('background cleanup proof with a mismatched deadline is never reused', async () => {
+  const checkpoints = [];
+  let cleanCalls = 0;
+  const fixture = makeProcess({
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+    handlers: {
+      'thread/backgroundTerminals/clean': async () => {
+        cleanCalls += 1;
+        return {};
+      },
+    },
+  });
+  await fixture.start();
+  const deadlineAt = Date.now() + 10_000;
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-background-cleanup-proof',
+    status: 'completed',
+    deadlineAt,
+  };
+  fixture.proc.backgroundOwner = Object.freeze({
+    turnId: 'turn-background-cleanup-proof',
+    deadlineAt,
+  });
+  fixture.proc.backgroundCleanupProof = Object.freeze({
+    turnId: 'turn-background-cleanup-proof',
+    terminalStatus: 'completed',
+    deadlineAt: deadlineAt - 1,
+  });
+  fixture.proc.state = 'BackgroundWorking';
+
+  assert.equal(
+    await fixture.proc.interrupt('clean-restart'),
+    true,
+  );
+
+  assert.equal(cleanCalls, 1);
+  assert.deepEqual(
+    checkpoints
+      .map(({ kind }) => kind)
+      .filter((kind) => kind.startsWith('stop-')),
+    [
+      'stop-terminal-reconciled',
+      'stop-clean-accepted',
+      'stop-empty-registry-observed',
+    ],
+  );
+  assert.equal(
+    checkpoints.some(({ kind }) => kind === 'stop-background-cleanup-reused'),
+    false,
+  );
+  await fixture.proc.kill();
+});
+
+test('background retirement contains missing or mismatched ownership', async (t) => {
+  for (const [name, makeOwner] of [
+    ['missing owner', () => null],
+    ['wrong turn', ({ deadlineAt }) => Object.freeze({
+      turnId: 'turn-other',
+      deadlineAt,
+    })],
+    ['wrong deadline', ({ turnId, deadlineAt }) => Object.freeze({
+      turnId,
+      deadlineAt: deadlineAt - 1,
+    })],
+    ['mutable owner', ({ turnId, deadlineAt }) => ({
+      turnId,
+      deadlineAt,
+    })],
+  ]) {
+    await t.test(name, async () => {
+      const fixture = makeProcess();
+      await fixture.start();
+      const terminal = {
+        turnId: 'turn-owned-background',
+        status: 'completed',
+        deadlineAt: Date.now() + 60_000,
+      };
+      fixture.proc.lastTerminal = terminal;
+      fixture.proc.backgroundOwner = makeOwner(terminal);
+      fixture.proc.state = 'BackgroundWorking';
+
+      await assert.rejects(
+        fixture.proc.interrupt('clean-restart'),
+        (error) => error.code === 'CODEX_BACKGROUND_OWNERSHIP_UNKNOWN',
+      );
+      assert.equal(fixture.proc.state, 'ContainmentFailed');
+      assert.equal(
+        fixture.proc.containmentReason,
+        'background-ownership-unknown',
+      );
+      await fixture.proc.kill();
+    });
+  }
+});
+
 test('a checkpoint failure after dispatch is typed, non-replayable, and refuses later work', async () => {
   let failWriteAttempt = false;
   const fixture = makeProcess({
@@ -2651,6 +3026,11 @@ test('natural completion leaving BackgroundWorking later cleans and releases on 
   assert.equal(result.text, 'server started');
   assert.equal(fixture.proc.state, 'BackgroundWorking');
   assert.equal(fixture.proc.hasActiveBackgroundWork(), true);
+  assert.deepEqual(fixture.proc.backgroundOwner, {
+    turnId: 'turn-background',
+    deadlineAt: fixture.proc.lastTerminal.deadlineAt,
+  });
+  assert.equal(Object.isFrozen(fixture.proc.backgroundOwner), true);
 
   const settled = new Promise((resolve) => {
     fixture.proc.once('codex-settled', resolve);
@@ -2663,6 +3043,7 @@ test('natural completion leaving BackgroundWorking later cleans and releases on 
 
   assert.equal(settlement.kind, 'background-settled');
   assert.equal(fixture.proc.state, 'Idle');
+  assert.equal(fixture.proc.backgroundOwner, null);
   assert.equal(cleaned, true);
   assert.equal(
     checkpoints.some(({ kind, turnId }) => (
@@ -2674,8 +3055,136 @@ test('natural completion leaving BackgroundWorking later cleans and releases on 
   await fixture.proc.kill();
 });
 
-test('background work missing idle status is exactly stopped at the original turn deadline', async () => {
+test('a stale background probe cannot reactivate a concurrently stopped turn', async (t) => {
+  const staleListEntered = deferred();
+  const releaseStaleList = deferred();
+  let listCalls = 0;
+  let cleanCalls = 0;
+  let send = null;
+  const fixture = makeProcess({
+    processOptions: {
+      interruptTimeoutMs: 250,
+      cleanupTimeoutMs: 250,
+    },
+    handlers: {
+      'turn/start': async (_params, client) => {
+        setImmediate(() => startTurnAndComplete(client, {
+          turnId: 'turn-background-probe-stop-race',
+          text: 'foreground completed',
+        }));
+        return {
+          turn: {
+            id: 'turn-background-probe-stop-race',
+            status: 'inProgress',
+            items: [],
+            error: null,
+          },
+        };
+      },
+      'thread/backgroundTerminals/list': async () => {
+        listCalls += 1;
+        if (listCalls === 1) {
+          staleListEntered.resolve();
+          await releaseStaleList.promise;
+          return { count: 1, nextCursor: null };
+        }
+        return { count: 0, nextCursor: null };
+      },
+      'thread/backgroundTerminals/clean': async () => {
+        cleanCalls += 1;
+        return {};
+      },
+    },
+  });
+  t.after(async () => {
+    releaseStaleList.resolve();
+    await send?.catch(() => {});
+    await fixture.proc.kill();
+  });
+  await fixture.start();
+  send = fixture.proc.send('finish while the background probe pauses', {
+    maxTurnMs: 500,
+  });
+  send.catch(() => {});
+  await staleListEntered.promise;
+
+  assert.equal(await fixture.proc.interrupt('clean-restart'), true);
+  assert.equal(fixture.proc.state, 'Stopped');
+  assert.equal(cleanCalls, 1);
+
+  releaseStaleList.resolve();
+  await send;
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.equal(fixture.proc.state, 'Stopped');
+  assert.equal(fixture.proc.backgroundOwner, null);
+  assert.equal(fixture.proc.backgroundWatchdog, null);
+  assert.equal(cleanCalls, 1);
+  assert.equal(listCalls, 2);
+});
+
+test('background watchdog contains ownership drift before starting cleanup', async (t) => {
+  let cleanCalls = 0;
+  const fixture = makeProcess({
+    processOptions: {
+      interruptTimeoutMs: 100,
+      cleanupTimeoutMs: 100,
+    },
+    handlers: {
+      'thread/backgroundTerminals/clean': async () => {
+        cleanCalls += 1;
+        return {};
+      },
+    },
+  });
+  t.after(() => fixture.proc.kill());
+  await fixture.start();
+  const deadlineAt = Date.now() + 50;
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-watchdog-owner',
+    status: 'completed',
+    deadlineAt,
+  };
+  fixture.proc.backgroundOwner = Object.freeze({
+    turnId: 'turn-watchdog-owner',
+    deadlineAt,
+  });
+  fixture.proc.state = 'BackgroundWorking';
+  const contained = new Promise((resolve) => {
+    fixture.proc.once('containment-failed', resolve);
+  });
+
+  fixture.proc._armBackgroundWatchdog();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-watchdog-owner-drifted',
+    status: 'completed',
+    deadlineAt,
+  };
+  await Promise.race([
+    contained,
+    new Promise((_, reject) => setTimeout(() => {
+      reject(new Error('background watchdog did not contain ownership drift'));
+    }, 500)),
+  ]);
+
+  assert.equal(fixture.proc.state, 'ContainmentFailed');
+  assert.equal(
+    fixture.proc.containmentReason,
+    'background-ownership-unknown',
+  );
+  assert.equal(
+    fixture.proc.containmentErrorCode,
+    'CODEX_BACKGROUND_OWNERSHIP_UNKNOWN',
+  );
+  assert.equal(fixture.proc.interruptPromise, null);
+  assert.equal(cleanCalls, 0);
+});
+
+test('background watchdog reserves cleanup budget before the exact owner deadline', async () => {
   let cleaned = false;
+  const cleanupDelayMs = 20;
+  const cleanupTimeouts = [];
+  const ownerRemainingAtCleanup = [];
   const fixture = makeProcess({
     processOptions: {
       interruptTimeoutMs: 100,
@@ -2702,7 +3211,14 @@ test('background work missing idle status is exactly stopped at the original tur
           ? { count: 0, nextCursor: null }
           : { count: 1, nextCursor: null }
       ),
-      'thread/backgroundTerminals/clean': async () => {
+      'thread/backgroundTerminals/clean': async (_params, _client, record) => {
+        const ownerRemaining = fixture.proc.lastTerminal.deadlineAt - Date.now();
+        cleanupTimeouts.push(record.options.timeoutMs);
+        ownerRemainingAtCleanup.push(ownerRemaining);
+        await new Promise((resolve) => setTimeout(resolve, cleanupDelayMs));
+        if (ownerRemaining < cleanupDelayMs) {
+          throw rpcError('cleanup RPC exhausted its owner deadline', 'CODEX_RPC_TIMEOUT');
+        }
         cleaned = true;
         return {};
       },
@@ -2711,7 +3227,10 @@ test('background work missing idle status is exactly stopped at the original tur
   await fixture.start();
   const settled = new Promise((resolve) => {
     fixture.proc.on('codex-settled', (event) => {
-      if (event.kind === 'stopped') resolve(event);
+      if (event.kind === 'stopped') resolve({ kind: 'stopped', event });
+    });
+    fixture.proc.once('containment-failed', () => {
+      resolve({ kind: 'contained', event: null });
     });
   });
 
@@ -2721,15 +3240,20 @@ test('background work missing idle status is exactly stopped at the original tur
   assert.equal(result.text, 'background started');
   assert.equal(fixture.proc.state, 'BackgroundWorking');
 
-  const event = await Promise.race([
+  const outcome = await Promise.race([
     settled,
     new Promise((_, reject) => setTimeout(() => {
       reject(new Error('background watchdog did not stop the turn'));
     }, 500)),
   ]);
-  assert.equal(event.turnId, 'turn-background-watchdog');
+  assert.equal(outcome.kind, 'stopped');
+  assert.equal(outcome.event.turnId, 'turn-background-watchdog');
   assert.equal(fixture.proc.state, 'Stopped');
   assert.equal(cleaned, true);
+  assert.equal(cleanupTimeouts.length, 1);
+  assert.equal(ownerRemainingAtCleanup.length, 1);
+  assert.ok(ownerRemainingAtCleanup[0] >= cleanupDelayMs);
+  assert.ok(cleanupTimeouts[0] <= 80);
   await fixture.proc.kill();
 });
 
@@ -3735,6 +4259,11 @@ test('human wait flags do not emit a partial lifecycle contract before U9', asyn
   const fixture = makeProcess();
   fixture.proc.on('codex-lifecycle', (event) => lifecycle.push(event));
   await fixture.start();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-human-wait-status',
+    status: 'completed',
+    deadlineAt: Date.now() + 60_000,
+  };
 
   await fixture.client.notify('thread/status/changed', {
     threadId: 'codex-thread',
@@ -3745,6 +4274,7 @@ test('human wait flags do not emit a partial lifecycle contract before U9', asyn
   });
 
   assert.equal(lifecycle.some(({ kind }) => kind === 'human-wait'), false);
+  assert.equal(fixture.proc.state, 'BackgroundWorking');
   await fixture.proc.kill();
 });
 
@@ -3760,6 +4290,11 @@ test('thread status waits for its durability checkpoint before changing control 
     },
   });
   await fixture.start();
+  fixture.proc.lastTerminal = {
+    turnId: 'turn-durable-status',
+    status: 'completed',
+    deadlineAt: Date.now() + 60_000,
+  };
 
   const notification = fixture.client.notify('thread/status/changed', {
     threadId: 'codex-thread',

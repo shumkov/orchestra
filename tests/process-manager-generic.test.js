@@ -1292,8 +1292,10 @@ class RuntimeProcess extends MockProcess {
     };
   }
 
-  interrupt() {
+  interrupt(reason) {
     if (this._runtimeInterruptPromise) return this._runtimeInterruptPromise;
+    this.interruptReasons ??= [];
+    this.interruptReasons.push(reason);
     this._runtimeInterruptPromise = this._interruptRuntime();
     return this._runtimeInterruptPromise;
   }
@@ -1491,6 +1493,50 @@ function containmentCleanupDetail(proc, overrides = {}) {
 }
 
 describe('ProcessManager — runtime identity and strict replacement', () => {
+  test('Codex retirement propagates the first bounded interruption owner', async () => {
+    const clean = runtimeManager();
+    const cleanProc = await clean.pm.getOrSpawn('clean', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-clean',
+    });
+    cleanProc.captureCleanRestartCandidate = () => null;
+    await clean.pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        outputAttempted: false,
+        pending: 0,
+        fenced: true,
+      }),
+    });
+    assert.deepEqual(cleanProc.interruptReasons, ['clean-restart']);
+
+    const direct = runtimeManager();
+    const directProc = await direct.pm.getOrSpawn('direct', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-direct',
+    });
+    await direct.pm.interrupt('direct');
+    assert.deepEqual(directProc.interruptReasons, ['interrupt']);
+
+    const shutdown = runtimeManager();
+    const shutdownProc = await shutdown.pm.getOrSpawn('shutdown', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-shutdown',
+    });
+    await shutdown.pm.shutdown();
+    assert.deepEqual(shutdownProc.interruptReasons, ['shutdown']);
+
+    const switched = runtimeManager();
+    const switchedProc = await switched.pm.getOrSpawn('switched', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-old',
+    });
+    await switched.pm.replaceRuntime('switched', {
+      runtime: 'claude',
+      spawnProfileId: 'profile-new',
+    });
+    assert.deepEqual(switchedProc.interruptReasons, ['runtime-switch']);
+  });
+
   test('strict Codex recovery never reuses an unattested warm generation', async () => {
     const { pm } = runtimeManager();
     await pm.getOrSpawn('chat', {

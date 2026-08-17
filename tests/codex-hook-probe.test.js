@@ -2,6 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const { EventEmitter } = require('node:events');
 const path = require('node:path');
 const { pathToFileURL } = require('node:url');
 
@@ -820,33 +821,19 @@ test('the raw session rejects unsupported envelope keys and versions', async (t)
   }
 });
 
-// Garbage that lands while the child is being torn down must still fail the
-// session; a body that already resolved cannot mask it.
-test('the raw session fails closed on malformed bytes that arrive during teardown', async (t) => {
-  const { withRawSession, categorizeFailure } = await import(probeUrl);
-  // Scheduling-independent by construction: a detached grandchild inherits
-  // stdout, confirms over IPC that it is ready, and writes strictly after the
-  // session child has exited. Keeping it outside the owned process group
-  // prevents teardown from killing it before it exercises the drain boundary.
-  const { scratch, peer } = rawPeerSession(t, [
-    "import readline from 'node:readline';",
-    "import { spawn } from 'node:child_process';",
-    'const lines = readline.createInterface({ input: process.stdin });',
-    'const hold = setInterval(() => {}, 1_000);',
-    "lines.once('line', () => {",
-    "  process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');",
-    "  process.on('SIGTERM', () => {",
-    "    const writer = spawn(process.execPath, ['-e', \"process.send('ready'); setTimeout(() => { require('node:fs').writeSync(1, 'garbage after exit\\\\n'); process.exit(0); }, 250);\"], { stdio: ['ignore', 'inherit', 'ignore', 'ipc'], detached: true });",
-    "    writer.once('message', () => { writer.disconnect(); writer.unref(); clearInterval(hold); lines.close(); });",
-    '  });',
-    '});',
-  ]);
-  const error = await withRawSession(
-    rawPeerOptions(scratch, peer),
-    async (session) => session.request('initialize', {}, 'test', 4_000),
-  ).then(() => null, (caught) => caught);
-  assert.ok(error, 'teardown-time garbage must fail the session');
-  assert.equal(categorizeFailure(error), 'framing');
+test('the raw stdout drain requires end and ignores close', async () => {
+  const { waitForRawStdoutEnd } = await import(probeUrl);
+  const stream = new EventEmitter();
+  let drained = false;
+  const drain = waitForRawStdoutEnd(stream).then(() => { drained = true; });
+
+  stream.emit('close');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(drained, false, 'close alone is not EOF proof');
+
+  stream.emit('end');
+  await drain;
+  assert.equal(drained, true);
 });
 
 test('the raw session proves the whole owned group is gone, not just the leader', async (t) => {

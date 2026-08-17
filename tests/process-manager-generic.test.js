@@ -1422,6 +1422,70 @@ class QualificationCodexProcess extends CodexProcess {
   }
 }
 
+class IdleDeadlineCodexProcess extends CodexProcess {
+  constructor({ sessionKey, spawnProfileId, cleanupTimeouts }) {
+    super({
+      sessionKey,
+      chatId: sessionKey,
+      threadId: null,
+      label: `idle-deadline-${sessionKey}`,
+      cwd: '/workspace',
+      clientFactory: () => {
+        throw new Error('test start installs the retirement client');
+      },
+      checkpointSink: async () => {},
+      hostIdentity: 'host-a',
+      bootSessionIdentity: 'boot-new',
+      generationIdFactory: () => `generation-${sessionKey}`,
+      expectedThreadPolicy: QUALIFICATION_THREAD_POLICY,
+      modelCatalog: QUALIFICATION_MODEL_CATALOG,
+      interruptTimeoutMs: 500,
+      cleanupTimeoutMs: 500,
+      logger: { debug() {}, error() {}, info() {}, log() {}, warn() {} },
+    });
+    this.spawnProfileId = spawnProfileId;
+    this.cleanupTimeouts = cleanupTimeouts;
+  }
+
+  async start() {
+    let requestId = 0;
+    this.client = {
+      request: async (method, _params, options = {}) => {
+        requestId += 1;
+        if (method === 'thread/backgroundTerminals/list') {
+          return { count: 0, nextCursor: null };
+        }
+        assert.equal(method, 'thread/backgroundTerminals/clean');
+        await options.onWriteAttempted?.({
+          id: requestId,
+          assertActive() {},
+          markWriteCommitted() {},
+        });
+        this.cleanupTimeouts.push(options.timeoutMs);
+        if (options.timeoutMs <= 1) {
+          const error = new Error('expired cleanup budget');
+          error.code = 'CODEX_RPC_TIMEOUT';
+          throw error;
+        }
+        await options.onResponseObserved?.({
+          id: requestId,
+          outcome: 'result',
+          assertActive() {},
+        });
+        return {};
+      },
+      async close() {},
+    };
+    this.providerSessionId = 'codex-thread';
+    this.lastTerminal = {
+      turnId: 'turn-historical',
+      status: 'completed',
+      deadlineAt: Date.now() - 60_000,
+    };
+    this.state = 'Idle';
+  }
+}
+
 function runtimeManager({
   processOptions = {},
   processFactory,
@@ -3532,6 +3596,40 @@ describe('ProcessManager — Codex retirement and callback fences', () => {
         reason: 'eligible',
       },
     );
+  });
+
+  test('clean restart retires an aged idle real Codex with a fresh cleanup budget', async () => {
+    const cleanupTimeouts = [];
+    const { pm } = runtimeManager({
+      processFactory: (sessionKey, ctx) => new IdleDeadlineCodexProcess({
+        sessionKey,
+        spawnProfileId: ctx.spawnProfileId,
+        cleanupTimeouts,
+      }),
+    });
+    const proc = await pm.getOrSpawn('codex-aged-idle-retirement', {
+      runtime: 'codex',
+      spawnProfileId: 'profile-aged-idle-retirement',
+    });
+
+    const snapshots = await pm.retireForCleanRestart({
+      getDeliveryEvidence: async () => ({
+        fenced: true,
+        pending: 0,
+        outputAttempted: false,
+      }),
+    });
+
+    assert.deepEqual(snapshots, [{
+      sessionKey: 'codex-aged-idle-retirement',
+      sourceMsgId: null,
+      eligible: false,
+      reason: 'no-active-turn',
+    }]);
+    assert.equal(proc.closed, true);
+    assert.equal(cleanupTimeouts.length, 1);
+    assert.ok(cleanupTimeouts[0] > 500);
+    assert.ok(cleanupTimeouts[0] <= 1_000);
   });
 
   test('clean restart retires one exact interrupted Codex turn into an eligible snapshot', async () => {

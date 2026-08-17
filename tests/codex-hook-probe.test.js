@@ -825,21 +825,21 @@ test('the raw session rejects unsupported envelope keys and versions', async (t)
 test('the raw session fails closed on malformed bytes that arrive during teardown', async (t) => {
   const { withRawSession, categorizeFailure } = await import(probeUrl);
   // Scheduling-independent by construction: a detached grandchild inherits
-  // stdout and writes strictly after the session child has exited. Keeping it
-  // outside the owned process group prevents teardown from killing the test
-  // writer before it can exercise the stdout-drain boundary.
+  // stdout, confirms over IPC that it is ready, and writes strictly after the
+  // session child has exited. Keeping it outside the owned process group
+  // prevents teardown from killing it before it exercises the drain boundary.
   const { scratch, peer } = rawPeerSession(t, [
     "import readline from 'node:readline';",
     "import { spawn } from 'node:child_process';",
     'const lines = readline.createInterface({ input: process.stdin });',
+    'const hold = setInterval(() => {}, 1_000);',
     "lines.once('line', () => {",
     "  process.stdout.write(JSON.stringify({ id: 1, result: {} }) + '\\n');",
     "  process.on('SIGTERM', () => {",
-    "    const writer = spawn(process.execPath, ['-e', \"process.on('SIGTERM', () => {}); setTimeout(() => { require('node:fs').writeSync(1, 'garbage after exit\\\\n'); process.exit(0); }, 250);\"], { stdio: ['ignore', 'inherit', 'ignore'], detached: true });",
-    "    writer.once('spawn', () => process.exit(0));",
+    "    const writer = spawn(process.execPath, ['-e', \"process.send('ready'); setTimeout(() => { require('node:fs').writeSync(1, 'garbage after exit\\\\n'); process.exit(0); }, 250);\"], { stdio: ['ignore', 'inherit', 'ignore', 'ipc'], detached: true });",
+    "    writer.once('message', () => { writer.disconnect(); writer.unref(); clearInterval(hold); lines.close(); });",
     '  });',
     '});',
-    'setInterval(() => {}, 1_000);',
   ]);
   const error = await withRawSession(
     rawPeerOptions(scratch, peer),

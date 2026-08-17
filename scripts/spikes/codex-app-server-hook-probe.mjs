@@ -612,6 +612,10 @@ function configDigest(configPath) {
 // secondary characterization of the payloads the production client drops.
 // Envelopes are validated and projected on ingestion; nothing arbitrary is
 // retained, and any terminal failure fails the whole session.
+export function waitForRawStdoutEnd(stream) {
+  return new Promise((resolvePromise) => stream.once('end', resolvePromise));
+}
+
 export async function withRawSession(
   { binary, codexHome, workspace, env, launcher, inspectGroup = inspectOwnedGroup },
   body,
@@ -754,11 +758,8 @@ export async function withRawSession(
   // Resolved only when stdout truly reaches EOF, which requires every writer
   // holding the descriptor — including any inherited grandchild — to close it.
   let stdoutDrained = false;
-  const stdoutDrain = new Promise((resolvePromise) => {
-    child.stdout.once('end', () => {
-      stdoutDrained = true;
-      resolvePromise();
-    });
+  const stdoutDrain = waitForRawStdoutEnd(child.stdout).then(() => {
+    stdoutDrained = true;
   });
   child.stdout.on('end', () => {
     // Flush the decoder: a trailing partial or unfinished work at EOF is a

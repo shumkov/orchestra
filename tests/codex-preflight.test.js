@@ -174,6 +174,7 @@ class FakeClient {
     this.closeError = closeError;
     this.faultOutcome = faultOutcome;
     this.calls = [];
+    this.hookVerifications = [];
     this.started = 0;
     this.closed = 0;
     this.faultWaits = 0;
@@ -193,6 +194,13 @@ class FakeClient {
     return typeof response === 'function'
       ? response(params, this.calls)
       : response;
+  }
+
+  async verifyHooks(options) {
+    this.calls.push({ method: 'verifyHooks', params: options });
+    this.hookVerifications.push(options);
+    if (this.failures.verifyHooks) throw this.failures.verifyHooks;
+    return this.results.verifyHooks ?? [];
   }
 
   async close() {
@@ -1200,5 +1208,286 @@ test('spawn profile receipt rejects incomplete, extra, or forged preflight data'
   assert.throws(
     () => createCodexSpawnProfile(profile, deepFrozenClone(result)),
     { code: 'CODEX_PREFLIGHT_RECEIPT_INVALID' },
+  );
+});
+
+// --- hook material on the spawn profile --------------------------------------
+// A manifest and the digest over the material it names are part of who the
+// profile is, so a profile prepared against different hook content cannot be
+// reused for a session that assumes the old content.
+
+const HOOK_SOURCE_PATH = '/opt/orchestra/hook-artifacts/1/hooks.json';
+const HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET = Object.freeze({
+  'aarch64-apple-darwin':
+    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+  'x86_64-unknown-linux-musl':
+    'cd133c6b3cacadad95a31cb651acff440272a33c011fadf803da3cfddf456f50',
+});
+
+function hookMaterial(profile = expectedProfile()) {
+  return {
+    hookManifest: {
+      ownedCwd: profile.cwd,
+      entries: [{
+        ordinal: 0,
+        configKey: `${HOOK_SOURCE_PATH}:stop:0:0`,
+        sourcePath: HOOK_SOURCE_PATH,
+        event: 'stop',
+        handlerType: 'command',
+        source: 'user',
+        isManaged: false,
+        displayOrder: 0,
+        timeoutSec: 600,
+        commandSha256: digest('hook-command'),
+      }],
+    },
+    hookArtifactsSha256: digest('hook-artifacts'),
+  };
+}
+
+test('the hooks-off spawn fingerprint is byte-identical to its pinned value', async () => {
+  const profile = expectedProfile();
+  const result = await preflightCodexRuntime(profile, {
+    clientFactory: () => new FakeClient(staticResults(profile)),
+  });
+  const receipt = createCodexSpawnProfile(profile, result);
+
+  assert.equal(
+    receipt.spawnProfileId,
+    HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET[profile.target],
+  );
+  assert.equal(
+    Object.hasOwn(receipt.expectedStaticProfile, 'hookManifest'),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(receipt.expectedStaticProfile, 'hookArtifactsSha256'),
+    false,
+  );
+});
+
+test('hook material is forwarded to preflight, verified once, and changes the spawn fingerprint', async () => {
+  const plainProfile = expectedProfile();
+  const hookProfile = expectedProfile(hookMaterial());
+  const clientOptions = [];
+  const clients = [];
+  const receipts = [];
+  for (const profile of [plainProfile, hookProfile]) {
+    const client = new FakeClient(staticResults(profile));
+    clients.push(client);
+    const result = await preflightCodexRuntime(profile, {
+      clientFactory: (options) => {
+        clientOptions.push(options);
+        return client;
+      },
+    });
+    receipts.push(createCodexSpawnProfile(profile, result));
+  }
+
+  assert.equal(Object.hasOwn(clientOptions[0], 'hookManifest'), false);
+  assert.deepEqual(clients[0].hookVerifications, []);
+  assert.deepEqual(
+    clientOptions[1].hookManifest,
+    hookProfile.hookManifest,
+  );
+  assert.deepEqual(clients[1].hookVerifications, [{ phase: 'trusted' }]);
+  // Trust is proven before credentials and catalogs are read.
+  assert.deepEqual(
+    clients[1].calls.map(({ method }) => method),
+    [
+      'config/read',
+      'configRequirements/read',
+      'permissionProfile/list',
+      'verifyHooks',
+      'account/read',
+      'model/list',
+    ],
+  );
+  assert.notEqual(receipts[0].spawnProfileId, receipts[1].spawnProfileId);
+  assert.equal(
+    receipts[1].expectedStaticProfile.hookArtifactsSha256,
+    hookProfile.hookArtifactsSha256,
+  );
+  assertDeepFrozen(receipts[1].expectedStaticProfile.hookManifest);
+});
+
+test('hook material identity separates manifests and artifact digests', async () => {
+  const base = hookMaterial();
+  const variants = [
+    base,
+    {
+      ...base,
+      hookArtifactsSha256: digest('hook-artifacts-after-mutation'),
+    },
+    {
+      hookManifest: {
+        ...base.hookManifest,
+        entries: [{
+          ...base.hookManifest.entries[0],
+          commandSha256: digest('hook-command-v2'),
+        }],
+      },
+      hookArtifactsSha256: base.hookArtifactsSha256,
+    },
+  ];
+  const ids = [];
+  for (const variant of variants) {
+    const profile = expectedProfile(variant);
+    const result = await preflightCodexRuntime(profile, {
+      clientFactory: () => new FakeClient(staticResults(profile)),
+    });
+    ids.push(createCodexSpawnProfile(profile, result).spawnProfileId);
+  }
+
+  assert.equal(new Set(ids).size, ids.length);
+});
+
+test('a pinned manifest requires a verifying client and a passing verification', async () => {
+  const profile = expectedProfile(hookMaterial());
+  await assert.rejects(
+    preflightCodexRuntime(profile, {
+      clientFactory: () => {
+        const client = new FakeClient(staticResults(profile));
+        client.verifyHooks = undefined;
+        return client;
+      },
+    }),
+    TypeError,
+  );
+
+  const unverified = Object.assign(
+    new Error('hook inventory did not match the pinned manifest'),
+    { code: 'CODEX_HOOK_TRUST_UNVERIFIED' },
+  );
+  const client = new FakeClient(staticResults(profile), {
+    failures: { verifyHooks: unverified },
+  });
+  await assert.rejects(
+    preflightCodexRuntime(profile, { clientFactory: () => client }),
+    (error) => error.code === 'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+  assert.equal(client.closed, 1);
+  assert.deepEqual(
+    client.calls.map(({ method }) => method),
+    [
+      'config/read',
+      'configRequirements/read',
+      'permissionProfile/list',
+      'verifyHooks',
+    ],
+  );
+});
+
+test('a manifest and its artifact digest cannot be carried separately', async () => {
+  const material = hookMaterial();
+  for (const partial of [
+    { hookManifest: material.hookManifest },
+    { hookArtifactsSha256: material.hookArtifactsSha256 },
+    {
+      hookManifest: material.hookManifest,
+      hookArtifactsSha256: 'not-a-digest',
+    },
+    {
+      hookManifest: { ownedCwd: material.hookManifest.ownedCwd, entries: [] },
+      hookArtifactsSha256: material.hookArtifactsSha256,
+    },
+  ]) {
+    const profile = expectedProfile(partial);
+    await assert.rejects(
+      preflightCodexRuntime(profile, {
+        clientFactory: () => new FakeClient(staticResults(profile)),
+      }),
+      TypeError,
+    );
+  }
+});
+
+const HOOKS_OFF_PROFILE_KEYS = Object.freeze([
+  'runtime',
+  'binary',
+  'target',
+  'binarySha256',
+  'cliVersion',
+  'protocolSchemaSha256',
+  'codexHome',
+  'cwd',
+  'env',
+  'allowlistedEnvironmentFingerprint',
+  'ownedConfigSha256',
+  'expectedConfigSha256',
+  'expectedConfig',
+  'expectedLayers',
+  'expectedOriginsSha256',
+  'expectedRequirements',
+  'expectedPermissionProfiles',
+  'permissionProfileId',
+  'model',
+  'effort',
+  'sessionLauncher',
+  'sessionLauncherSha256',
+]);
+const HOOKS_OFF_CLIENT_OPTION_KEYS = Object.freeze([
+  'binary',
+  'sessionLauncher',
+  'expectedSessionLauncherSha256',
+  'cwd',
+  'codexHome',
+  'env',
+  'expectedConfigSha256',
+  'onNotification',
+  'onFault',
+]);
+
+test('a hooks-off profile and client construction carry no hook keys at all', async () => {
+  const profile = expectedProfile();
+  const clientOptions = [];
+  const result = await preflightCodexRuntime(profile, {
+    clientFactory: (options) => {
+      clientOptions.push(options);
+      return new FakeClient(staticResults(profile));
+    },
+  });
+  const receipt = createCodexSpawnProfile(profile, result);
+
+  assert.deepEqual(
+    Object.keys(receipt.expectedStaticProfile),
+    HOOKS_OFF_PROFILE_KEYS,
+  );
+  assert.deepEqual(Object.keys(clientOptions[0]), HOOKS_OFF_CLIENT_OPTION_KEYS);
+  assert.equal(
+    Object.hasOwn(receipt.expectedStaticProfile, 'hookManifest'),
+    false,
+  );
+  assert.equal(
+    Object.hasOwn(receipt.expectedStaticProfile, 'hookArtifactsSha256'),
+    false,
+  );
+  assert.equal(Object.hasOwn(clientOptions[0], 'hookManifest'), false);
+  assert.equal(
+    receipt.spawnProfileId,
+    HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET[profile.target],
+  );
+});
+
+test('a hooks-on profile adds exactly the two hook keys and one client option', async () => {
+  const profile = expectedProfile(hookMaterial());
+  const clientOptions = [];
+  const result = await preflightCodexRuntime(profile, {
+    clientFactory: (options) => {
+      clientOptions.push(options);
+      return new FakeClient(staticResults(profile));
+    },
+  });
+  const receipt = createCodexSpawnProfile(profile, result);
+
+  assert.deepEqual(
+    Object.keys(receipt.expectedStaticProfile),
+    [...HOOKS_OFF_PROFILE_KEYS, 'hookManifest', 'hookArtifactsSha256'],
+  );
+  assert.deepEqual(
+    Object.keys(clientOptions[0]).filter(
+      (key) => !HOOKS_OFF_CLIENT_OPTION_KEYS.includes(key),
+    ),
+    ['hookManifest'],
   );
 });

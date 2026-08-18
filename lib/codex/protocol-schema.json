@@ -106,6 +106,14 @@
       "optional": [],
       "stateChanging": true
     },
+    "hooks/list": {
+      "required": [
+        "cwds"
+      ],
+      "optional": [],
+      "internal": true,
+      "stateChanging": false
+    },
     "thread/backgroundTerminals/list": {
       "required": [
         "threadId"

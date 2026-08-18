@@ -186,8 +186,24 @@ async function emitDescriptorMessages(descriptor) {
   }
 }
 
+// A method may answer differently on successive calls: `sequence` holds one
+// descriptor overlay per call, and the last one repeats once it is reached.
+// Scenarios without a sequence behave exactly as they always did.
+function stepDescriptor(descriptor) {
+  if (!Array.isArray(descriptor.sequence) || descriptor.sequence.length === 0) {
+    return descriptor;
+  }
+  const index = Math.min(
+    descriptor.sequenceCursor ?? 0,
+    descriptor.sequence.length - 1,
+  );
+  descriptor.sequenceCursor = index + 1;
+  return { ...descriptor, ...descriptor.sequence[index] };
+}
+
 async function sendResponse(entry) {
-  const { message, descriptor } = entry;
+  const { message } = entry;
+  const descriptor = stepDescriptor(entry.descriptor);
   if (descriptor.delayMs) {
     await new Promise((resolve) => setTimeout(resolve, descriptor.delayMs));
   }
@@ -254,7 +270,9 @@ async function flushBatch() {
   const entries = pendingBatch.splice(0);
   if (scenario.reverseBatch) entries.reverse();
   const responses = [];
-  for (const { message, descriptor } of entries) {
+  for (const entry of entries) {
+    const { message } = entry;
+    const descriptor = stepDescriptor(entry.descriptor);
     await emitDescriptorMessages(descriptor);
     if (descriptor.error) {
       responses.push({ id: message.id, error: descriptor.error });

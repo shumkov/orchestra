@@ -3342,3 +3342,769 @@ test('close timer budgets must stay inside the platform timer range', async (t) 
     () => harness.makeClient({ maxQueuedBytes: MAX_TIMER_DELAY_MS + 1 }),
   );
 });
+
+// --- manifest-bound hook verifier -------------------------------------------
+// The verifier is the only path to `hooks/list`. Its whole contract is that a
+// peer response either matches the frozen manifest exactly and yields four
+// closed fields per descriptor, or yields nothing at all.
+
+const HOOK_SOURCE_PATH = '/pinned/hooks.json';
+const HOOK_EVENTS = ['sessionStart', 'userPromptSubmit', 'stop'];
+const MAX_MANIFEST_ENTRIES = 16;
+const HOOK_EVENT_SNAKE = {
+  sessionStart: 'session_start',
+  userPromptSubmit: 'user_prompt_submit',
+  stop: 'stop',
+  // Pinned, but deliberately absent from this manifest: it gives the mutation
+  // cases a well-formed key and event that collide with nothing.
+  sessionEnd: 'session_end',
+};
+
+function sha256Hex(text) {
+  return createHash('sha256').update(text).digest('hex');
+}
+
+function hookCommand(event) {
+  return `/pinned/runtime /pinned/recorder.js ${event} /pinned/capture`;
+}
+
+function hookConfigKey(event, index = 0, sub = 0) {
+  return `${HOOK_SOURCE_PATH}:${HOOK_EVENT_SNAKE[event]}:${index}:${sub}`;
+}
+
+function hookDescriptor(event, ordinal) {
+  return {
+    ordinal,
+    configKey: hookConfigKey(event),
+    sourcePath: HOOK_SOURCE_PATH,
+    event,
+    handlerType: 'command',
+    source: 'user',
+    isManaged: false,
+    displayOrder: ordinal,
+    timeoutSec: 600,
+    commandSha256: sha256Hex(hookCommand(event)),
+  };
+}
+
+function hookManifest(ownedCwd, overrides = {}) {
+  return {
+    ownedCwd,
+    entries: HOOK_EVENTS.map(hookDescriptor),
+    ...overrides,
+  };
+}
+
+function hookMetadata(event, ordinal, trustStatus) {
+  return {
+    currentHash: `sha256:${sha256Hex(`hash:${event}`)}`,
+    displayOrder: ordinal,
+    enabled: true,
+    eventName: event,
+    handlerType: 'command',
+    isManaged: false,
+    key: hookConfigKey(event),
+    source: 'user',
+    sourcePath: HOOK_SOURCE_PATH,
+    timeoutSec: 600,
+    trustStatus,
+    additionalContextLimit: null,
+    command: hookCommand(event),
+    matcher: null,
+    pluginId: null,
+    statusMessage: null,
+  };
+}
+
+function hooksListResult(trustStatus = 'trusted', mutate) {
+  const hooks = HOOK_EVENTS.map(
+    (event, index) => hookMetadata(event, index, trustStatus),
+  );
+  const entry = {
+    cwd: '__OWNED_CWD__',
+    errors: [],
+    warnings: [],
+    hooks,
+  };
+  const result = { data: [entry] };
+  if (mutate) mutate(hooks, entry, result);
+  return result;
+}
+
+function hooksScenario(result) {
+  return { methods: { 'hooks/list': { result } } };
+}
+
+function expectedVerification(trustStatus = 'trusted') {
+  return HOOK_EVENTS.map((event, ordinal) => ({
+    ordinal,
+    currentHash: `sha256:${sha256Hex(`hash:${event}`)}`,
+    trustStatus,
+    enabled: true,
+  }));
+}
+
+function collectStrings(value, into = [], seen = new Set()) {
+  if (typeof value === 'string') {
+    into.push(value);
+    return into;
+  }
+  if (value instanceof Error) {
+    into.push(String(value.message), String(value.stack));
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (key === 'message' || key === 'stack') continue;
+      collectStrings(value[key], into, seen);
+    }
+    return into;
+  }
+  if (!value || typeof value !== 'object' || seen.has(value)) return into;
+  seen.add(value);
+  for (const child of Object.values(value)) collectStrings(child, into, seen);
+  return into;
+}
+
+async function verifierHarness(t, scenario) {
+  const harness = createHarness(t, scenario);
+  const emitted = [];
+  const faults = [];
+  const client = harness.makeClient({
+    hookManifest: hookManifest(harness.cwd),
+    onFault: async (outcome) => { faults.push(outcome); },
+  });
+  const originalEmit = client.emit.bind(client);
+  client.emit = (event, ...args) => {
+    emitted.push({ event, args });
+    return originalEmit(event, ...args);
+  };
+  await client.start();
+  return { harness, client, emitted, faults };
+}
+
+test('the hook verifier projects a matching inventory to closed ordinal trust', async (t) => {
+  const { harness, client } = await verifierHarness(
+    t,
+    hooksScenario(hooksListResult('trusted')),
+  );
+
+  const verified = await client.verifyHooks({ phase: 'trusted' });
+
+  assert.deepEqual(verified, expectedVerification('trusted'));
+  assert.equal(Object.isFrozen(verified), true);
+  for (const entry of verified) {
+    assert.equal(Object.isFrozen(entry), true);
+    assert.deepEqual(
+      Object.keys(entry).sort(),
+      ['currentHash', 'enabled', 'ordinal', 'trustStatus'],
+    );
+  }
+  assert.deepEqual(
+    verified.map((entry) => entry.ordinal),
+    [0, 1, 2],
+  );
+  const dispatched = harness.requests()
+    .filter((message) => message.method === 'hooks/list');
+  assert.equal(dispatched.length, 1);
+  assert.deepEqual(dispatched[0].params, { cwds: [harness.cwd] });
+});
+
+test('the discovery phase accepts the observed enabled-and-untrusted state', async (t) => {
+  const { client } = await verifierHarness(
+    t,
+    hooksScenario(hooksListResult('untrusted')),
+  );
+
+  assert.deepEqual(
+    await client.verifyHooks({ phase: 'discovery' }),
+    expectedVerification('untrusted'),
+  );
+});
+
+test('hooks/list stays refused on the public request surface', async (t) => {
+  const { harness, client } = await verifierHarness(
+    t,
+    hooksScenario(hooksListResult('trusted')),
+  );
+  await waitForInitializedLog(harness);
+  const before = harness.requests().length;
+
+  await rejectedWithCode(
+    client.request('hooks/list', { cwds: [harness.cwd] }, { timeoutMs: 500 }),
+    'CODEX_RPC_REJECTED',
+  );
+  await rejectedWithCode(
+    client.request('hooks/list', {}, { timeoutMs: 500 }),
+    'CODEX_RPC_REJECTED',
+  );
+
+  assert.equal(harness.requests().length, before);
+  assert.doesNotThrow(() => client.assertHealthy());
+  assert.equal(protocolSchema.clientRequests['hooks/list'].internal, true);
+  assert.deepEqual(
+    protocolSchema.clientRequests['hooks/list'].required,
+    ['cwds'],
+  );
+  assert.deepEqual(protocolSchema.clientRequests['hooks/list'].optional, []);
+  assert.equal(
+    protocolSchema.clientRequests['hooks/list'].stateChanging,
+    false,
+  );
+});
+
+test('a manifest cwd outside the owned workspace is rejected before the wire', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  const client = harness.makeClient({
+    hookManifest: hookManifest(harness.cwd, {
+      ownedCwd: path.join(path.dirname(harness.cwd), 'foreign-workspace'),
+    }),
+  });
+  await client.start();
+  await waitForInitializedLog(harness);
+  const before = harness.requests().length;
+
+  await rejectedWithCode(
+    client.verifyHooks({ phase: 'trusted' }),
+    'CODEX_RPC_REJECTED',
+  );
+
+  assert.equal(harness.requests().length, before);
+});
+
+test('the frozen manifest cannot be replaced, narrowed, or supplied per call', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  const source = hookManifest(harness.cwd);
+  const client = harness.makeClient({ hookManifest: source });
+  await client.start();
+
+  source.entries.pop();
+  source.ownedCwd = '/elsewhere';
+  assert.throws(() => {
+    client.hookManifest = hookManifest(harness.cwd, { entries: [] });
+  }, TypeError);
+  assert.equal(Object.isFrozen(client.hookManifest), true);
+  assert.equal(Object.isFrozen(client.hookManifest.entries), true);
+  assert.equal(Object.isFrozen(client.hookManifest.entries[0]), true);
+
+  await rejectedWithCode(
+    client.verifyHooks({
+      phase: 'trusted',
+      hookManifest: hookManifest(harness.cwd, { entries: [] }),
+    }),
+    'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+  await rejectedWithCode(
+    client.verifyHooks({ phase: 'nonsense' }),
+    'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+  assert.deepEqual(
+    await client.verifyHooks({ phase: 'trusted' }),
+    expectedVerification('trusted'),
+  );
+});
+
+test('a client without a manifest cannot verify hooks at all', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  const client = harness.makeClient();
+  await client.start();
+  await waitForInitializedLog(harness);
+  const before = harness.requests().length;
+
+  assert.equal(client.hookManifest, null);
+  await rejectedWithCode(
+    client.verifyHooks({ phase: 'trusted' }),
+    'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+  assert.equal(harness.requests().length, before);
+});
+
+test('hook verification is refused before the client is ready', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  const client = harness.makeClient({
+    hookManifest: hookManifest(harness.cwd),
+  });
+
+  await rejectedWithCode(
+    client.verifyHooks({ phase: 'trusted' }),
+    'CODEX_CLIENT_STATE',
+  );
+});
+
+test('no hook peer text crosses into the return value, errors, events, or faults', async (t) => {
+  const sentinel = 'MUST_NOT_CROSS_HOOK_TEXT';
+  const { client, emitted, faults } = await verifierHarness(
+    t,
+    hooksScenario(hooksListResult('trusted', (hooks, entry) => {
+      hooks[0].key = `${sentinel}_KEY`;
+      hooks[0].sourcePath = `${sentinel}_SOURCE_PATH`;
+      hooks[0].command = `${sentinel}_COMMAND`;
+      hooks[0].statusMessage = `${sentinel}_STATUS`;
+      hooks[0].matcher = `${sentinel}_MATCHER`;
+      hooks[0].pluginId = `${sentinel}_PLUGIN`;
+      hooks[0].additionalContextLimit = 4096;
+      entry.cwd = `${sentinel}_CWD`;
+      entry.errors = [`${sentinel}_ERROR`];
+      entry.warnings = [`${sentinel}_WARNING`];
+    })),
+  );
+
+  const error = await rejectedWithCode(
+    client.verifyHooks({ phase: 'trusted' }),
+    'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+
+  // An inventory that cannot be trusted ends the client rather than leaving a
+  // session that could still dispatch a turn.
+  assert.throws(() => client.assertHealthy(), (thrown) => (
+    thrown.code === 'CODEX_HOOK_TRUST_UNVERIFIED'
+  ));
+  const outcome = await client.waitForFault();
+  assert.equal(outcome.errorCode, 'CODEX_HOOK_TRUST_UNVERIFIED');
+  assert.deepEqual(faults, [outcome]);
+
+  const observed = [
+    ...collectStrings(error),
+    ...collectStrings(emitted),
+    ...collectStrings(faults),
+  ];
+  assert.ok(observed.length > 0);
+  for (const text of observed) {
+    assert.equal(
+      text.includes(sentinel),
+      false,
+      `hook peer text leaked: ${text}`,
+    );
+  }
+});
+
+test('phase rules reject every wrong-phase trust status and disabled hook', async (t) => {
+  const cases = [
+    ['trusted entry during discovery', 'discovery', (hooks) => {
+      hooks[1].trustStatus = 'trusted';
+    }],
+    ['untrusted entry during trusted', 'trusted', (hooks) => {
+      hooks[2].trustStatus = 'untrusted';
+    }],
+    ['modified entry during trusted', 'trusted', (hooks) => {
+      hooks[0].trustStatus = 'modified';
+    }],
+    ['managed entry during trusted', 'trusted', (hooks) => {
+      hooks[0].trustStatus = 'managed';
+    }],
+    ['managed entry during discovery', 'discovery', (hooks) => {
+      hooks[0].trustStatus = 'managed';
+    }],
+    ['disabled hook during trusted', 'trusted', (hooks) => {
+      hooks[1].enabled = false;
+    }],
+    ['disabled hook during discovery', 'discovery', (hooks) => {
+      hooks[1].enabled = false;
+    }],
+    ['unknown trust status', 'trusted', (hooks) => {
+      hooks[0].trustStatus = 'partiallyTrusted';
+    }],
+  ];
+
+  for (const [name, phase, mutate] of cases) {
+    await t.test(name, async (subtest) => {
+      const base = phase === 'discovery' ? 'untrusted' : 'trusted';
+      const { client } = await verifierHarness(
+        subtest,
+        hooksScenario(hooksListResult(base, mutate)),
+      );
+      await rejectedWithCode(
+        client.verifyHooks({ phase }),
+        'CODEX_HOOK_TRUST_UNVERIFIED',
+      );
+    });
+  }
+});
+
+test('the pinned optional shape is the only accepted one', async (t) => {
+  const cases = [
+    ['command missing', (hooks) => { delete hooks[0].command; }],
+    ['command null', (hooks) => { hooks[0].command = null; }],
+    ['command digest mismatch', (hooks) => {
+      hooks[0].command = `${hookCommand(HOOK_EVENTS[0])} --extra`;
+    }],
+    ['additionalContextLimit missing', (hooks) => {
+      delete hooks[1].additionalContextLimit;
+    }],
+    ['additionalContextLimit non-null', (hooks) => {
+      hooks[1].additionalContextLimit = 0;
+    }],
+    ['matcher missing', (hooks) => { delete hooks[1].matcher; }],
+    ['matcher non-null', (hooks) => { hooks[1].matcher = '*'; }],
+    ['pluginId missing', (hooks) => { delete hooks[2].pluginId; }],
+    ['pluginId non-null', (hooks) => { hooks[2].pluginId = 'plugin'; }],
+    ['statusMessage missing', (hooks) => { delete hooks[2].statusMessage; }],
+    ['statusMessage non-null', (hooks) => { hooks[2].statusMessage = 'ok'; }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async (subtest) => {
+      const { client } = await verifierHarness(
+        subtest,
+        hooksScenario(hooksListResult('trusted', mutate)),
+      );
+      await rejectedWithCode(
+        client.verifyHooks({ phase: 'trusted' }),
+        'CODEX_HOOK_TRUST_UNVERIFIED',
+      );
+    });
+  }
+});
+
+test('whole-inventory exactness refuses every manifest deviation', async (t) => {
+  const cases = [
+    ['extra hook', (hooks) => {
+      hooks.push(hookMetadata('stop', 3, 'trusted'));
+    }],
+    ['missing hook', (hooks) => { hooks.pop(); }],
+    ['single-entry inventory', (hooks) => { hooks.splice(1); }],
+    ['empty inventory', (hooks) => { hooks.splice(0); }],
+    ['duplicate key', (hooks) => {
+      hooks[2].key = hooks[1].key;
+      hooks[2].eventName = hooks[1].eventName;
+    }],
+    ['reordered inventory', (hooks) => {
+      const [first, ...rest] = hooks.splice(0);
+      hooks.push(...rest, first);
+    }],
+    ['nonzero key index', (hooks) => {
+      hooks[0].key = hookConfigKey(HOOK_EVENTS[0], 1, 0);
+    }],
+    ['nonzero key sub-index', (hooks) => {
+      hooks[0].key = hookConfigKey(HOOK_EVENTS[0], 0, 1);
+    }],
+    ['foreign source path', (hooks) => {
+      hooks[1].sourcePath = '/foreign/hooks.json';
+    }],
+    ['handlerType mismatch', (hooks) => { hooks[0].handlerType = 'prompt'; }],
+    ['source mismatch', (hooks) => { hooks[0].source = 'project'; }],
+    ['isManaged mismatch', (hooks) => { hooks[0].isManaged = true; }],
+    ['wrong displayOrder', (hooks) => { hooks[1].displayOrder = 7; }],
+    ['wrong timeoutSec', (hooks) => { hooks[1].timeoutSec = 60; }],
+    ['unknown field', (hooks) => { hooks[2].experimental = true; }],
+    ['malformed currentHash', (hooks) => {
+      hooks[2].currentHash = 'not-a-digest';
+    }],
+    ['uppercase currentHash', (hooks) => {
+      hooks[2].currentHash = `sha256:${'A'.repeat(64)}`;
+    }],
+    ['missing required field', (hooks) => { delete hooks[0].timeoutSec; }],
+    // Each of these moves exactly one field and leaves every other field of
+    // every entry exactly right, so a peer that matches on everything else
+    // cannot hide a comparison that was dropped.
+    // A pinned event the manifest does not carry: neither the closed enum nor
+    // per-event uniqueness can catch this, only the comparison against the
+    // descriptor's own event.
+    ['eventName swapped for an unmanifested pinned event', (hooks) => {
+      hooks[0].eventName = 'sessionEnd';
+    }],
+    ['eventName outside the pinned set', (hooks) => {
+      hooks[0].eventName = 'sessionRestart';
+    }],
+    // A well-formed key for an event the manifest does not carry: no other
+    // entry collides with it, so only the comparison against the descriptor's
+    // own key can refuse it.
+    ['key swapped for an unmanifested well-formed key', (hooks) => {
+      hooks[0].key = hookConfigKey('sessionEnd');
+    }],
+    ['sourcePath swapped for a sibling path', (hooks) => {
+      hooks[1].sourcePath = `${HOOK_SOURCE_PATH}.bak`;
+    }],
+    ['enabled as a string', (hooks) => { hooks[1].enabled = 'true'; }],
+    ['isManaged as a string', (hooks) => { hooks[1].isManaged = 'false'; }],
+    ['timeoutSec as a string', (hooks) => { hooks[1].timeoutSec = '600'; }],
+    ['displayOrder as a string', (hooks) => { hooks[2].displayOrder = '2'; }],
+    ['currentHash without its algorithm prefix', (hooks) => {
+      hooks[2].currentHash = sha256Hex('hash:stop');
+    }],
+    ['command as a number', (hooks) => { hooks[2].command = 600; }],
+    ['trustStatus as a boolean', (hooks) => { hooks[0].trustStatus = true; }],
+    ['non-empty errors', (_hooks, entry) => { entry.errors = ['boom']; }],
+    ['non-empty warnings', (_hooks, entry) => { entry.warnings = ['careful']; }],
+    ['foreign cwd', (_hooks, entry) => { entry.cwd = '/foreign/workspace'; }],
+    ['unknown entry field', (_hooks, entry) => { entry.extra = 1; }],
+    ['duplicated cwd entry', (_hooks, entry, result) => {
+      result.data.push({ ...entry });
+    }],
+    ['unknown result field', (_hooks, _entry, result) => {
+      result.nextCursor = null;
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    await t.test(name, async (subtest) => {
+      const { client } = await verifierHarness(
+        subtest,
+        hooksScenario(hooksListResult('trusted', mutate)),
+      );
+      await rejectedWithCode(
+        client.verifyHooks({ phase: 'trusted' }),
+        'CODEX_HOOK_TRUST_UNVERIFIED',
+      );
+    });
+  }
+});
+
+test('a session without a manifest issues no hook verification traffic', async (t) => {
+  const harness = createHarness(t);
+  const client = harness.makeClient();
+  await client.start();
+  await client.request('config/read', {
+    cwd: harness.cwd,
+    includeLayers: true,
+  }, { timeoutMs: 500 });
+  await waitForInitializedLog(harness);
+
+  assert.deepEqual(
+    harness.requests()
+      .filter((message) => Object.hasOwn(message, 'id'))
+      .map((message) => message.method),
+    ['initialize', 'config/read'],
+  );
+});
+
+test('manifest descriptors are rejected unless displayOrder is the ordinal', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  const misordered = hookManifest(harness.cwd);
+  misordered.entries[0] = { ...misordered.entries[0], displayOrder: 9 };
+
+  assert.throws(
+    () => harness.makeClient({ hookManifest: misordered }),
+    TypeError,
+  );
+
+  const sparse = hookManifest(harness.cwd);
+  sparse.entries[2] = { ...sparse.entries[2], ordinal: 3 };
+  assert.throws(
+    () => harness.makeClient({ hookManifest: sparse }),
+    TypeError,
+  );
+
+  const displaced = hookManifest(harness.cwd);
+  displaced.entries[1] = { ...displaced.entries[1], displayOrder: 2 };
+  displaced.entries[2] = { ...displaced.entries[2], displayOrder: 1 };
+  assert.throws(
+    () => harness.makeClient({ hookManifest: displaced }),
+    TypeError,
+  );
+
+  assert.doesNotThrow(
+    () => harness.makeClient({ hookManifest: hookManifest(harness.cwd) }),
+  );
+});
+
+// The boundary these two tests assert: `hooks/list` is absent from the
+// supported public request() surface, and no raw hook metadata reaches a
+// verifier return, a thrown error, an emitted event or a fault outcome.
+// Underscore-prefixed transport internals and the child's own streams are
+// same-process internals; they are not a boundary against a caller that
+// already holds the client object.
+test('every manifest constraint is enforced one field at a time', async (t) => {
+  const harness = createHarness(t, hooksScenario(hooksListResult('trusted')));
+  // A caller-supplied manifest is refused at construction, before any peer is
+  // consulted, so a wrong expectation can never become the thing a response is
+  // measured against.
+  const cases = [
+    ['ownedCwd relative', (manifest) => { manifest.ownedCwd = 'workspace'; }],
+    ['ownedCwd not a string', (manifest) => { manifest.ownedCwd = 1; }],
+    ['entries empty', (manifest) => { manifest.entries = []; }],
+    ['entries not an array', (manifest) => { manifest.entries = {}; }],
+    ['entries past the bound', (manifest) => {
+      manifest.entries = Array.from(
+        { length: MAX_MANIFEST_ENTRIES + 1 },
+        () => hookDescriptor(HOOK_EVENTS[0], 0),
+      );
+    }],
+    ['manifest missing a key', (manifest) => { delete manifest.ownedCwd; }],
+    ['manifest carrying an extra key', (manifest) => { manifest.phase = 'trusted'; }],
+    ['ordinal not the index', (manifest) => {
+      manifest.entries[1] = { ...manifest.entries[1], ordinal: 0 };
+    }],
+    ['displayOrder not the ordinal', (manifest) => {
+      manifest.entries[1] = { ...manifest.entries[1], displayOrder: 0 };
+    }],
+    ['configKey not derived from its own event', (manifest) => {
+      manifest.entries[0] = {
+        ...manifest.entries[0],
+        configKey: hookConfigKey('stop'),
+      };
+    }],
+    ['configKey with a nonzero index', (manifest) => {
+      manifest.entries[0] = {
+        ...manifest.entries[0],
+        configKey: hookConfigKey(HOOK_EVENTS[0], 1, 0),
+      };
+    }],
+    ['event swapped for another pinned event', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], event: 'stop' };
+    }],
+    ['event outside the pinned set', (manifest) => {
+      manifest.entries[0] = {
+        ...manifest.entries[0],
+        event: 'sessionRestart',
+        configKey: `${HOOK_SOURCE_PATH}:session_restart:0:0`,
+      };
+    }],
+    ['sourcePath relative', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], sourcePath: 'hooks.json' };
+    }],
+    ['handlerType not command', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], handlerType: 'prompt' };
+    }],
+    ['source not user', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], source: 'project' };
+    }],
+    ['isManaged true', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], isManaged: true };
+    }],
+    ['timeoutSec zero', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], timeoutSec: 0 };
+    }],
+    ['timeoutSec fractional', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], timeoutSec: 600.5 };
+    }],
+    ['timeoutSec as a string', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], timeoutSec: '600' };
+    }],
+    ['commandSha256 uppercase', (manifest) => {
+      manifest.entries[0] = {
+        ...manifest.entries[0],
+        commandSha256: 'A'.repeat(64),
+      };
+    }],
+    ['commandSha256 truncated', (manifest) => {
+      manifest.entries[0] = {
+        ...manifest.entries[0],
+        commandSha256: 'a'.repeat(63),
+      };
+    }],
+    ['descriptor missing a key', (manifest) => {
+      const { timeoutSec, ...rest } = manifest.entries[0];
+      manifest.entries[0] = rest;
+    }],
+    ['descriptor carrying an extra key', (manifest) => {
+      manifest.entries[0] = { ...manifest.entries[0], matcher: null };
+    }],
+    ['a repeated hook event', (manifest) => {
+      manifest.entries[2] = {
+        ...manifest.entries[0],
+        ordinal: 2,
+        displayOrder: 2,
+      };
+    }],
+  ];
+
+  for (const [name, mutate] of cases) {
+    const manifest = hookManifest(harness.cwd);
+    mutate(manifest);
+    assert.throws(
+      () => harness.makeClient({ hookManifest: manifest }),
+      TypeError,
+      name,
+    );
+  }
+
+  // The same builder, unmutated, is accepted — so the table above is rejecting
+  // its mutations, not a manifest that was never constructible.
+  assert.doesNotThrow(
+    () => harness.makeClient({ hookManifest: hookManifest(harness.cwd) }),
+  );
+});
+
+test('no supported public request surface path can dispatch hooks/list or read raw metadata', async (t) => {
+  const sentinel = 'MUST_NOT_CROSS_RAW_INVENTORY';
+  const { harness, client } = await verifierHarness(
+    t,
+    hooksScenario(hooksListResult('trusted', (hooks, entry) => {
+      hooks[0].command = `${sentinel}_COMMAND`;
+      hooks[0].key = `${sentinel}_KEY`;
+      entry.cwd = `${sentinel}_CWD`;
+    })),
+  );
+  await waitForInitializedLog(harness);
+  const before = harness.requests().length;
+
+  // The raw dispatcher is not a method, so no options bag handed to the
+  // supported surface can carry an internal flag or a projector into it.
+  assert.equal(client._request, undefined);
+  for (
+    let proto = Object.getPrototypeOf(client);
+    proto && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto)
+  ) {
+    assert.equal(
+      Object.getOwnPropertyNames(proto).includes('_request'),
+      false,
+    );
+  }
+
+  const attempts = [
+    () => client.request('hooks/list', { cwds: [harness.cwd] }, {
+      timeoutMs: 500,
+      internal: true,
+      projectResult: (raw) => raw,
+    }),
+    () => client.request('hooks/list', { cwds: [harness.cwd] }, {
+      timeoutMs: 500,
+      internal: true,
+    }),
+    () => client.request('hooks/list', { cwds: [harness.cwd] }, {
+      timeoutMs: 500,
+      projectResult: (raw) => raw,
+    }),
+  ];
+  const observed = [];
+  for (const attempt of attempts) {
+    const error = await rejectedWithCode(attempt(), 'CODEX_RPC_REJECTED');
+    observed.push(...collectStrings(error));
+  }
+
+  assert.equal(harness.requests().length, before);
+  assert.doesNotThrow(() => client.assertHealthy());
+  for (const text of observed) {
+    assert.equal(text.includes(sentinel), false, `raw metadata leaked: ${text}`);
+  }
+
+  // The one supported path still refuses this inventory, and refuses it
+  // without echoing a byte of it.
+  const refusal = await rejectedWithCode(
+    client.verifyHooks({ phase: 'trusted' }),
+    'CODEX_HOOK_TRUST_UNVERIFIED',
+  );
+  for (const text of collectStrings(refusal)) {
+    assert.equal(text.includes(sentinel), false, `raw metadata leaked: ${text}`);
+  }
+});
+
+test('an in-flight hook verification carries no projector on its pending record', async (t) => {
+  const harness = createHarness(t, {
+    methods: { 'hooks/list': { hold: true } },
+  });
+  const client = harness.makeClient({
+    hookManifest: hookManifest(harness.cwd),
+    requestTimeoutMs: 500,
+  });
+  await client.start();
+
+  const verification = client.verifyHooks({ phase: 'trusted' }).then(
+    () => null,
+    (error) => error,
+  );
+  await waitFor(() => client.pending.size === 1, 'hooks/list in flight');
+
+  const [record] = [...client.pending.values()];
+  assert.equal(record.method, 'hooks/list');
+  // The projector lives in module-private state keyed by this record, so a
+  // record forged into the pending map has no projector to borrow.
+  assert.equal(Object.hasOwn(record, 'projectResult'), false);
+  assert.equal(
+    Object.values(record).some((value) => typeof value === 'function'
+      && value.name.includes('project')),
+    false,
+  );
+
+  const error = await verification;
+  assert.equal(error.code, 'CODEX_RPC_TIMEOUT');
+});

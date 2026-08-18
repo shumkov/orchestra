@@ -56,9 +56,16 @@ class FakeClient {
     this.onFault = onFault;
     this.handlers = handlers;
     this.requests = [];
+    this.hookVerifications = [];
     this.closed = false;
     this.closeCount = 0;
     this.faultOutcome = null;
+  }
+
+  async verifyHooks(options) {
+    this.hookVerifications.push(options);
+    if (this.handlers.verifyHooks) return this.handlers.verifyHooks(options, this);
+    return [];
   }
 
   async start() {
@@ -5818,7 +5825,10 @@ test('real U2 client checkpoints containment before closing on response durabili
           LC_ALL: 'C',
         },
         expectedConfigSha256,
-        requestTimeoutMs: 2_000,
+        // The transport budget is the production default on purpose: what this
+        // test pins is the order of durability, containment and close, so a
+        // tighter private budget would only turn a slow spawn into a failure
+        // about something the test does not assert.
         sinkTimeoutMs: 500,
         closeGraceMs: 100,
         closeKillMs: 200,
@@ -5929,5 +5939,206 @@ test('turn-accepted is checkpointed after the turn/start response and before the
     'turn-accepted:turn-ordering',
     'turn-started-delivered',
   ]);
+  await fixture.proc.kill();
+});
+
+// --- hook verification at the session and turn boundaries ---------------------
+// A profile carrying a manifest cannot open, resume, or advance a session
+// without proving hook trust first: a cached profile prepared while trust was
+// valid is worth nothing once the hook content changes underneath it.
+
+let turnSequence = 0;
+async function turnStartHandler(_params, client) {
+  turnSequence += 1;
+  const turnId = `hook-turn-${turnSequence}`;
+  setImmediate(() => startTurnAndComplete(client, { turnId }));
+  return { turn: { id: turnId, status: 'inProgress', items: [], error: null } };
+}
+
+function makeHookProcess({
+  handlers = {},
+  verifications = [],
+  verifyHooks,
+  existingSessionId = null,
+} = {}) {
+  const hookVerifier = async (client, phase) => {
+    verifications.push({ phase, requests: client.requests.length });
+    if (verifyHooks) return verifyHooks(phase);
+    return [];
+  };
+  return makeProcess({
+    handlers,
+    existingSessionId,
+    processOptions: { hookVerifier },
+  });
+}
+
+test('hook trust is verified after initialize and before a fresh thread starts', async () => {
+  const verifications = [];
+  const fixture = makeHookProcess({ verifications });
+
+  await fixture.start();
+
+  assert.deepEqual(verifications, [{ phase: 'trusted', requests: 0 }]);
+  assert.deepEqual(
+    fixture.client.requests.map(({ method }) => method),
+    ['thread/start'],
+  );
+  await fixture.proc.kill();
+});
+
+test('hook trust is verified before a resumed thread starts', async () => {
+  const verifications = [];
+  const fixture = makeHookProcess({
+    verifications,
+    existingSessionId: 'codex-thread',
+  });
+
+  await fixture.start();
+
+  assert.deepEqual(verifications, [{ phase: 'trusted', requests: 0 }]);
+  assert.deepEqual(
+    fixture.client.requests.map(({ method }) => method),
+    ['thread/resume'],
+  );
+  await fixture.proc.kill();
+});
+
+test('hook trust is verified before every turn/start', async () => {
+  const verifications = [];
+  const fixture = makeHookProcess({
+    verifications,
+    handlers: { 'turn/start': turnStartHandler },
+  });
+  await fixture.start();
+
+  for (const prompt of ['first', 'second']) {
+    await fixture.proc.send(prompt);
+  }
+
+  assert.deepEqual(
+    verifications.map(({ phase }) => phase),
+    ['trusted', 'trusted', 'trusted'],
+  );
+  assert.deepEqual(
+    fixture.client.requests.map(({ method }) => method),
+    [
+      'thread/start',
+      'turn/start',
+      'thread/backgroundTerminals/list',
+      'turn/start',
+      'thread/backgroundTerminals/list',
+    ],
+  );
+  // Each verification observed the request log as it stood immediately before
+  // its own turn: nothing had been dispatched for that turn yet.
+  assert.deepEqual(
+    verifications.map(({ requests }) => requests),
+    [0, 1, 3],
+  );
+  await fixture.proc.kill();
+});
+
+test('a failed hook verification stops the session before any thread request', async (t) => {
+  for (const existingSessionId of [null, 'codex-thread']) {
+    await t.test(existingSessionId ? 'resume' : 'fresh', async () => {
+      const fixture = makeHookProcess({
+        existingSessionId,
+        verifyHooks: () => {
+          throw Object.assign(
+            new Error('hook inventory did not match the pinned manifest'),
+            { code: 'CODEX_HOOK_TRUST_UNVERIFIED' },
+          );
+        },
+      });
+
+      await assert.rejects(
+        fixture.start(),
+        (error) => error.code === 'CODEX_HOOK_TRUST_UNVERIFIED',
+      );
+
+      assert.deepEqual(fixture.client.requests.map(({ method }) => method), []);
+      await fixture.proc.kill();
+    });
+  }
+});
+
+test('a failed hook verification keeps a turn unsent', async () => {
+  let fail = false;
+  const fixture = makeHookProcess({
+    verifyHooks: () => {
+      if (!fail) return [];
+      throw Object.assign(
+        new Error('hook inventory did not match the pinned manifest'),
+        { code: 'CODEX_HOOK_TRUST_UNVERIFIED' },
+      );
+    },
+  });
+  await fixture.start();
+  fail = true;
+
+  const error = await fixture.proc.send('prompt').then(
+    () => null,
+    (caught) => caught,
+  );
+
+  assert.ok(error);
+  assert.equal(error.code, 'CODEX_HOOK_TRUST_UNVERIFIED');
+  assert.equal(error.deliveryState, 'not-sent');
+  assert.deepEqual(
+    fixture.client.requests.map(({ method }) => method),
+    ['thread/start'],
+  );
+  await fixture.proc.kill();
+});
+
+test('a client that cannot verify hooks never reaches a thread request', async () => {
+  const requests = [];
+  const proc = new CodexProcess({
+    sessionKey: 'chat:1',
+    chatId: '1',
+    threadId: null,
+    label: 'codex-test',
+    cwd: '/workspace',
+    checkpointSink: async () => {},
+    hostIdentity: 'host-test',
+    bootSessionIdentity: 'boot-test',
+    expectedThreadPolicy: EXPECTED_THREAD_POLICY,
+    modelCatalog: MODEL_CATALOG,
+    logger: SILENT,
+    hookVerifier: async (client, phase) => client.verifyHooks({ phase }),
+    clientFactory: () => ({
+      start: async () => {},
+      request: async (method, params) => {
+        requests.push({ method, params });
+        return {};
+      },
+      close: async () => {},
+      waitForFault: async () => null,
+    }),
+  });
+
+  await assert.rejects(
+    proc.start({ model: 'gpt-5.6-sol', effort: 'xhigh' }),
+    TypeError,
+  );
+
+  assert.deepEqual(requests, []);
+  await proc.kill();
+});
+
+test('a session without a hook verifier issues the unchanged request sequence', async () => {
+  const fixture = makeProcess({
+    handlers: { 'turn/start': turnStartHandler },
+  });
+  await fixture.start();
+  await fixture.proc.send('prompt');
+
+  assert.equal(fixture.proc.hookVerifier, null);
+  assert.deepEqual(
+    fixture.client.requests.map(({ method }) => method),
+    ['thread/start', 'turn/start', 'thread/backgroundTerminals/list'],
+  );
+  assert.deepEqual(fixture.client.hookVerifications, []);
   await fixture.proc.kill();
 });

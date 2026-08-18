@@ -166,6 +166,7 @@ async function codexSpawnProfile({
     },
     async close() {},
     async waitForFault() { return null; },
+    async verifyHooks() { return []; },
   };
   const result = await preflightCodexRuntime(profile, {
     clientFactory: () => client,
@@ -904,5 +905,72 @@ test('public Codex exports are inert at package require time', () => {
   assert.equal(
     child.stdout,
     '["function","function","function","function","function","function","function","function","object"]',
+  );
+});
+
+// --- hook verification plumbing ----------------------------------------------
+
+const FACTORY_HOOK_SOURCE_PATH = '/opt/orchestra/hook-artifacts/1/hooks.json';
+
+function codexHookMaterial(cwd = '/trusted/workspace') {
+  return {
+    hookManifest: {
+      ownedCwd: cwd,
+      entries: [{
+        ordinal: 0,
+        configKey: `${FACTORY_HOOK_SOURCE_PATH}:stop:0:0`,
+        sourcePath: FACTORY_HOOK_SOURCE_PATH,
+        event: 'stop',
+        handlerType: 'command',
+        source: 'user',
+        isManaged: false,
+        displayOrder: 0,
+        timeoutSec: 600,
+        commandSha256: digest('hook-command'),
+      }],
+    },
+    hookArtifactsSha256: digest('hook-artifacts'),
+  };
+}
+
+test('a profile without hook material gives the process no hook verifier', async () => {
+  const spawnProfile = await codexSpawnProfile();
+  const factory = await makeCodexFactory({ codexSpawnProfile: spawnProfile });
+
+  const proc = factory('codex-session', {
+    runtime: 'codex',
+    spawnProfileId: spawnProfile.spawnProfileId,
+    modelSettings: { model: 'gpt-5.6-sol', effort: 'xhigh' },
+  });
+
+  assert.equal(proc.hookVerifier, null);
+  assert.equal(
+    Object.hasOwn(spawnProfile.expectedStaticProfile, 'hookManifest'),
+    false,
+  );
+});
+
+test('a profile carrying hook material binds a trusted-phase verifier', async () => {
+  const spawnProfile = await codexSpawnProfile(codexHookMaterial());
+  const factory = await makeCodexFactory({ codexSpawnProfile: spawnProfile });
+  const proc = factory('codex-session', {
+    runtime: 'codex',
+    spawnProfileId: spawnProfile.spawnProfileId,
+    modelSettings: { model: 'gpt-5.6-sol', effort: 'xhigh' },
+  });
+
+  assert.equal(typeof proc.hookVerifier, 'function');
+  const verifications = [];
+  const client = {
+    verifyHooks: async (options) => {
+      verifications.push(options);
+      return [];
+    },
+  };
+  await proc.hookVerifier(client, 'trusted');
+  assert.deepEqual(verifications, [{ phase: 'trusted' }]);
+  assert.equal(
+    spawnProfile.expectedStaticProfile.hookArtifactsSha256,
+    codexHookMaterial().hookArtifactsSha256,
   );
 });

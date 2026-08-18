@@ -81,6 +81,103 @@ test('CliProcess construction — valid params', () => {
   assert.equal(p.bridgeReady, false);
 });
 
+test('folded reply attribution requires an echoed fold plus one uniquely consumed pending turn', () => {
+  const p = handshakeProcess();
+  p.pendingTurns.set('primary', {});
+  p.inputLedger.set('primary', { source: 'primary', msgId: '6406' });
+  p.inputLedger.set('autosteer', { source: 'autosteer', msgId: '6407' });
+  p.inputLedger.set('edit-fold', { source: 'edit-fold', msgId: '6408' });
+  p.inputLedger.set('old-primary', { source: 'primary', msgId: '6399' });
+
+  assert.deepEqual(
+    p._resolveReplyAttribution('autosteer', ['primary', 'autosteer']),
+    {
+      echoedTurnId: 'autosteer',
+      effectiveTurnId: 'primary',
+      sourceEntry: p.inputLedger.get('primary'),
+      foldSource: 'autosteer',
+    },
+    'an explicitly consumed autosteer fold maps to the live primary',
+  );
+  assert.deepEqual(
+    p._resolveReplyAttribution('edit-fold', ['edit-fold', 'primary', 'primary']),
+    {
+      echoedTurnId: 'edit-fold',
+      effectiveTurnId: 'primary',
+      sourceEntry: p.inputLedger.get('primary'),
+      foldSource: 'edit-fold',
+    },
+    'edit folds use the same rule and duplicate consumed ids do not create ambiguity',
+  );
+
+  for (const [label, echoedTurnId, consumedTurnIds] of [
+    ['the echoed fold is absent from consumed ids', 'autosteer', ['primary']],
+    ['the current primary is absent from consumed ids', 'autosteer', ['autosteer']],
+    ['a non-fold ledger source echoes an old turn', 'old-primary', ['old-primary', 'primary']],
+  ]) {
+    const attribution = p._resolveReplyAttribution(echoedTurnId, consumedTurnIds);
+    assert.equal(attribution.effectiveTurnId, echoedTurnId, label);
+    assert.equal(attribution.foldSource, null, label);
+    assert.equal(attribution.sourceEntry, p.inputLedger.get(echoedTurnId), label);
+  }
+
+  p.pendingTurns.set('other-primary', {});
+  const ambiguous = p._resolveReplyAttribution(
+    'autosteer',
+    ['autosteer', 'primary', 'other-primary'],
+  );
+  assert.equal(ambiguous.effectiveTurnId, 'autosteer',
+    'multiple consumed pending turns never guess an owner');
+  assert.equal(ambiguous.foldSource, null);
+  assert.equal(ambiguous.sourceEntry, p.inputLedger.get('autosteer'));
+
+  p.pendingTurns.clear();
+  assert.deepEqual(
+    p._resolveReplyAttribution('autosteer', ['autosteer']),
+    {
+      echoedTurnId: 'autosteer',
+      effectiveTurnId: 'autosteer',
+      sourceEntry: p.inputLedger.get('autosteer'),
+      foldSource: null,
+    },
+    'without a live primary, an autosteer reply remains independently attributable',
+  );
+});
+
+test('an interim folded reply stays interim and preserves the produced-final Stop rescue', () => {
+  const p = handshakeProcess();
+  const pending = {
+    replies: [],
+    replyCount: 0,
+    hardTimer: null,
+    quietTimer: null,
+    _stopHookData: { lastAssistantMessage: 'The completed answer.' },
+  };
+  p.pendingTurns.set('primary', pending);
+  p.inputLedger.set('primary', { source: 'primary', msgId: '6406' });
+  p.inputLedger.set('autosteer', { source: 'autosteer', msgId: '6407' });
+
+  const attribution = p._resolveReplyAttribution(
+    'autosteer',
+    ['primary', 'autosteer'],
+  );
+  assert.equal(
+    p._recordReplyForPendingTurn('Researching now…', attribution.effectiveTurnId, true),
+    true,
+  );
+
+  assert.equal(pending._interimReplyCount, 1);
+  assert.deepEqual(
+    p._computeTurnDelivery(pending, 'primary'),
+    {
+      text: 'The completed answer.',
+      alreadyDelivered: false,
+      branch: 'interim-rescue',
+    },
+  );
+  clearTimeout(pending.quietTimer);
+});
+
 function activeCleanRestartProcess(overrides = {}) {
   const p = handshakeProcess(overrides);
   const turnId = 'turn-active';

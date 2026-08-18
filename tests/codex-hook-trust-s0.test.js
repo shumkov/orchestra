@@ -398,7 +398,7 @@ test('a content-bearing envelope is refused rather than printed', async () => {
 // `--runtime`.
 test('a shared root-owned 0755 runtime passes without being required to be owner-only', async () => {
   const { attestArtifact } = await import(s0Url);
-  const receipt = attestArtifact('/bin/sh', 'system-runtime');
+  const receipt = attestArtifact('/usr/bin/env', 'system-runtime');
   assert.equal(receipt.ownerIsRoot, true);
   assert.equal(receipt.ownerOnlyMode, false, 'the fixture must not be owner-only');
   assert.equal(receipt.groupOrWorldWritable, false);

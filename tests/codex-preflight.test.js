@@ -1217,6 +1217,12 @@ test('spawn profile receipt rejects incomplete, extra, or forged preflight data'
 // reused for a session that assumes the old content.
 
 const HOOK_SOURCE_PATH = '/opt/orchestra/hook-artifacts/1/hooks.json';
+const HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET = Object.freeze({
+  'aarch64-apple-darwin':
+    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+  'x86_64-unknown-linux-musl':
+    'cd133c6b3cacadad95a31cb651acff440272a33c011fadf803da3cfddf456f50',
+});
 
 function hookMaterial(profile = expectedProfile()) {
   return {
@@ -1248,7 +1254,7 @@ test('the hooks-off spawn fingerprint is byte-identical to its pinned value', as
 
   assert.equal(
     receipt.spawnProfileId,
-    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+    HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET[profile.target],
   );
   assert.equal(
     Object.hasOwn(receipt.expectedStaticProfile, 'hookManifest'),
@@ -1459,7 +1465,7 @@ test('a hooks-off profile and client construction carry no hook keys at all', as
   assert.equal(Object.hasOwn(clientOptions[0], 'hookManifest'), false);
   assert.equal(
     receipt.spawnProfileId,
-    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+    HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET[profile.target],
   );
 });
 

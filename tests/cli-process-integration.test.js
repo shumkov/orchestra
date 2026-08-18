@@ -290,6 +290,350 @@ test('reply tool call: no ledgered participant → dispatcher gets participantJi
   await cp.kill('test');
 });
 
+test('2026-08-17 routine: a combined autosteer reply belongs to the primary message, not the folded follow-up', async t => {
+  const dispatched = [];
+  const events = [];
+  const cp = makeCliProcess({
+    toolDispatcher: async (call) => {
+      dispatched.push(call);
+      return { ok: true, message_id: 6408 };
+    },
+  });
+  cp.db = { logEvent: (kind, detail) => events.push({ kind, detail }) };
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Which Xero field and date should I use?', {
+    context: { sourceMsgId: 6406 },
+  });
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+
+  assert.equal(cp.injectUserMessage({
+    content: 'Were the receipts uploaded?',
+    msgId: 6407,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+
+  const combinedAnswer = 'Use the transaction date in Xero. The receipts are uploaded.';
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'routine-6408',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: combinedAnswer,
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [primary.turn_id, folded.turn_id],
+    },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'routine-6408');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(dispatched.length, 1);
+  assert.equal(dispatched[0].turnId, primary.turn_id,
+    'the active preview and dispatcher keep the primary turn owner');
+  assert.equal(dispatched[0].sourceMsgId, 6406,
+    'the combined answer quotes the primary message instead of the folded follow-up');
+  assert.deepEqual(cp.pendingTurns.get(primary.turn_id)?.replies, [combinedAnswer],
+    'the delivered final is recorded on the primary turn');
+  assert.equal(events.some(event => event.kind === 'cli-late-reply-correlated'), false,
+    'a proven current fold is not classified as a late reply');
+  assert.deepEqual(
+    events.find(event => event.kind === 'cli-fold-reply-attributed')?.detail,
+    {
+      chat_id: cp.chatId,
+      thread_id: cp.threadId,
+      session_key: cp.sessionKey,
+      backend: cp.backend,
+      echoed_turn_id: folded.turn_id,
+      effective_turn_id: primary.turn_id,
+      source: 'autosteer',
+      interim: false,
+    },
+    'telemetry records the delivered folded attribution without message content',
+  );
+
+  const pending = cp.pendingTurns.get(primary.turn_id);
+  cp._captureStopHookData(pending, {
+    lastAssistantMessage: 'Receipts uploaded; use the transaction date.',
+  });
+  cp._finalizeTurn(primary.turn_id);
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true,
+    'a distinct Stop recap does not create a second fallback answer');
+  assert.equal(result.text, combinedAnswer);
+});
+
+test('an unproven old autosteer reply stays late through dispatch, quoting, and bookkeeping', async t => {
+  const dispatched = [];
+  const events = [];
+  const cp = makeCliProcess({
+    toolDispatcher: async (call) => {
+      dispatched.push(call);
+      return { ok: true, message_id: 6410 };
+    },
+  });
+  cp.db = { logEvent: (kind, detail) => events.push({ kind, detail }) };
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Current primary', { context: { sourceMsgId: 6406 } });
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  assert.equal(cp.injectUserMessage({
+    content: 'Earlier folded follow-up',
+    msgId: 6407,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'late-autosteer',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: 'Reply for the old follow-up',
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [folded.turn_id],
+    },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'late-autosteer');
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(dispatched[0].turnId, folded.turn_id);
+  assert.equal(dispatched[0].sourceMsgId, 6407);
+  assert.deepEqual(cp.pendingTurns.get(primary.turn_id)?.replies, []);
+  assert.equal(events.some(event => event.kind === 'cli-late-reply-correlated'), true);
+  assert.equal(events.some(event => event.kind === 'cli-fold-reply-attributed'), false);
+});
+
+test('a failed folded delivery leaves its matching Stop answer deliverable', async t => {
+  const dispatched = [];
+  const events = [];
+  const cp = makeCliProcess({
+    toolDispatcher: async (call) => {
+      dispatched.push(call);
+      return { ok: false, error: 'telegram unavailable' };
+    },
+  });
+  cp.db = { logEvent: (kind, detail) => events.push({ kind, detail }) };
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Primary', { context: { sourceMsgId: 6406 } });
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  assert.equal(cp.injectUserMessage({
+    content: 'Folded follow-up',
+    msgId: 6407,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+  const combinedAnswer = 'The combined answer that Telegram did not receive.';
+
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'failed-fold',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: combinedAnswer,
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [primary.turn_id, folded.turn_id],
+    },
+  });
+  const ack = await bridge.waitFor(
+    m => m.kind === 'tool_ack' && m.tool_call_id === 'failed-fold',
+  );
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(ack.ok, false);
+  assert.equal(dispatched[0].sourceMsgId, 6406);
+  assert.notEqual(cp.inputLedger.get(primary.turn_id)._quoteUsed, true);
+  assert.deepEqual(cp.pendingTurns.get(primary.turn_id)?.replies, []);
+  assert.equal(events.some(event => event.kind === 'cli-fold-reply-attributed'), false);
+
+  const pending = cp.pendingTurns.get(primary.turn_id);
+  cp._captureStopHookData(pending, { lastAssistantMessage: combinedAnswer });
+  cp._finalizeTurn(primary.turn_id);
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, false,
+    'failed Telegram delivery cannot suppress the matching Stop fallback');
+  assert.equal(result.text, combinedAnswer);
+});
+
+test('a primary cannot finalize while its folded reply delivery is still in flight', async t => {
+  const dispatched = [];
+  let finishDispatch;
+  const cp = makeCliProcess({
+    toolDispatcher: call => {
+      dispatched.push(call);
+      return new Promise(resolve => { finishDispatch = resolve; });
+    },
+  });
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Primary', { context: { sourceMsgId: 6406 } });
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  assert.equal(cp.injectUserMessage({
+    content: 'Folded follow-up',
+    msgId: 6407,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+  const combinedAnswer = 'Delivered after the Stop signal.';
+
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'slow-fold',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: combinedAnswer,
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [primary.turn_id, folded.turn_id],
+    },
+  });
+  for (let i = 0; i < 50 && dispatched.length === 0; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+
+  const pending = cp.pendingTurns.get(primary.turn_id);
+  cp._captureStopHookData(pending, { lastAssistantMessage: combinedAnswer });
+  cp._finalizeTurn(primary.turn_id);
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'finalization waits for the delivery outcome');
+
+  finishDispatch({ ok: true, message_id: 6408 });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'slow-fold');
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true);
+  assert.equal(result.text, combinedAnswer);
+});
+
+test('a primary reply without consumed ids cannot finalize while delivery is in flight', async t => {
+  let finishDispatch;
+  const cp = makeCliProcess({
+    toolDispatcher: () => new Promise(resolve => { finishDispatch = resolve; }),
+  });
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Primary', { context: { sourceMsgId: 6406 } });
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  const answer = 'Direct answer still being delivered.';
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'slow-direct',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: answer,
+      turn_id: primary.turn_id,
+    },
+  });
+  for (let i = 0; i < 50 && typeof finishDispatch !== 'function'; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+
+  cp._finalizeTurn(primary.turn_id);
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'finalization waits even when the reply omitted optional consumed_turn_ids');
+
+  finishDispatch({ ok: true, message_id: 6408 });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'slow-direct');
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true);
+  assert.equal(result.text, answer);
+});
+
+test('a timeout waits for a rejecting folded delivery before rescuing the Stop answer', async t => {
+  let rejectDispatch;
+  const cp = makeCliProcess({
+    toolDispatcher: () => new Promise((resolve, reject) => { rejectDispatch = reject; }),
+  });
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Primary', { context: { sourceMsgId: 6406 } });
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  assert.equal(cp.injectUserMessage({
+    content: 'Folded follow-up',
+    msgId: 6407,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+  const combinedAnswer = 'The Stop answer after a rejected delivery.';
+
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'rejected-fold',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: combinedAnswer,
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [primary.turn_id, folded.turn_id],
+    },
+  });
+  for (let i = 0; i < 50 && typeof rejectDispatch !== 'function'; i++) {
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+
+  const pending = cp.pendingTurns.get(primary.turn_id);
+  pending.seen = true;
+  cp._captureStopHookData(pending, { lastAssistantMessage: combinedAnswer });
+  pending._fireTimeout('idle');
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'the timeout cannot settle the turn before delivery outcome is known');
+
+  rejectDispatch(new Error('telegram unavailable'));
+  const ack = await bridge.waitFor(
+    m => m.kind === 'tool_ack' && m.tool_call_id === 'rejected-fold',
+  );
+  const result = await sendP;
+  assert.equal(ack.ok, false);
+  assert.equal(result.alreadyDelivered, false);
+  assert.equal(result.text, combinedAnswer);
+});
+
 test('tool call with wrong chat_id is dropped (security guard)', async () => {
   const dispatched = [];
   const cp = makeCliProcess({

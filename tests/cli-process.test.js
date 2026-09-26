@@ -1483,6 +1483,19 @@ test.describe('--system-prompt-snapshot off', () => {
   });
 });
 
+// A chat message that is a slash command reaches claude as channel text
+// (`/name args`), not as a native command, so the model decides what to pass
+// to the Skill tool. Claude Code 2.1.283 runs sometimes passed the whole
+// `/name args` string as the skill's arguments, so `$ARGUMENTS` started with
+// the command name. The contract spells out the split.
+test('channels contract tells the model to pass only the text after /name as skill args', async () => {
+  const args = await captureSpawnArgs({}, {});
+  const hint = args[args.indexOf('--append-system-prompt') + 1];
+  assert.match(hint, /slash command/i);
+  assert.match(hint, /`args`[^\n]*(only|just) the text after/i);
+  assert.match(hint, /never include the\s+command name/i);
+});
+
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
 // to avoid the variadic flag eating subsequent args. Regression guard for
 // the bug where two --append-system-prompt flags broke MCP registration.

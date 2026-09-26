@@ -1445,6 +1445,57 @@ test('rc.7: channels-mode spawn has ONE --append-system-prompt with both display
     'the disprovable "those fail" rationale must not return (agent empirically ignores it)');
 });
 
+// Claude Code 2.1.267+ records the appended system prompt once per
+// conversation and replays it on every --resume. The display rules and reply
+// contract are rebuilt on every spawn (richText toggles, new releases), so a
+// recorded copy would silently keep resumed chats on stale instructions.
+// Binaries that predate the flag reject it at startup, so it is only passed
+// when --help lists it.
+test.describe('--system-prompt-snapshot off', () => {
+  const os = require('node:os');
+  const path = require('node:path');
+  const fsSync = require('node:fs');
+  function fakeClaude(helpText) {
+    const dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'orch-snap-'));
+    const bin = path.join(dir, 'claude');
+    fsSync.writeFileSync(bin, `#!/bin/sh\ncat <<'EOF'\n${helpText}\nEOF\n`, { mode: 0o755 });
+    return { bin, cleanup: () => fsSync.rmSync(dir, { recursive: true, force: true }) };
+  }
+
+  test('passed right after the appended prompt when the binary supports it', async () => {
+    const { bin, cleanup } = fakeClaude('  --append-system-prompt <prompt>\n  --system-prompt-snapshot <on|off>');
+    try {
+      const args = await captureSpawnArgs({ claudeBin: bin }, {});
+      const i = args.indexOf('--system-prompt-snapshot');
+      assert.ok(i >= 0, 'flag present');
+      assert.equal(args[i + 1], 'off');
+      assert.equal(args[i - 2], '--append-system-prompt',
+        'directly after the prompt value, before the variadic --settings/--mcp-config/--add-dir flags');
+    } finally { cleanup(); }
+  });
+
+  test('omitted for a binary whose --help does not list it (e.g. 2.1.220)', async () => {
+    const { bin, cleanup } = fakeClaude('  --append-system-prompt <prompt>');
+    try {
+      const args = await captureSpawnArgs({ claudeBin: bin }, {});
+      assert.equal(args.indexOf('--system-prompt-snapshot'), -1);
+    } finally { cleanup(); }
+  });
+});
+
+// A chat message that is a slash command reaches claude as channel text
+// (`/name args`), not as a native command, so the model decides what to pass
+// to the Skill tool. Claude Code 2.1.283 runs sometimes passed the whole
+// `/name args` string as the skill's arguments, so `$ARGUMENTS` started with
+// the command name. The contract spells out the split.
+test('channels contract tells the model to pass only the text after /name as skill args', async () => {
+  const args = await captureSpawnArgs({}, {});
+  const hint = args[args.indexOf('--append-system-prompt') + 1];
+  assert.match(hint, /slash command/i);
+  assert.match(hint, /`args`[^\n]*(only|just) the text after/i);
+  assert.match(hint, /never include the\s+command name/i);
+});
+
 // rc.7: --mcp-config must remain the LAST flag in args (variadic <configs...>)
 // to avoid the variadic flag eating subsequent args. Regression guard for
 // the bug where two --append-system-prompt flags broke MCP registration.

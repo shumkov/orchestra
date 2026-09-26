@@ -382,6 +382,46 @@ test('production Workflow notification remains correlated across Stop system row
   assert.equal(correlation.reason, 'eligible');
 });
 
+// Claude Code inserts `total_tokens_reminder` attachments (context-usage
+// reminders from the service) into the transcript chain, including between a
+// failed direct reply's tool_result and the final text. A live gate run showed
+// the fallback rejecting that chain as `ancestry-row-ineligible`, so the
+// Workflow's final report was never delivered.
+function withTokenReminder(fixture, afterUuid) {
+  const rows = fixture.rows;
+  const index = rows.findIndex(row => row.uuid === afterUuid);
+  const child = rows[index + 1];
+  const reminder = {
+    type: 'attachment',
+    uuid: 'token-reminder',
+    parentUuid: afterUuid,
+    sessionId: fixture.sessionId,
+    isSidechain: false,
+    attachment: { type: 'total_tokens_reminder', used: 31_000, total: 1_000_000 },
+  };
+  child.parentUuid = reminder.uuid;
+  rows.splice(index + 1, 0, reminder);
+  return fixture;
+}
+
+test('a token-usage reminder between the failed reply and the final text keeps the fallback eligible', async (t) => {
+  const fixture = withTokenReminder(makeFailedWorkflowRows(), 'branch-1');
+  const correlation = await correlateFixture(t, fixture);
+  assert.equal(correlation.reason, 'eligible');
+  assert.equal(correlation.eligible, true);
+});
+
+test('other attachments in the completion chain still fail closed (e.g. a folded user prompt)', async (t) => {
+  const fixture = withTokenReminder(makeFailedWorkflowRows(), 'branch-1');
+  fixture.rows.find(row => row.uuid === 'token-reminder').attachment = {
+    type: 'queued_command',
+    prompt: 'a new user message folded into the turn',
+  };
+  const correlation = await correlateFixture(t, fixture);
+  assert.equal(correlation.eligible, false);
+  assert.equal(correlation.reason, 'ancestry-row-ineligible');
+});
+
 test('an accepted Workflow boundary digest detects a same-size rewrite', async (t) => {
   const fixture = makeWorkflowRows();
   const { dir, transcriptPath } = writeTranscript(fixture.rows);

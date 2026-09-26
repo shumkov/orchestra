@@ -1246,6 +1246,100 @@ test('P1 #18: _handleStartupDialogs sends Enter on trust dialog', async () => {
   await cp.kill('test');
 });
 
+// Claude Code 2.1.283 reversed the trust dialog: unnumbered options with
+// "No, exit" listed first and pre-selected. Pressing Enter on it exits claude,
+// so every spawn in an untrusted cwd died ("tmux session disappeared … matched:
+// trust"). The pane below is the live 2.1.283 capture; the gate must move the
+// cursor to "Yes, I trust this folder" before confirming.
+async function trustDialogKeys(firstPanes) {
+  const sentKeys = [];
+  let phase = 0;
+  const runner = {
+    spawn: async () => {},
+    killSession: async () => {},
+    sendControl: async (_name, key) => { sentKeys.push(key); },
+    captureWide: async () => {
+      const out = phase < firstPanes.length
+        ? firstPanes[phase]
+        : 'Listening for channel messages from: server:orchestra-bridge';
+      phase++;
+      return out;
+    },
+  };
+  const cp = new CliProcess({
+    sessionKey: `sess-trust-${Date.now()}`, chatId: 'chat-1', threadId: null, label: 'trust',
+    tmuxRunner: runner, botName: 'testbot', claudeBin: '/usr/bin/true',
+    toolDispatcher: async () => ({ ok: true }),
+    logger: quietLogger,
+    handshakeTimeoutMs: 2000,
+  });
+  const startP = cp.start();
+  for (let i = 0; i < 50 && (!cp.sockPath || !require('fs').existsSync(cp.sockPath)); i++) {
+    await new Promise(r => setTimeout(r, 20));
+  }
+  const bridge = await connectFakeBridge({
+    sockPath: cp.sockPath, sessionKey: cp.sessionKey, secret: cp.sockSecret,
+  });
+  await startP;
+  bridge.close();
+  await cp.kill('test');
+  return sentKeys;
+}
+
+const TRUST_DIALOG_2_1_283 = [
+  ' Accessing workspace:',
+  ' /private/tmp/work',
+  ' Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what\'s in this',
+  ' folder first.',
+  ' Claude Code\'ll be able to read, edit, and execute files here.',
+  ' Security guide',
+  ' ❯ No, exit',
+  '   Yes, I trust this folder',
+  ' Enter to confirm · Esc to cancel',
+].join('\n');
+
+const TRUST_DIALOG_2_1_283_YES_SELECTED = TRUST_DIALOG_2_1_283
+  .replace(' ❯ No, exit', '   No, exit')
+  .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
+
+test('claude 2.1.283 trust dialog (No, exit pre-selected): moves to "Yes, I trust" before confirming', async () => {
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, YES, YES]), ['Down', 'Enter']);
+});
+
+// Live 2.1.283 run: the dialog rendered before it accepted input, the first
+// Down was dropped, and an Enter sent right after it confirmed "No, exit".
+// Enter must wait until the pane shows "Yes" selected.
+test('a dropped Down is retried; Enter is never sent while "No, exit" is selected', async () => {
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, NO, NO, YES, YES]), ['Down', 'Down', 'Enter']);
+});
+
+// The menu wraps (Down on "Yes" selects "No, exit" again). A single "Yes"
+// frame can be followed by a lagging Down's redraw, so Enter waits for "Yes"
+// to hold across consecutive captures.
+test('a single "Yes" frame followed by a wrap back to "No" is not confirmed', async () => {
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, YES, NO, NO, YES, YES]), ['Down', 'Down', 'Enter']);
+});
+
+// The gate captures 1000 lines of scrollback. A stale dialog frame left above
+// the live one must not drive navigation.
+test('a stale "No, exit" frame in scrollback above a live "Yes" frame only confirms', async () => {
+  const stacked = `${TRUST_DIALOG_2_1_283}\n${TRUST_DIALOG_2_1_283_YES_SELECTED}`;
+  assert.deepEqual(await trustDialogKeys([stacked, stacked]), ['Enter']);
+});
+
+test('trust dialog still rendering its options: no key is sent until the selection is visible', async () => {
+  const header = TRUST_DIALOG_2_1_283.split('\n').slice(0, 6).join('\n');
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([header, NO, NO, YES, YES]), ['Down', 'Enter']);
+});
+
 // Regression (2026-06-04): claude 2.1.158 reworded the trust dialog to "Quick
 // safety check: Is this a project you created or one you trust? … 1. Yes, I trust
 // this folder". The old regex /trust the files in this folder/i no longer matched,
@@ -1260,7 +1354,9 @@ test('P1 #18: _handleStartupDialogs sends Enter on the claude 2.1.158 trust dial
     killSession: async () => {},
     sendControl: async (_name, key) => { sentKeys.push(key); },
     captureWide: async () => {
-      const out = phase === 0
+      // A real dialog stays on screen until answered; the gate confirms only
+      // after the selection holds across consecutive captures.
+      const out = phase <= 1
         ? '  Quick safety check: Is this a project you created or one you trust?\n  ❯ 1. Yes, I trust this folder\n    2. No, exit\n  Enter to confirm · Esc to cancel'
         : 'Listening for channel messages from: server:orchestra-bridge';
       phase++;

@@ -1303,28 +1303,41 @@ const TRUST_DIALOG_2_1_283_YES_SELECTED = TRUST_DIALOG_2_1_283
   .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
 
 test('claude 2.1.283 trust dialog (No, exit pre-selected): moves to "Yes, I trust" before confirming', async () => {
-  assert.deepEqual(
-    await trustDialogKeys([TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
-    ['Down', 'Enter'],
-  );
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, YES, YES]), ['Down', 'Enter']);
 });
 
 // Live 2.1.283 run: the dialog rendered before it accepted input, the first
 // Down was dropped, and an Enter sent right after it confirmed "No, exit".
 // Enter must wait until the pane shows "Yes" selected.
 test('a dropped Down is retried; Enter is never sent while "No, exit" is selected', async () => {
-  assert.deepEqual(
-    await trustDialogKeys([TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
-    ['Down', 'Down', 'Enter'],
-  );
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, NO, NO, YES, YES]), ['Down', 'Down', 'Enter']);
+});
+
+// The menu wraps (Down on "Yes" selects "No, exit" again). A single "Yes"
+// frame can be followed by a lagging Down's redraw, so Enter waits for "Yes"
+// to hold across consecutive captures.
+test('a single "Yes" frame followed by a wrap back to "No" is not confirmed', async () => {
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([NO, NO, YES, NO, NO, YES, YES]), ['Down', 'Down', 'Enter']);
+});
+
+// The gate captures 1000 lines of scrollback. A stale dialog frame left above
+// the live one must not drive navigation.
+test('a stale "No, exit" frame in scrollback above a live "Yes" frame only confirms', async () => {
+  const stacked = `${TRUST_DIALOG_2_1_283}\n${TRUST_DIALOG_2_1_283_YES_SELECTED}`;
+  assert.deepEqual(await trustDialogKeys([stacked, stacked]), ['Enter']);
 });
 
 test('trust dialog still rendering its options: no key is sent until the selection is visible', async () => {
   const header = TRUST_DIALOG_2_1_283.split('\n').slice(0, 6).join('\n');
-  assert.deepEqual(
-    await trustDialogKeys([header, TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
-    ['Down', 'Enter'],
-  );
+  const NO = TRUST_DIALOG_2_1_283;
+  const YES = TRUST_DIALOG_2_1_283_YES_SELECTED;
+  assert.deepEqual(await trustDialogKeys([header, NO, NO, YES, YES]), ['Down', 'Enter']);
 });
 
 // Regression (2026-06-04): claude 2.1.158 reworded the trust dialog to "Quick
@@ -1341,7 +1354,9 @@ test('P1 #18: _handleStartupDialogs sends Enter on the claude 2.1.158 trust dial
     killSession: async () => {},
     sendControl: async (_name, key) => { sentKeys.push(key); },
     captureWide: async () => {
-      const out = phase === 0
+      // A real dialog stays on screen until answered; the gate confirms only
+      // after the selection holds across consecutive captures.
+      const out = phase <= 1
         ? '  Quick safety check: Is this a project you created or one you trust?\n  ❯ 1. Yes, I trust this folder\n    2. No, exit\n  Enter to confirm · Esc to cancel'
         : 'Listening for channel messages from: server:orchestra-bridge';
       phase++;

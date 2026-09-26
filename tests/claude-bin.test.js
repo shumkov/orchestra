@@ -160,6 +160,25 @@ describe('claude-bin — ensureVendoredClaudeBin', () => {
     } finally { teardown(); }
   });
 
+  // Copies now stay in a temp file while `--version` runs, so a process
+  // killed mid-deploy can leave a ~250 MB temp copy behind. Fresh temp files
+  // may belong to a concurrent boot and must survive; old ones are litter.
+  test('GC removes temp copies older than 10 minutes and keeps fresh ones', () => {
+    const { vendorD } = setup();
+    try {
+      fakeExec(path.join(vendorD, VER));
+      const stale = path.join(vendorD, `${VER}.tmp.111.1`);
+      const fresh = path.join(vendorD, `${VER}.tmp.222.2`);
+      fs.writeFileSync(stale, 'x');
+      fs.writeFileSync(fresh, 'x');
+      const old = new Date(Date.now() - 11 * 60_000);
+      fs.utimesSync(stale, old, old);
+      ensureVendoredClaudeBin(VER, { logger: quiet });
+      assert.ok(!fs.existsSync(stale), 'stale temp copy removed');
+      assert.ok(fs.existsSync(fresh), 'fresh temp copy (possible concurrent boot) kept');
+    } finally { teardown(); }
+  });
+
   test('system absent + installer SUCCEEDS → installs into versions dir, then vendors', () => {
     const { vendorD, versionsD } = setup();
     try {
@@ -398,6 +417,18 @@ describe('claude-bin — supportsClaudeFlag', () => {
 
   test('a missing or failing binary reports false instead of throwing', () => {
     assert.equal(supportsClaudeFlag(path.join(os.tmpdir(), `no-claude-${Date.now()}`), '--x'), false);
+  });
+
+  // Omitting a flag because --help failed silently changes behaviour (e.g.
+  // resumed chats keep a stale recorded system prompt), so it must be visible.
+  test('a failing --help is logged once, not on every check', () => {
+    const warnings = [];
+    const logger = { warn: (m) => warnings.push(m) };
+    const bin = path.join(os.tmpdir(), `no-claude-warn-${Date.now()}`);
+    supportsClaudeFlag(bin, '--a', { logger });
+    supportsClaudeFlag(bin, '--b', { logger });
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /--help/);
   });
 
   test('runs --help once per binary (it takes ~1s, so spawns must not repeat it)', () => {

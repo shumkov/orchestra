@@ -170,6 +170,36 @@ test('repeat trigger stops after maxRepeats so a stuck dialog still times out', 
   assert.deepEqual(runner.sent, ['Down', 'Down', 'Down']);
 });
 
+// A two-option menu that wraps: a Down whose redraw lags the next capture
+// can be followed by a second Down that lands back on the first option. A
+// trigger with `stablePolls` fires only after its regex has matched that many
+// consecutive captures, so a key is never sent into a frame that is still
+// changing.
+test('stablePolls: fires only after N consecutive matching captures', async () => {
+  const NO = '❯ No, exit\n  Yes, I trust this folder';
+  const YES = '  No, exit\n❯ Yes, I trust this folder';
+  const runner = makeScriptedRunner([
+    NO, NO,        // stable → Down
+    YES,           // one Yes frame is not enough to confirm
+    NO, NO,        // a lagging Down wrapped back to No → Down again
+    YES, YES,      // stable Yes → Enter
+    'Listening for channel messages from: server:orchestra-bridge',
+  ]);
+  await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'trust-select', regex: /❯ No, exit/, key: 'Down', repeat: true, stablePolls: 2 },
+      { name: 'trust', regex: /❯ Yes, I trust this folder/, key: 'Enter', stablePolls: 2 },
+    ],
+    readySignal: /Listening for channel messages from: server:orchestra-bridge/i,
+    logger: quietLogger,
+    pollMs: 5,
+    settleMs: 5,
+  });
+  assert.deepEqual(runner.sent, ['Down', 'Down', 'Enter']);
+});
+
 test('captureWide error is non-fatal and loop continues', async () => {
   let calls = 0;
   const runner = {

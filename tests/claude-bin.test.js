@@ -21,8 +21,23 @@ afterEach(() => {
 });
 
 describe('claude-bin — resolvePinnedClaudeBin', () => {
-  test('defaults to the compatibility-gated Claude Code 2.1.220 pin', () => {
-    assert.equal(CLAUDE_CLI_PINNED_VERSION, '2.1.220');
+  test('defaults to the compatibility-gated Claude Code 2.1.283 pin', () => {
+    assert.equal(CLAUDE_CLI_PINNED_VERSION, '2.1.283');
+  });
+
+  // The pinned Agent SDK defines the CLI version: its platform package ships
+  // the exact binary we vendor, and SDK-backed sessions run that same binary.
+  // Bumping the SDK without moving the constant (or the reverse) must fail here
+  // instead of silently running two different Claude versions.
+  test('the pin equals the claudeCodeVersion bundled by the installed Agent SDK', () => {
+    const sdkEntry = require.resolve('@anthropic-ai/claude-agent-sdk');
+    const sdkPkg = JSON.parse(fs.readFileSync(path.join(path.dirname(sdkEntry), 'package.json'), 'utf8'));
+    assert.equal(sdkPkg.claudeCodeVersion, CLAUDE_CLI_PINNED_VERSION);
+    assert.equal(
+      require('../package.json').optionalDependencies['@anthropic-ai/claude-agent-sdk'],
+      sdkPkg.version,
+      'package.json pins the installed SDK version exactly',
+    );
   });
 
   test('resolves to the standard claude-CLI versions path', () => {
@@ -91,7 +106,9 @@ describe('claude-bin — ensureVendoredClaudeBin', () => {
   const SAVE = ['ORCHESTRA_CLAUDE_BIN', 'ORCHESTRA_CLAUDE_VENDOR_DIR', 'ORCHESTRA_CLAUDE_VERSIONS_DIR', 'ORCHESTRA_CLAUDE_INSTALL_BIN'];
   let saved; let root;
 
-  const fakeExec = (p) => fs.writeFileSync(p, '#!/bin/sh\necho fake-claude', { mode: 0o755 });
+  // A fake claude that answers `--version` the way the real one does, so the
+  // pre-rename validation accepts it.
+  const fakeExec = (p, ver = VER) => fs.writeFileSync(p, `#!/bin/sh\necho '${ver} (Claude Code)'\n`, { mode: 0o755 });
 
   function setup() {
     saved = {}; for (const k of SAVE) { saved[k] = process.env[k]; delete process.env[k]; }
@@ -151,7 +168,7 @@ describe('claude-bin — ensureVendoredClaudeBin', () => {
       const inst = path.join(root, 'fake-installer');
       fs.writeFileSync(inst,
         '#!/bin/sh\nmkdir -p "$ORCHESTRA_CLAUDE_VERSIONS_DIR"\n'
-        + 'printf \'#!/bin/sh\\necho fake\\n\' > "$ORCHESTRA_CLAUDE_VERSIONS_DIR/$2"\n'
+        + 'printf \'#!/bin/sh\\necho "%s (Claude Code)"\\n\' "$2" > "$ORCHESTRA_CLAUDE_VERSIONS_DIR/$2"\n'
         + 'chmod 755 "$ORCHESTRA_CLAUDE_VERSIONS_DIR/$2"\n', { mode: 0o755 });
       process.env.ORCHESTRA_CLAUDE_INSTALL_BIN = inst;
       const r = ensureVendoredClaudeBin(VER, { logger: quiet });
@@ -184,6 +201,214 @@ describe('claude-bin — ensureVendoredClaudeBin', () => {
       assert.equal(r.path, ov);
       assert.equal(r.vendored, false);
     } finally { teardown(); }
+  });
+});
+
+// The pinned Agent SDK ships the exact claude binary in a per-platform optional
+// package. Vendoring from it removes the dependency on claude's auto-updater,
+// which prunes all but the newest ~3 versions from its versions directory.
+describe('claude-bin — vendoring from the Agent SDK platform package', () => {
+  const { createRequire } = require('node:module');
+  const { ensureVendoredClaudeBin, findSdkClaudeBin } = require('../index').claudeBin;
+  const quiet = { log: () => {}, warn: () => {}, error: () => {} };
+  const VER = '2.1.283';
+  const SAVE = ['ORCHESTRA_CLAUDE_BIN', 'ORCHESTRA_CLAUDE_VENDOR_DIR', 'ORCHESTRA_CLAUDE_VERSIONS_DIR', 'ORCHESTRA_CLAUDE_INSTALL_BIN'];
+  const PLATFORM = { platform: 'darwin', arch: 'arm64' };
+  let saved; let root;
+
+  const writeClaude = (p, { reports = VER, marker = '' } = {}) => {
+    fs.mkdirSync(path.dirname(p), { recursive: true });
+    fs.writeFileSync(p, `#!/bin/sh\n# ${marker}\necho '${reports} (Claude Code)'\n`, { mode: 0o755 });
+  };
+
+  // Lays out <root>/app/node_modules/@anthropic-ai/{claude-agent-sdk, claude-agent-sdk-<suffix>}
+  // and returns a require bound inside that app, as npm would install it.
+  function fakeSdk({
+    sdkVersion = '0.3.283',
+    claudeCodeVersion = VER,
+    platforms = { 'darwin-arm64': {} },
+  } = {}) {
+    const app = path.join(root, 'app');
+    const scope = path.join(app, 'node_modules', '@anthropic-ai');
+    const sdkDir = path.join(scope, 'claude-agent-sdk');
+    fs.mkdirSync(sdkDir, { recursive: true });
+    fs.writeFileSync(path.join(sdkDir, 'package.json'), JSON.stringify({
+      name: '@anthropic-ai/claude-agent-sdk', version: sdkVersion, claudeCodeVersion, main: 'sdk.js',
+    }));
+    fs.writeFileSync(path.join(sdkDir, 'sdk.js'), '');
+    for (const [suffix, { version = sdkVersion, reports = claudeCodeVersion }] of Object.entries(platforms)) {
+      const dir = path.join(scope, `claude-agent-sdk-${suffix}`);
+      fs.mkdirSync(dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({
+        name: `@anthropic-ai/claude-agent-sdk-${suffix}`, version,
+      }));
+      writeClaude(path.join(dir, 'claude'), { reports, marker: `from-sdk-${suffix}` });
+    }
+    return createRequire(path.join(app, 'index.js'));
+  }
+
+  function setup() {
+    saved = {}; for (const k of SAVE) { saved[k] = process.env[k]; delete process.env[k]; }
+    root = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-sdk-vendor-'));
+    const vendorD = path.join(root, 'vendor');
+    const versionsD = path.join(root, 'versions');
+    fs.mkdirSync(vendorD, { recursive: true });
+    fs.mkdirSync(versionsD, { recursive: true });
+    process.env.ORCHESTRA_CLAUDE_VENDOR_DIR = vendorD;
+    process.env.ORCHESTRA_CLAUDE_VERSIONS_DIR = versionsD;
+    // Any `claude install` attempt in these tests is a bug: point it at a
+    // missing binary so it fails loudly instead of touching the real host.
+    process.env.ORCHESTRA_CLAUDE_INSTALL_BIN = path.join(root, 'no-installer');
+    return { vendorD, versionsD };
+  }
+  function teardown() {
+    for (const k of SAVE) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k]; }
+    try { fs.rmSync(root, { recursive: true, force: true }); } catch {}
+  }
+  const vendoredFrom = (vendorD) => fs.readFileSync(path.join(vendorD, VER), 'utf8');
+
+  test('prefers the SDK platform binary over claude\'s auto-updater versions dir', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { marker: 'from-versions' });
+      const sdkRequire = fakeSdk();
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: sdkRequire, ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.equal(r.path, path.join(vendorD, VER));
+      assert.match(vendoredFrom(vendorD), /from-sdk-darwin-arm64/);
+      fs.accessSync(r.path, fs.constants.X_OK);
+    } finally { teardown(); }
+  });
+
+  test('works with no versions-dir copy at all (auto-updater already pruned it)', () => {
+    const { vendorD } = setup();
+    try {
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: fakeSdk(), ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.match(vendoredFrom(vendorD), /from-sdk/);
+    } finally { teardown(); }
+  });
+
+  test('an SDK bundling a different claude version is skipped, not vendored under the wrong name', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { marker: 'from-versions' });
+      const sdkRequire = fakeSdk({ claudeCodeVersion: '2.1.999' });
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: sdkRequire, ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.match(vendoredFrom(vendorD), /from-versions/);
+    } finally { teardown(); }
+  });
+
+  test('a platform package whose version differs from the SDK is skipped', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { marker: 'from-versions' });
+      const sdkRequire = fakeSdk({ platforms: { 'darwin-arm64': { version: '0.3.282' } } });
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: sdkRequire, ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.match(vendoredFrom(vendorD), /from-versions/);
+    } finally { teardown(); }
+  });
+
+  test('a missing SDK (optional deps omitted) falls through to the versions dir', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { marker: 'from-versions' });
+      const emptyRequire = createRequire(path.join(root, 'empty-app', 'index.js'));
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: emptyRequire, ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.match(vendoredFrom(vendorD), /from-versions/);
+    } finally { teardown(); }
+  });
+
+  // `npm i -g` extracts in place and the service restarts within seconds, so a
+  // boot can see package.json before the binary is fully written. A copy that
+  // doesn't report the requested version must never become the cached vendor
+  // copy, because the fast path trusts any executable file it finds there.
+  test('a source binary that does not report the requested version is never cached', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { marker: 'from-versions' });
+      const sdkRequire = fakeSdk({ platforms: { 'darwin-arm64': { reports: 'garbage' } } });
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: sdkRequire, ...PLATFORM } });
+      assert.equal(r.ok, true, r.reason);
+      assert.match(vendoredFrom(vendorD), /from-versions/, 'fell through to the next valid source');
+      assert.deepEqual(fs.readdirSync(vendorD), [VER], 'no temp file left behind');
+    } finally { teardown(); }
+  });
+
+  test('when every source fails validation → ok=false and nothing is vendored', () => {
+    const { vendorD, versionsD } = setup();
+    try {
+      writeClaude(path.join(versionsD, VER), { reports: '2.1.100' });
+      const emptyRequire = createRequire(path.join(root, 'empty-app', 'index.js'));
+      const r = ensureVendoredClaudeBin(VER, { logger: quiet, sdk: { requireFrom: emptyRequire, ...PLATFORM } });
+      assert.equal(r.ok, false);
+      assert.match(r.reason, /--version/);
+      assert.deepEqual(fs.readdirSync(vendorD), []);
+    } finally { teardown(); }
+  });
+
+  // Mirrors the SDK's own resolver: glibc first on a glibc Linux host, musl
+  // first only where glibc is absent.
+  test('linux: picks the glibc package on glibc hosts and the musl package on musl hosts', () => {
+    setup();
+    try {
+      const sdkRequire = fakeSdk({ platforms: { 'linux-x64': {}, 'linux-x64-musl': {} } });
+      const glibc = findSdkClaudeBin({ requireFrom: sdkRequire, platform: 'linux', arch: 'x64', preferMusl: false });
+      const musl = findSdkClaudeBin({ requireFrom: sdkRequire, platform: 'linux', arch: 'x64', preferMusl: true });
+      assert.equal(glibc.ok, true, glibc.reason);
+      assert.match(glibc.path, /claude-agent-sdk-linux-x64[\\/]claude$/);
+      assert.match(musl.path, /claude-agent-sdk-linux-x64-musl[\\/]claude$/);
+      assert.equal(glibc.claudeCodeVersion, VER);
+    } finally { teardown(); }
+  });
+});
+
+// 2.1.220 rejects unknown options at startup, so a flag introduced by a newer
+// CLI must only be passed to binaries that list it in --help.
+describe('claude-bin — supportsClaudeFlag', () => {
+  const { supportsClaudeFlag } = require('../index').claudeBin;
+  let dir;
+  const fakeHelp = (name, helpText) => {
+    const p = path.join(dir, name);
+    const counter = `${p}.calls`;
+    fs.writeFileSync(p, `#!/bin/sh\necho x >> '${counter}'\ncat <<'EOF'\n${helpText}\nEOF\n`, { mode: 0o755 });
+    return { bin: p, calls: () => fs.readFileSync(counter, 'utf8').trim().split('\n').length };
+  };
+
+  test('true when --help lists the flag, false when it does not', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-flag-'));
+    try {
+      const newer = fakeHelp('newer', '  --system-prompt-snapshot <on|off>   Record the system prompt');
+      const older = fakeHelp('older', '  --append-system-prompt <prompt>');
+      assert.equal(supportsClaudeFlag(newer.bin, '--system-prompt-snapshot'), true);
+      assert.equal(supportsClaudeFlag(older.bin, '--system-prompt-snapshot'), false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a flag that is only a prefix of a listed flag does not count', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-flag-'));
+    try {
+      const bin = fakeHelp('prefix', '  --system-prompt-snapshot-mode <x>');
+      assert.equal(supportsClaudeFlag(bin.bin, '--system-prompt-snapshot'), false);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  test('a missing or failing binary reports false instead of throwing', () => {
+    assert.equal(supportsClaudeFlag(path.join(os.tmpdir(), `no-claude-${Date.now()}`), '--x'), false);
+  });
+
+  test('runs --help once per binary (it takes ~1s, so spawns must not repeat it)', () => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pg-flag-'));
+    try {
+      const bin = fakeHelp('cached', '  --system-prompt-snapshot <on|off>\n  --other');
+      supportsClaudeFlag(bin.bin, '--system-prompt-snapshot');
+      supportsClaudeFlag(bin.bin, '--other');
+      supportsClaudeFlag(bin.bin, '--system-prompt-snapshot');
+      assert.equal(bin.calls(), 1);
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
   });
 });
 

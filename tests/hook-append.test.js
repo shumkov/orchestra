@@ -25,6 +25,21 @@ function runHelper(out, stdin) {
 }
 
 describe('orchestra-hook-append', () => {
+  // Hook payloads carry prompts and tool inputs. A hook that fires after the
+  // session's files were cleaned up (e.g. a late SessionEnd) recreates the
+  // file, so the helper itself must create it owner-only rather than rely on
+  // the caller's umask (claude runs it under 022 → 0644).
+  test('creates a missing ndjson file owner-only (0600) regardless of umask', () => {
+    const out = tmpfile();
+    const res = spawnSync('/bin/sh', ['-c', `umask 022; exec "${process.execPath}" "${HELPER}" "${out}"`], {
+      input: JSON.stringify({ hook_event_name: 'SessionEnd' }),
+      encoding: 'utf8',
+      timeout: 5000,
+    });
+    assert.equal(res.status, 0, res.stderr);
+    assert.equal(fs.statSync(out).mode & 0o777, 0o600);
+  });
+
   test('appends one compacted line with a polygram_received_at_ms stamp', () => {
     const out = tmpfile();
     const before = Date.now();

@@ -126,6 +126,50 @@ test('handles multiple triggers in declared order and dedupes by name', async ()
   assert.deepEqual(runner.sent, ['Enter', 'Enter']);
 });
 
+// A TUI dialog can render before it accepts input, so a navigation key sent
+// on first sight may be dropped. A `repeat` trigger keeps firing while its
+// regex still matches (the cursor has not moved yet) and stops once the pane
+// changes, so the confirming key is only sent after the move is visible.
+test('repeat trigger re-fires while its regex still matches, then yields', async () => {
+  const runner = makeScriptedRunner([
+    '❯ No, exit\n  Yes, I trust this folder',        // Down dropped by the TUI
+    '❯ No, exit\n  Yes, I trust this folder',        // Down registers
+    '  No, exit\n❯ Yes, I trust this folder',
+    'Listening for channel messages from: server:orchestra-bridge',
+  ]);
+  const result = await runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'trust-select', regex: /❯ No, exit\n\s*Yes, I trust/, key: 'Down', repeat: true },
+      { name: 'trust', regex: /❯ Yes, I trust this folder/, key: 'Enter' },
+    ],
+    readySignal: /Listening for channel messages from: server:orchestra-bridge/i,
+    logger: quietLogger,
+    pollMs: 5,
+    settleMs: 5,
+  });
+  assert.deepEqual(runner.sent, ['Down', 'Down', 'Enter']);
+  assert.deepEqual(result.matchedTriggers, ['trust-select', 'trust'], 'each name reported once');
+});
+
+test('repeat trigger stops after maxRepeats so a stuck dialog still times out', async () => {
+  const runner = makeScriptedRunner(['❯ No, exit\n  Yes, I trust this folder']);
+  await assert.rejects(runStartupGate({
+    runner,
+    tmuxName: 'sess',
+    triggers: [
+      { name: 'trust-select', regex: /❯ No, exit/, key: 'Down', repeat: true, maxRepeats: 3 },
+    ],
+    readySignal: /never/,
+    logger: quietLogger,
+    deadlineMs: 300,
+    pollMs: 5,
+    settleMs: 5,
+  }), (err) => err.code === 'TUI_STARTUP_TIMEOUT');
+  assert.deepEqual(runner.sent, ['Down', 'Down', 'Down']);
+});
+
 test('captureWide error is non-fatal and loop continues', async () => {
   let calls = 0;
   const runner = {

@@ -1298,13 +1298,33 @@ const TRUST_DIALOG_2_1_283 = [
   ' Enter to confirm · Esc to cancel',
 ].join('\n');
 
+const TRUST_DIALOG_2_1_283_YES_SELECTED = TRUST_DIALOG_2_1_283
+  .replace(' ❯ No, exit', '   No, exit')
+  .replace('   Yes, I trust this folder', ' ❯ Yes, I trust this folder');
+
 test('claude 2.1.283 trust dialog (No, exit pre-selected): moves to "Yes, I trust" before confirming', async () => {
-  assert.deepEqual(await trustDialogKeys([TRUST_DIALOG_2_1_283]), ['Down', 'Enter']);
+  assert.deepEqual(
+    await trustDialogKeys([TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
+    ['Down', 'Enter'],
+  );
+});
+
+// Live 2.1.283 run: the dialog rendered before it accepted input, the first
+// Down was dropped, and an Enter sent right after it confirmed "No, exit".
+// Enter must wait until the pane shows "Yes" selected.
+test('a dropped Down is retried; Enter is never sent while "No, exit" is selected', async () => {
+  assert.deepEqual(
+    await trustDialogKeys([TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
+    ['Down', 'Down', 'Enter'],
+  );
 });
 
 test('trust dialog still rendering its options: no key is sent until the selection is visible', async () => {
   const header = TRUST_DIALOG_2_1_283.split('\n').slice(0, 6).join('\n');
-  assert.deepEqual(await trustDialogKeys([header, TRUST_DIALOG_2_1_283]), ['Down', 'Enter']);
+  assert.deepEqual(
+    await trustDialogKeys([header, TRUST_DIALOG_2_1_283, TRUST_DIALOG_2_1_283_YES_SELECTED]),
+    ['Down', 'Enter'],
+  );
 });
 
 // Regression (2026-06-04): claude 2.1.158 reworded the trust dialog to "Quick

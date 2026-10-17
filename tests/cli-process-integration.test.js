@@ -372,6 +372,243 @@ test('2026-08-17 routine: a combined autosteer reply belongs to the primary mess
   assert.equal(result.text, combinedAnswer);
 });
 
+test('Admin source batch: interim consumed acknowledgement cannot finish before later foreground tools', async t => {
+  const events = [];
+  const cp = makeCliProcess();
+  cp.activityQuietMs = 30;
+  cp.stopGraceMs = 20;
+  cp.db = { logEvent: (kind, detail) => events.push({ kind, detail }) };
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => { bridge.close(); await cp.kill('test'); });
+  const sendP = cp.send('Diagnose the recorded source notifications');
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent({
+    type: 'UserPromptSubmit',
+    prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">notifications</channel>`,
+  });
+  let results = 0;
+  let idle = 0;
+  cp.on('result', () => { results++; });
+  cp.on('idle', () => { idle++; });
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'source-recon-status', name: 'reply',
+    args: {
+      chat_id: cp.chatId, turn_id: primary.turn_id,
+      text: 'Checking current alerts and their source history.', interim: true,
+      consumed_turn_ids: [primary.turn_id],
+    },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'source-recon-status');
+  await new Promise(resolve => setTimeout(resolve, 90));
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'an interim consumption receipt must not finish the source batch during a quiet gap');
+  assert.equal(cp.inFlight, true);
+  assert.equal(results, 0);
+  assert.equal(idle, 0);
+  assert.equal(events.some(e => e.kind === 'cli-activity-quiet-finalize'), false);
+
+  cp._handleHookEvent({ type: 'PreToolUse', toolName: 'Bash' });
+  await new Promise(resolve => setTimeout(resolve, 90));
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'later foreground work belongs to the same still-pending turn');
+  cp._handleHookEvent({ type: 'Stop', lastAssistantMessage: 'Completed source diagnosis.' });
+  const result = await sendP;
+  assert.equal(result.text, 'Completed source diagnosis.');
+  assert.equal(result.alreadyDelivered, false, 'the completed answer is rescued after the status');
+  assert.equal(results, 1);
+  assert.equal(idle, 1);
+});
+
+for (const [label, dispatchResult, text, interim] of [
+  ['interim', { ok: true }, 'Still checking.', true],
+  ['failed', { ok: false, error: 'unavailable' }, 'Undelivered answer.', false],
+  ['rejected', new Error('unavailable'), 'Undelivered answer.', false],
+  ['empty', { ok: true }, '', false],
+]) {
+  test(`a consumed-only ${label} sibling reply cannot become quiet or ceiling success`, async t => {
+    const cp = makeCliProcess({ toolDispatcher: async () => {
+      if (dispatchResult instanceof Error) throw dispatchResult;
+      return dispatchResult;
+    } });
+    cp.activityQuietMs = 30;
+    const bridge = await startWithFakeBridge(cp);
+    t.after(async () => { bridge.close(); await cp.kill('test'); });
+    const sendP = cp.send('Current work');
+    sendP.catch(() => {});
+    const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+    cp._handleHookEvent({
+      type: 'UserPromptSubmit',
+      prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">work</channel>`,
+    });
+    cp.inputLedger.set('sibling-cycle', { source: 'primary', state: 'resolved' });
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: `sibling-${label}`, name: 'reply',
+      args: { chat_id: cp.chatId, turn_id: 'sibling-cycle', text, interim, consumed_turn_ids: [primary.turn_id] },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === `sibling-${label}`);
+    await new Promise(resolve => setTimeout(resolve, 90));
+    assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+      'consumption without a delivered final answer must remain pending');
+    const rejection = assert.rejects(sendP, error => error.code === 'TURN_TIMEOUT');
+    cp.pendingTurns.get(primary.turn_id)._fireTimeout('idle');
+    await rejection;
+  });
+}
+
+test('a delivered final sibling answer recovers after hook silence and later interim cannot revoke it', async t => {
+  const cp = makeCliProcess();
+  cp.activityQuietMs = 30;
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => { bridge.close(); await cp.kill('test'); });
+  const sendP = cp.send('Current work');
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent({
+    type: 'UserPromptSubmit',
+    prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">work</channel>`,
+  });
+  cp.inputLedger.set('sibling-cycle', { source: 'primary', state: 'resolved' });
+  for (const [toolCallId, text, interim] of [
+    ['earlier-status', 'A longer status while the answer is still being prepared.', true],
+    ['final-sibling', 'Done.', false],
+    ['later-status', 'Longer progress status after the final answer.', true],
+  ]) {
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: toolCallId, name: 'reply',
+      args: { chat_id: cp.chatId, turn_id: 'sibling-cycle', text, interim, consumed_turn_ids: [primary.turn_id] },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === toolCallId);
+  }
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, true);
+  assert.equal(cp.pendingTurns.size, 0, 'a delivered final sibling answer retains stalled-hook recovery');
+});
+
+test('a final reply consuming unrelated IDs cannot complete an interim-acked pending turn', async t => {
+  const cp = makeCliProcess();
+  cp.activityQuietMs = 30;
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => { bridge.close(); await cp.kill('test'); });
+  const sendP = cp.send('Current work');
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent({
+    type: 'UserPromptSubmit',
+    prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">work</channel>`,
+  });
+  cp.inputLedger.set('sibling-cycle', { source: 'primary', state: 'resolved' });
+  for (const [toolCallId, interim, consumedIds] of [
+    ['current-status', true, [primary.turn_id]],
+    ['unrelated-final', false, ['sibling-cycle']],
+  ]) {
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: toolCallId, name: 'reply',
+      args: { chat_id: cp.chatId, turn_id: 'sibling-cycle', text: toolCallId, interim, consumed_turn_ids: consumedIds },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === toolCallId);
+  }
+  await new Promise(resolve => setTimeout(resolve, 90));
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'final delivery only proves completion for the input IDs it actually covers');
+});
+
+for (const ok of [true, false]) {
+  test(`a delayed consuming reply cannot arm success before its ${ok ? 'successful' : 'failed'} delivery`, async t => {
+    let finishDispatch;
+    const cp = makeCliProcess({ toolDispatcher: () => new Promise(resolve => { finishDispatch = resolve; }) });
+    cp.activityQuietMs = 30;
+    const bridge = await startWithFakeBridge(cp);
+    t.after(async () => { bridge.close(); await cp.kill('test'); });
+    const sendP = cp.send('Current work');
+    sendP.catch(() => {});
+    const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+    cp._handleHookEvent({
+      type: 'UserPromptSubmit',
+      prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">work</channel>`,
+    });
+    cp.inputLedger.set('sibling-cycle', { source: 'primary', state: 'resolved' });
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: 'delayed-sibling', name: 'reply',
+      args: { chat_id: cp.chatId, turn_id: 'sibling-cycle', text: 'Completed.', consumed_turn_ids: [primary.turn_id] },
+    });
+    for (let i = 0; i < 50 && typeof finishDispatch !== 'function'; i++) {
+      await new Promise(resolve => setTimeout(resolve, 1));
+    }
+    assert.equal(typeof finishDispatch, 'function');
+    await new Promise(resolve => setTimeout(resolve, 90));
+    const pending = cp.pendingTurns.get(primary.turn_id);
+    assert.ok(pending);
+    assert.notEqual(pending._finalizeAfterReplyDelivery, true,
+      'an unconfirmed consuming answer cannot queue a success behind delivery');
+    finishDispatch({ ok });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'delayed-sibling');
+    if (ok) {
+      assert.equal((await sendP).alreadyDelivered, true,
+        'successful sibling delivery rearms stalled-hook recovery');
+    } else {
+      await new Promise(resolve => setTimeout(resolve, 90));
+      assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+        'failed delivery cannot release a previously queued quiet success');
+    }
+  });
+}
+
+test('interim consumed acknowledgement keeps the busy absolute checkpoint extendable, including during its probe', async t => {
+  const cp = makeCliProcess();
+  cp.activityQuietMs = 60_000;
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => { bridge.close(); await cp.kill('test'); });
+  const sendP = cp.send('Current work');
+  sendP.catch(() => {});
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent({
+    type: 'UserPromptSubmit',
+    prompt: `<channel source="polygram-bridge" turn_id="${primary.turn_id}">work</channel>`,
+  });
+  const status = async toolCallId => {
+    bridge.send({
+      kind: 'tool', session: cp.sessionKey, tool_call_id: toolCallId, name: 'reply',
+      args: { chat_id: cp.chatId, turn_id: primary.turn_id, text: toolCallId, interim: true, consumed_turn_ids: [primary.turn_id] },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === toolCallId);
+  };
+  cp.probeBusyState = async () => ({ streaming: true, paneTail: 'working' });
+  await status('status-before-checkpoint');
+  await cp._checkpointAbsolute(primary.turn_id);
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true,
+    'interim consumption before the probe must extend working time instead of resolving');
+  const pending = cp.pendingTurns.get(primary.turn_id);
+  assert.equal(pending._extended, true);
+  clearTimeout(pending.absoluteTimer);
+  let finishProbe;
+  cp.probeBusyState = () => new Promise(resolve => { finishProbe = resolve; });
+  const checkpoint = cp._checkpointAbsolute(primary.turn_id);
+  await status('status-during-checkpoint');
+  finishProbe({ streaming: true, paneTail: 'more work' });
+  await checkpoint;
+  assert.equal(cp.pendingTurns.has(primary.turn_id), true);
+  assert.equal(pending._lastCheckpointPaneTail, 'more work',
+    'interim consumption during the probe must not skip rearming the checkpoint');
+  clearTimeout(pending.absoluteTimer);
+  const finalCheckpoint = cp._checkpointAbsolute(primary.turn_id);
+  cp.inputLedger.set('sibling-cycle', { source: 'primary', state: 'resolved' });
+  bridge.send({
+    kind: 'tool', session: cp.sessionKey, tool_call_id: 'final-during-checkpoint', name: 'reply',
+    args: { chat_id: cp.chatId, turn_id: 'sibling-cycle', text: 'Done.', consumed_turn_ids: [primary.turn_id] },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'final-during-checkpoint');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(cp._turnHasFinalReply(pending), false,
+    'only the sibling consuming delivery supplies final-answer proof during this probe');
+  finishProbe({ streaming: true, paneTail: 'final delivery' });
+  await finalCheckpoint;
+  assert.equal(pending._lastCheckpointPaneTail, 'more work',
+    'a final answer landing during the probe keeps its own quiet finalization path');
+  cp._activityQuietFinalize(primary.turn_id);
+  assert.equal((await sendP).alreadyDelivered, true);
+});
+
 test('an unproven old autosteer reply stays late through dispatch, quoting, and bookkeeping', async t => {
   const dispatched = [];
   const events = [];

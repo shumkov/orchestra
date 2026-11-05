@@ -752,6 +752,22 @@ test('a reply that answers a turn merged with an earlier follow-up covers the fo
   await proc.kill('test');
 });
 
+test('a turn cut at its hard cap while still working does not hand its queued follow-up back for redelivery', async () => {
+  const { proc, written } = makeProc({ dropConfirmMs: 30 });
+  const { settled, turnId } = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'hello?', msgId: 2, source: 'autosteer' }), true);
+  proc._lastAckFieldAt = Date.now();
+  const dropped = [];
+  proc.on('input-dropped', (p) => dropped.push(p));
+  proc.pendingTurns.get(turnId)._fireTimeout('hard-max');
+  assert.equal((await within(settled, 100)).err?.code, 'TURN_MAX_EXCEEDED');
+  await sleep(120);
+  assert.equal(dropped.length, 0,
+    'claude is still working and holds the follow-up; resending it would answer it twice');
+  await proc.kill('test');
+});
+
 test('ProcessManager forwards a failed own-cycle to the consumer as onApiError', () => {
   assert.equal(CALLBACK_TO_EVENT.onApiError, 'api-error');
 });

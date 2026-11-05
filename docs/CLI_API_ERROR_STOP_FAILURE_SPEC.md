@@ -98,6 +98,11 @@ Re-check them on every pin bump.
   finish before its helper writes) is closed silently by that Stop, so its
   follow-ups get no notice. A bridge disconnect drops the process, so prompts
   left open by an ignored StopFailure are never swept into a later query.
+- A turn that rejects (API error, or an idle or absolute ceiling) arms the
+  drop-confirm sweep, as any cycle end does, so a follow-up claude never
+  picks up is handed back once instead of staying unaccounted. A hard-max
+  cut does not: claude is still working and still holds its queued
+  follow-ups, so a resend would answer them twice.
 - Nothing is retried or re-sent, and no session is restarted.
 
 ## Telemetry

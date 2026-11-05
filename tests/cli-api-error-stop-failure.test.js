@@ -52,6 +52,7 @@ function makeProc(opts = {}) {
     turnTimeoutMs: 60_000,
     turnAbsoluteMs: 60_000,
     interruptGraceMs: opts.interruptGraceMs ?? 5_000,
+    ...(opts.dropConfirmMs != null && { dropConfirmMs: opts.dropConfirmMs }),
   });
   proc.bridgeReady = true;
   proc.bridgeServer = { writeMessage: (obj) => { written.push(obj); } };
@@ -544,6 +545,29 @@ test('a cycle that already ended with Stop sends no API-error notice for a later
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
   assert.equal(apiErrors.length, 0, 'the cycle ended normally; its follow-up is not reported as failed');
   await proc.kill('test');
+});
+
+test('a follow-up claude never picks up after the turn rejects is still checked for a drop, not left unaccounted', async () => {
+  for (const ending of ['api-error', 'timeout']) {
+    const { proc, written } = makeProc({ dropConfirmMs: 30 });
+    const { settled, turnId } = startTurn(proc, written, 1);
+    proc._handleHookEvent(hook(upsRaw(turnId, 'prompt-1', '1')));
+    assert.equal(proc.injectUserMessage({ content: 'hello?', msgId: 2, source: 'autosteer' }), true);
+    // claude follows the consumed_turn_ids contract this session, so an input
+    // it never acknowledged or picked up counts as dropped, not folded.
+    proc._lastAckFieldAt = Date.now();
+    const dropped = [];
+    proc.on('input-dropped', (p) => dropped.push(p));
+
+    if (ending === 'api-error') proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+    else proc.pendingTurns.get(turnId)._fireTimeout('idle');
+    assert.equal((await within(settled, 100)).outcome, 'rejected', ending);
+
+    await sleep(120);   // the confirm window passes with no pickup
+    assert.equal(dropped.length, 1, `${ending}: the follow-up is handed back for one redelivery instead of being lost`);
+    assert.equal(dropped[0].msgId, '2');
+    await proc.kill('test');
+  }
 });
 
 test('ProcessManager forwards a failed own-cycle to the consumer as onApiError', () => {

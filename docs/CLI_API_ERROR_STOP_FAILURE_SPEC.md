@@ -91,8 +91,9 @@ Re-check them on every pin bump.
     to no turn, it emits `api-error { apiError, anchorMsgIds, sessionId,
     backend }` once (`onApiError`), with every follow-up message still
     waiting, oldest first (empty for a wakeup).
-  - A late StopFailure for a prompt that is no longer open, or one that only
-    closes prompts of turns that already settled, is only logged.
+  - A late StopFailure whose prompt is no longer open still settles a
+    pending turn that ran in it, but closes nothing else. One that matches no
+    pending turn and closes no prompt of claude's own is only logged.
 - Known limit: a StopFailure line read after a later query's Stop (the
   StopFailure hook does not block claude; the later query would have to
   finish before its helper writes) is closed silently by that Stop, so its

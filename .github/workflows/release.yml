@@ -15,7 +15,10 @@ concurrency:
 
 jobs:
   publish:
-    runs-on: ubuntu-latest
+    # Pinned: on Ubuntu 26.04 /usr/bin/env is a symlink to the multicall coreutils
+    # binary, which the Codex session-launcher characterization tests reject as an
+    # unsafe executable. Production hosts ship a regular file.
+    runs-on: ubuntu-24.04
     # Configure in repo Settings -> Environments -> release, and add orchestra as an
     # npm trusted publisher (repo shumkov/orchestra, workflow release.yml, environment release).
     environment: release

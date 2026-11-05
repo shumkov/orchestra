@@ -502,6 +502,50 @@ test("the next prompt's UserPromptSubmit written before this cycle's StopFailure
   await proc.kill('test');
 });
 
+// The overnight shape up to the follow-up's own cycle: turn-1 fails, and the
+// follow-up autosteered into it runs afterwards as its own query 'prompt-2'.
+async function followUpRunsAsOwnCycle(proc, written) {
+  const first = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(first.turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'hello?', msgId: 2, source: 'autosteer' }), true);
+  const followUp = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+  assert.equal((await within(first.settled, 200)).outcome, 'rejected');
+  proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-2', '2')));
+  return followUp;
+}
+
+test('a turn folded into the follow-up\'s cycle owns that cycle: once it is answered, a late failure sends no notice', async () => {
+  const { proc, written } = makeProc();
+  await followUpRunsAsOwnCycle(proc, written);
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  // The user writes again; claude folds the new turn into the running cycle.
+  const next = startTurn(proc, written, 3);
+  proc._handleHookEvent(hook(upsRaw(next.turnId, 'prompt-2', '3')));
+  proc._recordReplyForPendingTurn('here is your answer', next.turnId);
+  proc._finalizeTurn(next.turnId);
+  assert.equal((await within(next.settled, 200)).outcome, 'resolved');
+
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));   // a closing request of that cycle fails
+  assert.equal(apiErrors.length, 0,
+    'the cycle was settled through the folded turn, which answered the user; an error under the follow-up would contradict that answer');
+  await proc.kill('test');
+});
+
+test('a cycle that already ended with Stop sends no API-error notice for a later StopFailure under the same prompt', async () => {
+  const { proc, written } = makeProc();
+  await followUpRunsAsOwnCycle(proc, written);
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  proc._handleHookEvent(hook({ hook_event_name: 'Stop', prompt_id: 'prompt-2', last_assistant_message: 'here you go' }));
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
+  assert.equal(apiErrors.length, 0, 'the cycle ended normally; its follow-up is not reported as failed');
+  await proc.kill('test');
+});
+
 test('ProcessManager forwards a failed own-cycle to the consumer as onApiError', () => {
   assert.equal(CALLBACK_TO_EVENT.onApiError, 'api-error');
 });

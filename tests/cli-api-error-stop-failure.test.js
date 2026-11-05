@@ -570,6 +570,24 @@ test('a follow-up claude never picks up after the turn rejects is still checked 
   }
 });
 
+test('a follow-up the user cancelled with /stop is not answered when claude still runs it and that fails', async () => {
+  const { proc, written } = makeProc({ interruptGraceMs: 30 });
+  const first = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(first.turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'hello?', msgId: 2, source: 'autosteer' }), true);
+  const followUp = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  await proc.interrupt();                                   // cancels the turn and its follow-up
+  assert.equal((await within(first.settled, 200)).outcome, 'resolved');
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-2', '2')));   // claude runs the queued input anyway
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
+  assert.equal(apiErrors.length, 1, 'the consumer still learns the cycle ended (visuals stop)');
+  assert.equal(apiErrors[0].anchorMsgId, null, 'the user cancelled that message; no "couldn\'t finish" under it');
+  await proc.kill('test');
+});
+
 test('ProcessManager forwards a failed own-cycle to the consumer as onApiError', () => {
   assert.equal(CALLBACK_TO_EVENT.onApiError, 'api-error');
 });

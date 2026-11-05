@@ -27,6 +27,13 @@ Re-check them on every pin bump.
   follow-up's extra UserPromptSubmit, its tool hooks, and its final
   Stop/StopFailure all share it. A queued prompt that runs as its own cycle
   gets a new one.
+- Several messages queued while a query runs each fire their own
+  UserPromptSubmit, with their own `prompt_id`, when that query ends. Claude
+  then runs them as **one** query, and its Stop or StopFailure carries only
+  the **last** `prompt_id`. Seen with two and three follow-ups queued during
+  the retry window, both when the merged query failed and when it succeeded.
+  Their UserPromptSubmit lines arrived in message order, 35–200 ms apart,
+  consistent with claude waiting for each UserPromptSubmit hook in turn.
 - A sub-agent whose request fails fires `StopFailure` with `agent_id` and the
   parent's `prompt_id`, and **no SubagentStop**. The main thread carries no
   `agent_id`, even under `--agent`.
@@ -59,17 +66,37 @@ Re-check them on every pin bump.
     error.
   - The rejection happens before `idle` is emitted, so a throwing listener
     cannot strand the turn after its ceilings were cleared.
-- **No match**: a prompt that ran with no pending turn (a follow-up that runs
-  after a failed turn, a wakeup) is remembered at its UserPromptSubmit,
-  together with the first follow-up message it picked up. The memory is a
-  bounded map of the last 8 prompts, because the next prompt's line can be
-  written first.
-  - A delivered final reply to that follow-up clears its message, since the
-    user is no longer waiting on it.
-  - Its StopFailure emits `api-error { apiError, anchorMsgId, sessionId,
-    backend }` once (`onApiError`).
-  - A late failure of a turn that already settled matches neither, so it is
-    only logged.
+- **Open prompts.** Every prompt is remembered from its UserPromptSubmit
+  until its query ends, in submission order. The map is bounded like the
+  input ledger (64), and an eviction is logged.
+  - A prompt a pending turn runs in belongs to that turn, and the turn's
+    settlement answers it. That includes a pending turn folded into a prompt
+    that started as claude's own cycle: the follow-ups the prompt held are
+    dropped.
+  - Any other follow-up a prompt picks up (in claude's own cycle, or folded
+    into a turn's query after that turn settled) is kept, except ones the
+    user cancelled with /stop.
+  - A delivered final reply clears the follow-ups of its prompt and every
+    older open prompt (claude answers a merged query as a whole). A reply is
+    recorded before claude's reply tool returns, so the next query's prompts
+    are not open yet.
+  - A C-c (`interrupt()`) closes every open prompt: it ends the query with no
+    hook.
+- **The end of prompt P closes P and every older open prompt**, because
+  claude runs queued prompts as one query ended under the last `prompt_id`.
+  - Stop closes them silently.
+  - StopFailure settles every pending turn whose prompt is P or one it
+    closed (as above). If a closed prompt still holds follow-ups, or belongs
+    to no turn, it emits `api-error { apiError, anchorMsgIds, sessionId,
+    backend }` once (`onApiError`), with every follow-up message still
+    waiting, oldest first (empty for a wakeup).
+  - A late StopFailure for a prompt that is no longer open, or one that only
+    closes prompts of turns that already settled, is only logged.
+- Known limit: a StopFailure line read after a later query's Stop (the
+  StopFailure hook does not block claude; the later query would have to
+  finish before its helper writes) is closed silently by that Stop, so its
+  follow-ups get no notice. A bridge disconnect drops the process, so prompts
+  left open by an ignored StopFailure are never swept into a later query.
 - Nothing is retried or re-sent, and no session is restarted.
 
 ## Telemetry
@@ -77,7 +104,7 @@ Re-check them on every pin bump.
 | Event | Fields |
 |---|---|
 | `cli-turn-api-error` | `turn_id`, `api_error_code`, `api_error_unlisted`, `delivered` / `deferred`, `reply_count`, `duration_ms` |
-| `cli-stop-failure-unattributed` | `reason` (`no-prompt-id`, `own-cycle`, `no-matching-pending`), `api_error_code`, `api_error_unlisted`, `pending_count`, `anchor_msg_id` |
+| `cli-stop-failure-unattributed` | `reason` (`no-prompt-id`, `own-cycle`, `no-matching-pending`), `api_error_code`, `api_error_unlisted`, `pending_count`, `closed_prompt_count`, `anchor_msg_ids` |
 | `cli-stop-failure-ignored` | `reason` (`closed`, `bridge-disconnecting`), `api_error_code` |
 | `cli-stop-failure-subagent` | `agent_id`, `api_error_code` |
 | `cli-stop-failure-during-interrupt` | `turn_id`, `api_error_code` |

@@ -167,7 +167,7 @@ test('a failure of a different query leaves a pending turn alone (exact prompt_i
   assert.equal(s.outcome, 'still-pending', 'the queued user turn never ran — its own query decides it');
   assert.equal(proc.pendingTurns.size, 1);
   assert.equal(apiErrors.length, 1, 'the failed wakeup is reported to the consumer');
-  assert.equal(apiErrors[0].anchorMsgId, null, 'no user message was waiting on the wakeup');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, [], 'no user message was waiting on the wakeup');
   assert.ok(events.some((e) => e.kind === 'cli-stop-failure-unattributed'));
   await proc.kill('test');
 });
@@ -199,7 +199,7 @@ test('overnight shape: a follow-up autosteered into the dead turn runs as its ow
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));   // a duplicated line
   assert.equal(apiErrors.length, 1, 'one failed cycle, one notice');
-  assert.equal(apiErrors[0].anchorMsgId, '2', 'the notice names the follow-up the user is waiting on');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, ['2'], 'the notice names the follow-up the user is waiting on');
   assert.equal(apiErrors[0].apiError, 'server_error');
   assert.deepEqual(leaks, [], 'the provider error text never takes the Stop or wakeup delivery paths');
   await proc.kill('test');
@@ -226,7 +226,7 @@ test('a follow-up cycle that already answered its message does not later claim i
     proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
 
     assert.equal(apiErrors.length, 1, 'the consumer still learns the cycle ended (visuals stop)');
-    assert.equal(apiErrors[0].anchorMsgId, null,
+    assert.deepEqual(apiErrors[0].anchorMsgIds, [],
       `the follow-up already has its answer — no "couldn't finish" under it (${viaConsumedIds ? 'consumed ids' : 'bound reply'})`);
     await proc.kill('test');
   }
@@ -286,7 +286,7 @@ test('hook lines out of order (the follow-up\'s UPS before the failed turn\'s St
   assert.equal((await within(settled, 200)).outcome, 'rejected', 'the first turn still fails on its own query');
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
   assert.equal(apiErrors.length, 1);
-  assert.equal(apiErrors[0].anchorMsgId, '2', 'the follow-up is still answered');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, ['2'], 'the follow-up is still answered');
   await proc.kill('test');
 });
 
@@ -499,7 +499,7 @@ test("the next prompt's UserPromptSubmit written before this cycle's StopFailure
   proc._handleHookEvent(hook(upsRaw(f3, 'prompt-3', '3')));   // written before prompt-2's StopFailure
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
   proc._handleHookEvent(hook(stopFailureRaw('prompt-3')));
-  assert.deepEqual(apiErrors.map((p) => p.anchorMsgId), ['2', '3'], 'each follow-up gets its own notice');
+  assert.deepEqual(apiErrors.map((p) => p.anchorMsgIds), [['2'], ['3']], 'each follow-up gets its own notice');
   await proc.kill('test');
 });
 
@@ -584,7 +584,147 @@ test('a follow-up the user cancelled with /stop is not answered when claude stil
   proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-2', '2')));   // claude runs the queued input anyway
   proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));
   assert.equal(apiErrors.length, 1, 'the consumer still learns the cycle ended (visuals stop)');
-  assert.equal(apiErrors[0].anchorMsgId, null, 'the user cancelled that message; no "couldn\'t finish" under it');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, [], 'the user cancelled that message; no "couldn\'t finish" under it');
+  await proc.kill('test');
+});
+
+// Two follow-ups queued while turn-1 retries, as the pinned CLI runs them: one
+// UserPromptSubmit each (own prompt_ids) when turn-1's query ends, then ONE
+// query for both, ended under the last prompt_id only.
+async function twoFollowUpsQueued(proc, written) {
+  const first = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(first.turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'two', msgId: 2, source: 'autosteer' }), true);
+  const f2 = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  assert.equal(proc.injectUserMessage({ content: 'three', msgId: 3, source: 'autosteer' }), true);
+  const f3 = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+  assert.equal((await within(first.settled, 200)).outcome, 'rejected');
+  proc._handleHookEvent(hook(upsRaw(f2, 'prompt-2', '2')));
+  proc._handleHookEvent(hook(upsRaw(f3, 'prompt-3', '3')));
+  return { f2, f3 };
+}
+
+test('two follow-ups claude ran as one failed query both get the notice', async () => {
+  const { proc, written } = makeProc();
+  await twoFollowUpsQueued(proc, written);
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-3')));   // the merged query's only end
+  assert.equal(apiErrors.length, 1, 'one failed query, one event');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, ['2', '3'],
+    'the first follow-up is waiting too; its prompt never gets an end of its own');
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-2')));   // a stray line for the merged prompt
+  assert.equal(apiErrors.length, 1, 'no second notice');
+  await proc.kill('test');
+});
+
+test('a merged query that ends with Stop closes the earlier follow-up\'s prompt too', async () => {
+  const { proc, written } = makeProc();
+  await twoFollowUpsQueued(proc, written);
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+  proc._handleHookEvent(hook({ hook_event_name: 'Stop', prompt_id: 'prompt-3', last_assistant_message: 'both answered' }));
+
+  // Later, a wakeup cycle fails.
+  proc._handleHookEvent(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'scheduled wakeup', prompt_id: 'wake-1' }));
+  proc._handleHookEvent(hook(stopFailureRaw('wake-1')));
+  assert.equal(apiErrors.length, 1);
+  assert.deepEqual(apiErrors[0].anchorMsgIds, [],
+    'the answered follow-up from the earlier query must not be told it failed');
+  await proc.kill('test');
+});
+
+test('a turn queued behind claude\'s own cycle and run together with a follow-up fails promptly, and the follow-up is answered', async () => {
+  const { proc, written } = makeProc();
+  // claude is busy with a wakeup; the user's message queues behind it, then a follow-up.
+  proc._handleHookEvent(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'scheduled wakeup', prompt_id: 'wake-1' }));
+  const { settled, turnId } = startTurn(proc, written, 1);
+  assert.equal(proc.injectUserMessage({ content: 'and this', msgId: 2, source: 'autosteer' }), true);
+  const followUp = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  proc._handleHookEvent(hook({ hook_event_name: 'Stop', prompt_id: 'wake-1', last_assistant_message: 'woke' }));
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  // Both queued messages run as one query, ended under the follow-up's prompt_id.
+  proc._handleHookEvent(hook(upsRaw(turnId, 'prompt-a', '1')));
+  proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-b', '2')));
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-b')));
+
+  const s = await within(settled, 200);
+  assert.equal(s.outcome, 'rejected', 'the user\'s turn ran in the failed query; it must not wait for the 30-minute checkpoint');
+  assert.equal(s.err.code, 'CLAUDE_API_ERROR');
+  assert.equal(apiErrors.length, 1);
+  assert.deepEqual(apiErrors[0].anchorMsgIds, ['2'], 'the follow-up is answered too');
+  await proc.kill('test');
+});
+
+test('a follow-up folded into a turn\'s query after that turn settled is answered when the query fails', async () => {
+  const { proc, written } = makeProc();
+  const { settled, turnId } = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'one more thing', msgId: 2, source: 'autosteer' }), true);
+  const followUp = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  proc._recordReplyForPendingTurn('here is your answer', turnId);
+  proc._finalizeTurn(turnId);                                  // settled before the query ended
+  assert.equal((await within(settled, 200)).outcome, 'resolved');
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-1', '2')));   // folded in at a tool boundary
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+  assert.equal(apiErrors.length, 1);
+  assert.deepEqual(apiErrors[0].anchorMsgIds, ['2'],
+    'the settled turn answered message 1 only; the follow-up is still waiting');
+  await proc.kill('test');
+});
+
+test('a cycle the user stopped with C-c is not reported when a later query fails', async () => {
+  const { proc, written } = makeProc({ interruptGraceMs: 30 });
+  proc._handleHookEvent(hook({ hook_event_name: 'UserPromptSubmit', prompt: 'scheduled wakeup', prompt_id: 'wake-1' }));
+  await proc.interrupt();                                      // C-c ends the wakeup's query with no hook
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  const { settled, turnId } = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(turnId, 'prompt-1', '1')));
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+  assert.equal((await within(settled, 200)).outcome, 'rejected');
+  assert.equal(apiErrors.length, 0, 'only the user\'s turn ran in the failed query; the stopped wakeup did not fail');
+  await proc.kill('test');
+});
+
+test('a reply that answers a merged query covers every follow-up in it', async () => {
+  const { proc, written } = makeProc();
+  const { f3 } = await twoFollowUpsQueued(proc, written);
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+  // claude answers both messages in one reply bound to the last envelope,
+  // then a closing request of the same query fails.
+  proc._recordReplyForPendingTurn('answers to both', f3);
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-3')));
+  assert.equal(apiErrors.length, 1, 'the consumer still learns the cycle ended (visuals stop)');
+  assert.deepEqual(apiErrors[0].anchorMsgIds, [], 'neither message gets "couldn\'t finish" after the answer');
+  await proc.kill('test');
+});
+
+test('many follow-ups queued in one retry window (a busy group chat) are all answered', async () => {
+  const { proc, written } = makeProc();
+  const first = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(first.turnId, 'prompt-1', '1')));
+  const followUps = [];
+  for (let msgId = 2; msgId <= 13; msgId += 1) {
+    assert.equal(proc.injectUserMessage({ content: `m${msgId}`, msgId, source: 'autosteer' }), true);
+    followUps.push([written.filter((w) => w.kind === 'user_msg').pop().turn_id, msgId]);
+  }
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-1')));
+  assert.equal((await within(first.settled, 200)).outcome, 'rejected');
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+  for (const [turnId, msgId] of followUps) proc._handleHookEvent(hook(upsRaw(turnId, `prompt-${msgId}`, String(msgId))));
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-13')));
+  assert.equal(apiErrors.length, 1);
+  assert.deepEqual(apiErrors[0].anchorMsgIds, followUps.map(([, msgId]) => String(msgId)));
   await proc.kill('test');
 });
 

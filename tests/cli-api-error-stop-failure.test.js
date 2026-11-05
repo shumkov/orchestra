@@ -9,10 +9,10 @@
  * Claude credential expired): the prompt is picked up (UserPromptSubmit), the
  * CLI retries for ~3 minutes, then writes a synthetic assistant entry
  * (`isApiErrorMessage: true`, `error: "server_error"`) and fires the
- * StopFailure hook — never Stop. Before this fix StopFailure was not
- * registered, nothing observed the failure, later messages were autosteered
- * into the dead turn, and the user heard nothing until the 30-minute
- * checkpoint gave up.
+ * StopFailure hook — never Stop. Unless StopFailure is registered and
+ * handled, nothing observes that end: later messages are autosteered into the
+ * dead turn and the user hears nothing until the 30-minute checkpoint gives
+ * up.
  *
  * Every payload below is fed through the real hook parser
  * (normalizeHookEvent) with the field names the pinned CLI writes, verified
@@ -114,7 +114,7 @@ test('a turn whose model request ends in a synthetic isApiErrorMessage server_er
 
   const s = await within(settled, 200);
   assert.equal(s.outcome, 'rejected',
-    'the failed turn must end now — pre-fix it stayed pending until the 30-minute checkpoint');
+    'the failed turn must end now, not stay pending until the 30-minute checkpoint');
   assert.equal(s.err.code, 'CLAUDE_API_ERROR');
   assert.equal(s.err.apiError, 'server_error', 'the CLI error class reaches the consumer');
   assert.doesNotMatch(s.err.message, /127\.0\.0\.1|gateway|upstream/,

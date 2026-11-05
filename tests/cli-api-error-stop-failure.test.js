@@ -728,6 +728,30 @@ test('many follow-ups queued in one retry window (a busy group chat) are all ans
   await proc.kill('test');
 });
 
+test('a reply that answers a turn merged with an earlier follow-up covers the follow-up too', async () => {
+  const { proc, written } = makeProc();
+  const first = startTurn(proc, written, 1);
+  proc._handleHookEvent(hook(upsRaw(first.turnId, 'prompt-1', '1')));
+  assert.equal(proc.injectUserMessage({ content: 'hello?', msgId: 2, source: 'autosteer' }), true);
+  const followUp = written.filter((w) => w.kind === 'user_msg').pop().turn_id;
+  proc.pendingTurns.get(first.turnId)._fireTimeout('idle');
+  assert.equal((await within(first.settled, 100)).err?.code, 'TURN_TIMEOUT');
+  const apiErrors = [];
+  proc.on('api-error', (p) => apiErrors.push(p));
+
+  // The user's next message and the queued follow-up run as one query.
+  const next = startTurn(proc, written, 5);
+  proc._handleHookEvent(hook(upsRaw(followUp, 'prompt-2', '2')));
+  proc._handleHookEvent(hook(upsRaw(next.turnId, 'prompt-3', '5')));
+  proc._recordReplyForPendingTurn('answers to both', next.turnId);
+  proc._handleHookEvent(hook(stopFailureRaw('prompt-3')));   // a closing request fails
+
+  assert.equal((await within(next.settled, 200)).outcome, 'resolved');
+  assert.deepEqual(apiErrors.flatMap((p) => p.anchorMsgIds), [],
+    'the merged query answered the follow-up; no "couldn\'t finish" under it');
+  await proc.kill('test');
+});
+
 test('ProcessManager forwards a failed own-cycle to the consumer as onApiError', () => {
   assert.equal(CALLBACK_TO_EVENT.onApiError, 'api-error');
 });

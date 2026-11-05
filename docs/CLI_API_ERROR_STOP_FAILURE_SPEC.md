@@ -77,9 +77,10 @@ Re-check them on every pin bump.
     into a turn's query after that turn settled) is kept, except ones the
     user cancelled with /stop.
   - A delivered final reply clears the follow-ups of its prompt and every
-    older open prompt (claude answers a merged query as a whole). A reply is
-    recorded before claude's reply tool returns, so the next query's prompts
-    are not open yet.
+    older open prompt (claude answers a merged query as a whole), whether it
+    is bound to a follow-up or to a pending turn. A reply is recorded before
+    claude's reply tool returns, so the next query's prompts are not open
+    yet.
   - A C-c (`interrupt()`) closes every open prompt: it ends the query with no
     hook.
 - **The end of prompt P closes P and every older open prompt**, because

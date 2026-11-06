@@ -92,6 +92,18 @@ describe('hook-settings — buildHookSettings', () => {
     }
   });
 
+  // Claude Code binds a cross-session inbox in every session and, with no
+  // explicit setting, delivers a message from any same-user session whose
+  // permission mode matches. Bot sessions run bypassPermissions, so any
+  // other bypass session on the host (another bot's chat, a dev session)
+  // could put text into a bot's conversation outside polygram, and a
+  // mismatched sender raises a TUI approval dialog the tmux driver never
+  // answers. The bot's only input must be its own transport.
+  test('refuses inbound cross-session messages from other Claude sessions', () => {
+    const s = buildHookSettings({ ndjsonPath: '/abs/foo.ndjson' });
+    assert.equal(s.crossSessionInbound, 'refuse');
+  });
+
   test('rejects non-absolute ndjsonPath', () => {
     assert.throws(() => buildHookSettings({ ndjsonPath: 'rel.ndjson' }),
       /must be an absolute path/);

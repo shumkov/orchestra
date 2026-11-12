@@ -1,16 +1,145 @@
 # Claude runtime 2.1.322 upgrade preparation
 
+## Publication and integration checkpoint — 2026-11-12
+
+Ivan authorized publication and planned rollout. Tracking issue
+[Polygram #133](https://github.com/shumkov/polygram/issues/133) is OPEN; the
+published title and complete body were read back and verified against the prepared
+body. The issue prerequisite and full matched matrix prerequisite are satisfied.
+The bounded correction is accepted with the retained limits below. Codex owns
+Orchestra 0.12.0; this worker must wait for its authoritative published base before
+Claude release version selection, tags or main integration. No deployment is
+performed here. The separately reviewed aligned pin/consumer preparation and both
+24-hour soaks remain; strict focused traces stay INCONCLUSIVE and require no new
+provider loop. Earlier authorization/pin-status statements below describe their
+historical checkpoints and are superseded by this section.
+
+
 Status: proposed candidate; the SDK and CLI pins MUST remain 0.3.283 / 2.1.283 until the tracking issue exists and the checked old/new matrix passes on one recorded gate commit. A draft issue is not an opened issue. No release, consumer update, activation, or soak is authorized here.
 
-## Followup preparation status
 
-Related Polygram child now exists at `/Users/ivanshumkov/orca/workspaces/polygram/claude-322-gates`, branch `claude-322-gates`, base `960b0be3b191f5a336bab8d5d6577d411c548a3a`, correctly parented to this Orchestra worktree through Orca. All work is uncommitted. The parent and its dependencies remain untouched.
+## Coordinator acceptance and retained limits
 
-The reviewed local amendment is the child's `docs/claude-322-fixture-preparation-spec.md`; candidate expectation provenance is in `docs/claude-322-discovery-dossier.md`. Both exact binaries now reach readiness with the smallest supported included local consent file. Both then explicitly reject Channels and exit BLOCKED (2) before the test prompt; downstream modes were not retried. No supported credential-free account/feature enrollment was found. Paid execution requires an explicit go and an authorized isolated account context.
+The coordinator accepts this bounded ownership correction on the completed
+23/23 matched matrix, all three distinct UUID-owned user completions observed on
+both actual SDK/CLI pairs, observed peer/zero events preserving pending owners,
+reviewed retained-shape RED 2 FAIL -> GREEN 2 PASS, the cancellation/drop
+regressions, and independent clean code reviews. The former strict focused
+oracle required unsupported standalone-report/notification-before-zero behavior
+and its overlap holds were denied. Its INCONCLUSIVE verdicts remain unchanged;
+those extra assumptions are not a release gate. No new live scheduling fixture,
+provider query, or instrumentation loop is required or planned for this correction.
+This accepts explicitly limited coverage; downstream delivery and every overlap
+schedule remain unproven. Tracking-issue publication remains the explicit pre-pin
+prerequisite, and pin/consumer reviews, release/activation authority, staging and
+both 24-hour soaks remain. No runtime or package pin changes are made here.
 
-The child adds optional absolute manifest selection with exact-content binding and a fail-closed discovery stage. Separate `claude-2.1.322-discovery.json` is provisional and only permits candidate-filtered, non-authoritative runs; it cannot accept artifacts. Old .283 expectations remain intact; .322 inherits no opt-in waiver. The accepted default manifest and all runtime pins remain unchanged. The initial-phase observations below are retained as history, superseded where noted by this status and `/tmp/orchestra-claude-upgrade-followup-report.md`.
+## Final full unit/integration verification
 
-The current provider request states invocation/deadline scope and uncertainty. No extra spending-cap, metering proxy, or whole-run timeout project is a mandatory gate; existing driver turn limits, timeouts and cost-estimate metadata remain intact. Mandatory issue, accepted matrix on one gate commit, aligned reviewed pins, consumer review and both 24h soaks are unchanged.
+Ran the complete package test command once on the final corrected runtime with
+Node 24.4.0: `node --test --test-force-exit --test-concurrency=1 tests/*.test.js`.
+All 34 test files completed: 1,579 tests, 1,560 PASS, 0 FAIL, 19 existing contract
+capability-N/A skips (17 channels-protocol, 2 Codex-capability), 0 cancelled.
+Duration 103.370 seconds, exit 0. Runtime SHA-256 remains
+`c6f61a85acd139a0c524a7726dc5eead02be34480305bcd3fbdde32005c72184`.
+HOME/CODEX_HOME/TMP/tmux/vendor/versions were private synthetic trees, with an
+allowlisted credential-free environment and disabled installer/updater. The suite
+uses fake processes/bridges and local fixtures; no paid queries were repeated.
+No failures required code changes. This is unit/integration proof, not additional
+provider, downstream delivery, persistence, activation or soak proof. Full log,
+command, times and per-skip receipts:
+`/tmp/orchestra-claude-upgrade-research-3agLJs/compatibility-acceptance-full-suite/`.
+
+
+## Current correction and matched-pair result
+
+Bounded SdkProcess normal-send serialization, UUID/origin ownership, cancellation
+and drop correction is implemented with retained RED/GREEN tests and independent
+CLEAN design/code reviews. Public interfaces, intentional injection/steering and
+autonomous report output remain. Runtime source SHA-256:
+`c6f61a85acd139a0c524a7726dc5eead02be34480305bcd3fbdde32005c72184`.
+
+Actual SDK0.3.283/CLI2.1.283 versus SDK0.3.322/CLI2.1.322 complete matched matrix
+`m-6cce-a` PASSES23/23 scheduled cells on signed gate
+`6cceb3b3544f4efc74330c82f0557d7f1bfb31d6`, manifest SHA-256
+`63bcf4e6f018bcbf689240a472328b73e1ee265af58a4cc7c3175d8320b8e817`.
+The existing old opt-in waiver remains explicit; no candidate waiver was added.
+Documented .292 clear ordering and exact two-result/task/run/session semantics
+are validated on the new matched pair. Historical b796 crossed-pair FAIL and e187
+runner-blocked FAIL remain immutable, not combined into this new PASS.
+
+Strict focused provider probes remain INCONCLUSIVE: all3correct UUID-owned user
+completions and observed peer/zero report terminals preserve pending ownership,
+but denied fixture holds and stronger report/notification-order witnesses prevent
+complete scheduling/downstream proof. Reviewed retained-shape replay fails on old
+runtime and passes after correction; this does not relabel provider evidence.
+No unchanged paid retry or wider runtime refactor is proposed. See
+`SDK_PENDING_ATTRIBUTION_COMPATIBILITY_SPEC.md` and
+`/tmp/orchestra-claude-ownership-correction-report.md` for exact evidence and the
+accepted coverage limits. No further focused provider loop is required. Pins
+remain old; issue is unpublished, consumer
+update/release/activation and both24hsoaks remain pending. Claude does not block
+coordinator-owned Codex work.
+
+## Historical provider verification before ownership correction
+
+Ivan authorized all paid calls needed for upgrade discovery, full old/new matrix
+and actual-new-SDK/focused followups. Existing access-only OAuth was used in
+synthetic HOME/config/vendor/tmux trees; no real login/refresh state was changed.
+Publication, push, release, issue creation and activation remain unauthorized.
+
+Related Polygram child `/Users/ivanshumkov/orca/workspaces/polygram/claude-322-gates`
+has signed gate commit `b796ec57a010edc092a9e03a287a00870dbb891d`, parent
+`b10cdb32a6a11958a8516b24d86beeceabeefa9e`, prepared base `eea29d3`.
+The separate acceptance manifest SHA-256 is
+`bcfa47f6ce435bc3513677bc1325234dd476c523646c16477f9cb7f8eeb45f9a`.
+Its 106 focused tests pass with zero skips. Full unfiltered `gate-b796ec5-full-a`
+definitively FAILS: 23 selected, 15 completed, 14 PASS, one failed candidate
+background MCP, eight not run after failure. All ten old cells and candidate
+CLI twice plus Workflow direct/fallback PASS. All eight post-stop cases PASS in filtered observations on that same commit
+(after short IDs fixed Opus/snapshot fixture path limits). These are supplemental; they cannot make a failed full attempt pass. The earlier full
+`b10cdb3` attempt failed the old instructions assertion; neutral owned instructions
+restored count one on both versions without weakening the old contract. The old
+source of that historical instruction attachment is unproven. Parent piddock,
+trusted-Codex, accepted default matrix and all runtime pins remain unchanged.
+
+Candidate discovery exercised all 13 planned invocations across retained batches.
+Five constant-SDK scenarios and all five actual SDK .322 core checks PASS.
+Candidate Opus behavior/anchors and snapshot were exercised; enclosing provisional
+lifecycle checks are distinguished from model success. The first channel row
+has exact parent=false old / true candidate assertions; instruction count zero
+was a clean-fixture hypothesis corrected to one, not accepted version drift.
+
+The candidate opt-in MCP fails with constant old SDK. Actual SDK .322 completes
+the task and returns the marker but fails strict ordering: notification occurs
+before membership clear, whereas the contract requires clear before notification.
+It does not require clear before task completion. Both streams also have two
+terminal SDK results, violating the checked exactly-one-result source assumption;
+raw hashes, normalized records and reconstructed native proofs match. No candidate
+waiver was added.
+Real auto-mode queued-prompt attribution fails on both actual old/new pairs;
+.322 additionally emits an empty zero-turn report result consuming pending user
+work. The bounded proposal and intentionally RED manual reproducer are in
+`docs/SDK_PENDING_ATTRIBUTION_COMPATIBILITY_SPEC.md` and
+`scripts/spikes/sdk-pending-attribution-regression.cjs`; runtime is unmodified.
+
+Guarded native auth now establishes Channels delivery in both local stubs.
+HTTP 500/401, retry recovery, injection/followup/interrupt/subagent, folded-input
+and mailbox checks PASS on both versions, with eager tools only for deterministic
+local scripting. Default candidate deferred-tool fixtures failed and are retained;
+real-provider matrix defaults are unchanged. The child SQLite binding was rebuilt
+in its own dependencies only. See `docs/CLAUDE_LOCAL_STUB_TOOLS_SPEC.md`.
+
+The freshly refreshed existing context was read after prior calls completed;
+profile returned 403, while one supported inference smoke returned definite
+weekly quota exhaustion. No unchanged quota retry occurred. Another existing
+native context completed the current real comparison, without login mutation.
+
+Current detailed evidence is retained under
+`/tmp/orchestra-claude-upgrade-research-3agLJs`; the final authorized-phase report
+will be `/tmp/orchestra-claude-upgrade-provider-report.md`. The tracking issue is
+still a local draft. No unit count, provider check or matrix attempt replaces
+that publication gate, separate consumer review, or either mandatory 24h soak.
 
 ## Problem and scope
 
@@ -39,32 +168,37 @@ Review the full change range after .283, not just .322. Relevant changes include
 ## Approach and alternatives
 
 1. Preserve the host's old SDK-supplied executable outside updater, vendor GC, node_modules, and disposable test trees; record version, SHA-256, byte size and source. Download the exact candidate platform tarball from the official registry; verify its registry integrity and executable version/hash. No installer or updater runs.
-2. Review this spec independently for compatibility, scope, and isolation. Then run checked local fixtures against both exact binaries through the unchanged Orchestra adapter, in separate synthetic homes and a private tmux socket directory. Put HOME beneath a dedicated mode-0700 user-data fixture root, outside temporary roots: the mailbox IPC correctly rejects a HOME under `/tmp` (including canonical aliases and `os.tmpdir()`). Keep TMPDIR and TMUX_TMPDIR separate from HOME. Use a minimal allowlisted environment and dummy auth; keep all inference at a loopback HTTP stub and enforce external network denial. On macOS, changing HOME does not isolate the login Keychain: enforce denial of `security` execution, Keychain file reads/writes and securityd access, and preflight these restrictions before launching either binary. Do not import real settings, login material, sessions, or cached account flags. If Channels cannot initialize under these constraints, report BLOCKED rather than borrowing real auth.
-3. Record command, exit, adapter commit, driver hash, binary hash, and content-free verdict for each local check. Private logs and artifacts stay mode 0600 beneath mode-0700 directories. Never use daemon vendor paths. Do not run auth-expired, boot-replay, production boot smoke, or a broad matrix during this authorization scope.
-4. Prepare the exact issue text and a bounded paid-gate request. Leave version files and lockfile unchanged. Only after the mandatory issue and accepted matrix may a separately reviewed Orchestra pin change, release, and separately reviewed aligned Polygram consumer update proceed.
+2. Review this spec independently for compatibility, scope, and isolation. Then run checked local fixtures against both exact binaries through the independently reviewed corrected Orchestra adapter, in separate synthetic homes and a private tmux socket directory. Put HOME beneath a dedicated mode-0700 user-data fixture root, outside temporary roots: the mailbox IPC correctly rejects a HOME under `/tmp` (including canonical aliases and `os.tmpdir()`). Keep TMPDIR and TMUX_TMPDIR separate from HOME. Use a minimal allowlisted environment. Pure local transport checks keep inference at loopback with external network denial; authorized provider checks use the separately reviewed access-only native context and provider network allowlist. On macOS, changing HOME does not isolate the login Keychain: enforce denial of `security` execution, Keychain file reads/writes and securityd access, and preflight these restrictions before launching either binary. Do not import real settings, sessions or cached feature flags. The authorized provider controller supplies access-only credentials inside the synthetic HOME after genuine account checks, without modifying the real login. Record explicit Channels rejections; never fabricate enrollment.
+3. Record command, exit, adapter commit, driver hash, binary hash, and content-free verdict for each local check. Private logs and artifacts stay mode 0600 beneath mode-0700 directories. Never use daemon vendor paths. Do not run auth-expired, boot-replay or production boot smoke. The reviewed full provider matrix is authorized within its isolated controller.
+4. Prepare the exact local issue draft and execute authorized provider gates with retained evidence. Leave version files and lockfile unchanged. Only after the mandatory issue and accepted matrix may a separately reviewed Orchestra pin change, release, and separately reviewed aligned Polygram consumer update proceed.
 
 Rejected alternatives: update npm pins first (violates the gate); run the old .220/.283 matrix against .322 (wrong manifest and attestation); copy .283 expectations to .322 as accepted truth (hides drift); use only local unit counts (does not test native lifecycle/model behavior); use live HOME or daemon vendor paths (auth and GC hazards); update Codex alongside this work (separate ownership).
 
 ## Gate ownership and data flow
 
-At the initial read-only reference commit, the checked runner loaded `claude-2.1.283-matrix.json` at a fixed path without a manifest override. The followup child adds a reviewed optional selector; the accepted default stays unchanged. It currently compares **2.1.220 -> 2.1.283**, holding installed SDK **0.3.283** constant. It has no .322 expectations and must refuse unknown versions. An isolated related Polygram child checkout is needed before editing that matrix: old becomes .283, candidate .322, old expectations retained, .220 removed, and .322 expectations established from reviewed observations. Candidate-specific waived opt-in behavior must be established anew; do not inherit the .283 waiver. Pin edits wait until a full accepted run on one gate commit.
+At the initial read-only reference commit, the checked default runner compared **2.1.220 -> 2.1.283** with installed SDK **0.3.283** held constant and no .322 expectations. That accepted default remains unchanged. The related Polygram child now has a separate reviewed .283/.322 acceptance manifest with explicit immutable per-side SDK roots; it evaluates actual .283/.283 and .322/.322 pairs on one source commit. The old .283 expectations remain, .220 is absent from this separate manifest, and exact .322 expectations are source-backed and reviewed. Signed6cceb3b completed the full matched matrix23/23PASS. The old opt-in waiver remains explicit and old-only; there is no candidate waiver. Pin edits still wait for the real tracking issue and remaining requirements below.
 
 Every scheduled matrix cell currently needs real inference: CLI contract twice per side; Workflow direct and fallback; delayed MCP default and, unless independently justified otherwise, opt-in; SDK PostToolBatch, subagent, resume, compaction and tool-less drain; candidate Opus projection and system-prompt snapshot. The binary Workflow anchors are statically inspectable, but their enclosing Opus projection still makes real calls. Existing snapshot NOT-APPLICABLE and opt-in waiver policy remain exact, evidence-based exceptions, not blanket exemptions.
 
-Additional no-provider gates: `cli-api-error-stub.mjs` fail + inject + followup, fail + three injections, flaky recovery, subagent error attribution, retry interruption, 401, and folded input; `mailbox-two-roles.mjs --model stub`. Fixture validation and SDK type/API comparison can run locally. None establishes complete old/new lifecycle equality. The unchanged installed SDK in the pre-pin matrix isolates CLI changes; after the accepted pin move, repeat applicable SDK gates with SDK 0.3.322 to verify the actual new pair.
+Additional no-provider gates: `cli-api-error-stub.mjs` fail + inject + followup, fail + three injections, flaky recovery, subagent error attribution, retry interruption, 401, and folded input; `mailbox-two-roles.mjs --model stub`. Fixture validation and SDK type/API comparison can run locally. None establishes complete old/new lifecycle equality. The initial constant-old-SDK candidate experiment remains a failed crossed-pair observation. The completed matched matrix already verifies actual SDK0.3.322 before any pin move, using exact per-side resolution and imported-source proof.
 
 ## Failure modes and verification
 
 - Any unexplained new session/hook/queue/task/Stop/reply/wrapper shape blocks pin movement. Add a concrete red-then-green regression before changing adapters.
 - Fresh HOME may lack account feature enrollment; a local stub gate that cannot reach readiness is blocked, not a compatibility regression and not a pass.
 - A local fixture can prove transport/parsing only. It cannot prove real model choices, native provider tasks, snapshots enabled for an account, persisted consumer state, or deployment.
-- Matrix timeouts, failures, or ambiguous paid runs do not authorize automatic retries. Stop and send evidence plus a bounded rerun request.
+- Classify completed failures before another run and fix a definite cause before retrying. Do not repeat an ambiguous paid action without asking. Necessary planned upgrade batches remain authorized; no new batch approval is required.
 - No provider credentials in reviewable files; no real conversations in any artifact. Read preserved binary evidence back after tests.
-- Final independent review checks the actual diff and recorded outcomes. A documentation-only preparation has no runtime behavioral delta; regression TDD is unnecessary unless a concrete bug is found.
+- Final independent review checks the actual diff and recorded outcomes. Documentation-only receipt updates add no behavior; the runtime correction retains concrete RED/GREEN regression evidence.
 
-Remaining mandatory gates: open the issue after publication approval; reviewed .283/.322 matrix and full accepted run on one gate commit; aligned SDK/CLI Orchestra pin change with tests and independent review; authorized Orchestra release; separately reviewed exact Orchestra + SDK Polygram update; authorized staging and **at least 24h SDK staging soak**, then coordinated VPS activation and **24h CLI soak**. Watch `autosteer-match-miss`, `autonomous-wakeup-message`, and `tool-only-completion`. No local result waives either soak.
+Completed: reviewed actual-pair matrix and full accepted23/23run on signed6cceb3b. Remaining mandatory gates: open the issue after publication approval; aligned SDK/CLI Orchestra pin change with tests and independent review; authorized Orchestra release; separately reviewed exact Orchestra + SDK Polygram update; authorized staging and **at least 24h SDK staging soak**, then coordinated VPS activation and **24h CLI soak**. Watch `autosteer-match-miss`, `autonomous-wakeup-message`, and `tool-only-completion`. No local result waives either soak.
 
-## Results and review receipts
+## Historical initial preparation results and review receipts
+
+This section preserves the initial no-provider preparation record. Authorization,
+execution and source-review facts in the current status above supersede the
+initial outcome and next-call request below. The old reports remain retained.
+
 
 Independent spec review receipts (built-in, one-shot, read-only): `spec_compatibility` CLEAN; `spec_scope` CLEAN; `spec_isolation` CLEAN after fixing non-temporary HOME and denying actual Keychain Mach services. The latter verified the correction against native lookup preflights, rather than trusting a daemon label. Compatibility review also singled out .321's queued-subagent empty results for explicit later investigation.
 

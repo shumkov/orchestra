@@ -1,0 +1,31 @@
+{
+  "cliVersion": "codex-cli 0.167.2",
+  "binarySha256": "97bc82fd46f117cf10efb95e6ff0c81dc4784f5797bcdc2cb75093ba09e4def0",
+  "binarySha256ByTarget": {
+    "aarch64-apple-darwin": "97bc82fd46f117cf10efb95e6ff0c81dc4784f5797bcdc2cb75093ba09e4def0",
+    "x86_64-unknown-linux-musl": "a9672d0fa0dd8fcf8cad136fa0d056b914bc046f5ac3d78f4a5cf390655af56b"
+  },
+  "schemaSha256": {
+    "stableProtocolV2Canonical": "3acaab0f5788b486250d8e32f75ae5e98198c63090a500c04182df52f0c8f137",
+    "experimentalProtocolV2Canonical": "ca9811bd8310c9576f2acc1c37ba132afeef49c0cdbc3e02908b64ad12126163"
+  },
+  "schemaRawSha256ByTarget": {
+    "aarch64-apple-darwin": {
+      "stableClientRequest": "94074a415950787a25e09ae3b4d9de312cc264eb0f021633dfca921d300cd42a",
+      "stableProtocol": "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554",
+      "experimentalClientRequest": "2d629aaaceea335d7e58ab19ce5908c8dd75ca3f3a6161a5f015bf59aadd3295",
+      "experimentalProtocol": "486c7c8daa5dc7f3ab2a1fb56de5316804caf7a4210fda1dc28d3f0f4e90cfe1"
+    },
+    "x86_64-unknown-linux-musl": {
+      "stableClientRequest": "94074a415950787a25e09ae3b4d9de312cc264eb0f021633dfca921d300cd42a",
+      "stableProtocol": "021462a9bacd117f4cd40c256a4888619d059cec6a65b795198d521ba660e554",
+      "experimentalClientRequest": "2d629aaaceea335d7e58ab19ce5908c8dd75ca3f3a6161a5f015bf59aadd3295",
+      "experimentalProtocol": "486c7c8daa5dc7f3ab2a1fb56de5316804caf7a4210fda1dc28d3f0f4e90cfe1"
+    }
+  },
+  "provenance": "Official GitHub rust-v0.167.2 standalone target archives; Darwin schemas generated under empty CODEX_HOME; exact Linux x64 CLI/helper attested and schemas regenerated using Linux x64 Node22 in an isolated ARM64 Linux VM with Apple RosettaLinux translation. Native x64 CPU/sandbox/helper lifecycle evidence is separately bounded in the report.",
+  "codeModeHostSha256ByTarget": {
+    "aarch64-apple-darwin": "45acdb759c3ac0a6b30a5107329b364b7ac1579f2cdf270997f03bc8d6365ef6",
+    "x86_64-unknown-linux-musl": "007c62795a7215c27ee85486ecb95e714b33118a2d18c6d7b09b0d9793c72ff4"
+  }
+}

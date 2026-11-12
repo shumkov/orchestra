@@ -88,6 +88,34 @@ function model(overrides = {}) {
   };
 }
 
+function policyProfile({ trusted = false, proxy = false } = {}) {
+  const config = projectedConfig();
+  if (proxy) {
+    config.modelProvider = 'cliproxyapi';
+    config.modelProviders = { count: 1, keySha256: [digest('cliproxyapi')] };
+  }
+  if (trusted) {
+    config.defaultPermissions = 'polygram-trusted';
+    config.webSearch = 'live';
+    config.permissionProfiles = [{
+      id: 'polygram-trusted',
+      extends: null,
+      networkEnabled: true,
+      filesystemSha256: digest({ glob_scan_max_depth: null, ':root': 'write' }),
+      filesystem: [{ rootSha256: digest(':root'), access: 'write' }],
+    }];
+  }
+  return expectedProfile({
+    expectedConfig: config,
+    permissionProfileId: config.defaultPermissions,
+    expectedPermissionProfiles: [{
+      id: config.defaultPermissions,
+      allowed: true,
+      descriptionSha256: digest('profile-description'),
+    }],
+  });
+}
+
 function expectedProfile(overrides = {}) {
   const targetReceipt = resolveCodexTargetPin();
   const codexHome = '/srv/orchestra/codex-home';
@@ -743,7 +771,7 @@ test('static mismatch stops before account/model and always closes', async () =>
   assert.equal(client.closed, 1);
 });
 
-test('expected policy pins OpenAI, user review, and one effective config digest', async () => {
+test('expected policy pins the named provider, user review, and one effective config digest', async () => {
   const cases = [{
     expectedConfig: {
       ...projectedConfig(),
@@ -793,6 +821,88 @@ test('expected policy pins OpenAI, user review, and one effective config digest'
     );
     assert.equal(factoryCalls, 0);
   }
+});
+
+test('explicit proxy and trusted policies preserve authenticated preflight and exact receipts', async () => {
+  const ids = new Set();
+  for (const trusted of [false, true]) {
+    for (const proxy of [false, true]) {
+      const profile = policyProfile({ trusted, proxy });
+      const client = new FakeClient(staticResults(profile));
+      const result = await preflightCodexRuntime(profile, {
+        clientFactory: makeFactory(client),
+      });
+      assert.equal(result.auth.authenticated, true);
+      assert.equal(result.auth.requiresOpenaiAuth, true);
+      const receipt = createCodexSpawnProfile(profile, result);
+      assert.deepEqual(receipt.expectedStaticProfile.expectedConfig, profile.expectedConfig);
+      ids.add(receipt.spawnProfileId);
+      assert.equal(client.calls.some(({ method }) => method.startsWith('thread/')), false);
+    }
+  }
+  assert.equal(ids.size, 4);
+});
+
+test('trusted preflight accepts the Codex 0.145 serialized null filesystem default', async () => {
+  const profile = policyProfile({ trusted: true });
+  assert.equal(
+    profile.expectedConfig.permissionProfiles[0].filesystemSha256,
+    'ce41c7bdb7f357798e0ce66850e28f87de7a8544bb13ce2cc029985aa41d852a',
+  );
+  const result = await preflightCodexRuntime(profile, {
+    clientFactory: makeFactory(new FakeClient(staticResults(profile))),
+  });
+  assert.equal(result.auth.authenticated, true);
+  assert.equal(createCodexSpawnProfile(profile, result).expectedStaticProfile.permissionProfileId, 'polygram-trusted');
+});
+
+test('trusted policy rejects partial access, hidden filesystem rules and mixed provider registries', async () => {
+  const mutations = [
+    (p) => { p.expectedConfig.webSearch = 'disabled'; },
+    (p) => { p.expectedConfig.permissionProfiles[0].networkEnabled = false; },
+    (p) => { p.expectedConfig.permissionProfiles[0].extends = 'other'; },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystem = []; },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystem[0].access = 'read'; },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystem.push({ rootSha256: digest('/secret'), access: 'deny' }); },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystemSha256 = digest({ glob_scan_max_depth: null, ':root': 'write', ':workspace_roots': { '.': 'read' } }); },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystemSha256 = digest({ glob_scan_max_depth: 1, ':root': 'write' }); },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystemSha256 = digest({ glob_scan_max_depth: null, ':root': 'write', other: null }); },
+    (p) => { p.expectedConfig.permissionProfiles[0].filesystemSha256 = digest({ ':root': 'write' }); },
+    (p) => { p.permissionProfileId = p.expectedConfig.defaultPermissions = 'other'; p.expectedConfig.permissionProfiles[0].id = 'other'; p.expectedPermissionProfiles[0].id = 'other'; },
+    (p) => { p.expectedConfig.modelProvider = 'openai'; },
+    (p) => { p.expectedConfig.modelProviders = { count: 0, keySha256: [] }; },
+    (p) => { p.expectedConfig.modelProviders = { count: 2, keySha256: [digest('cliproxyapi'), digest('other')] }; },
+    (p) => { p.expectedConfig.modelProviders.keySha256 = [digest('other')]; },
+    (p) => { p.expectedConfig.allowLoginShell = true; },
+    (p) => { p.expectedConfig.shellEnvironmentInherit = 'all'; },
+  ];
+  for (const mutate of mutations) {
+    const profile = policyProfile({ trusted: true, proxy: true });
+    mutate(profile);
+    await assert.rejects(preflightCodexRuntime(profile, {
+      clientFactory: () => { throw new Error('invalid policy must fail before spawn'); },
+    }), { code: 'CODEX_STATIC_PROFILE_MISMATCH' });
+  }
+});
+
+test('proxy provider and private config drift fail exact reattestation without disclosing config', async () => {
+  const profile = policyProfile({ trusted: true, proxy: true });
+  for (const change of [
+    { modelProvider: 'openai' },
+    { sha256: digest('changed private provider key or endpoint') },
+    { modelProviders: { count: 0, keySha256: [] } },
+  ]) {
+    const results = staticResults(profile);
+    results['config/read'].config = { ...profile.expectedConfig, ...change };
+    await assert.rejects(reattestCodexStaticPolicy(profile, new FakeClient(results)), {
+      code: 'CODEX_STATIC_PROFILE_MISMATCH',
+    });
+  }
+  const results = staticResults(profile);
+  results['account/read'] = { account: null, requiresOpenaiAuth: true };
+  await assert.rejects(preflightCodexRuntime(profile, {
+    clientFactory: makeFactory(new FakeClient(results)),
+  }), { code: 'CODEX_AUTH_UNAVAILABLE' });
 });
 
 test('ChatGPT account is authenticated even when requiresOpenaiAuth is true', async () => {
@@ -1219,9 +1329,9 @@ test('spawn profile receipt rejects incomplete, extra, or forged preflight data'
 const HOOK_SOURCE_PATH = '/opt/orchestra/hook-artifacts/1/hooks.json';
 const HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET = Object.freeze({
   'aarch64-apple-darwin':
-    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+    '5e736d31f58d2f9bafbfeb3aba86414bad1e632a1eaaedef82304b497cbca0bf',
   'x86_64-unknown-linux-musl':
-    'cd133c6b3cacadad95a31cb651acff440272a33c011fadf803da3cfddf456f50',
+    '178c7be54e8f11a469714ab102590dc8e8a4e34a84b1e67a19991f5f34e6d354',
 });
 
 function hookMaterial(profile = expectedProfile()) {

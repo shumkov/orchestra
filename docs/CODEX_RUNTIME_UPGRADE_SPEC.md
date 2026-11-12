@@ -96,7 +96,10 @@ stop requiring a reviewed spec amendment, not an extra accepted hash or stripped
 unknown fields. Native memories remain disabled; shell inherits none, login false,
 trusted actual service HOME/explicit PATH; limited mode retains its existing synthetic
 command HOME and controlled PATH. CLIProxy remains optional, loopback Responses, private
-bearer, requires_openai_auth=true, supports_websockets=true, no native fallback.
+bearer, requires_openai_auth=false, supports_websockets=true, no native fallback.
+The provider-specific auth correction in CODEX_PROXY_AUTH_FIX_SPEC.md supersedes
+the initial requirement to keep native ChatGPT auth for CLIProxy; native OpenAI
+mode still requires its ChatGPT account.
 
 ## Verification and failure handling
 
@@ -117,9 +120,9 @@ rollout can resume under candidate, retaining an untouched old copy.
 At least one candidate fixture must traverse production preflight -> spawn receipt
 -> factory/CodexProcess -> acknowledged on-disk checkpoint sink, with authoritative
 checkpoint readback; a no-op client sink cannot establish this integration layer.
-Credential-free fixture-only providers may set requires_openai_auth=false; that
-exception never clears production native ChatGPT-auth admission, which is proved
-separately using the exact native/CLIProxy policy.
+Credential-free fixtures and explicit bearer-authenticated CLIProxy set
+requires_openai_auth=false; native OpenAI retains ChatGPT-auth admission.
+Model catalogs alone never establish external provider entitlement.
 3. Hooks: run existing hooks-on/off production-client gate against candidate; raw
 inventory characterization before exact verifier update, red/green fixture tests,
 negative metadata tests, trusted inventory and content-free event dropping.

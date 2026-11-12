@@ -165,8 +165,8 @@ async function codexSpawnProfile({
       }
       if (method === 'account/read') {
         return {
-          account: { type: 'chatgpt' },
-          requiresOpenaiAuth: true,
+          account: profile.expectedConfig.modelProvider === 'cliproxyapi' ? null : { type: 'chatgpt' },
+          requiresOpenaiAuth: profile.expectedConfig.modelProvider !== 'cliproxyapi',
         };
       }
       if (method === 'model/list') {

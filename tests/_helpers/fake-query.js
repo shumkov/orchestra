@@ -55,7 +55,7 @@
 
 const { EventEmitter } = require('events');
 
-function makeFakeQuery() {
+function makeFakeQuery({ echoUserUuids = true } = {}) {
   const emitter = new EventEmitter();
   const pushedMessages = [];                  // captured user messages pm sent via streamInput
   const yieldQueue = [];                      // outgoing iterator queue (events tests pushed)
@@ -65,6 +65,16 @@ function makeFakeQuery() {
   let modelChanged = null;
   let permissionModeChanged = null;
   let flagSettingsApplied = null;
+  let consumedUuids = [];
+
+  function echo(msg) {
+    if (!echoUserUuids || msg?.parent_tool_use_id != null || msg?.origin
+      || !['assistant', 'stream_event', 'partial_assistant', 'result'].includes(msg?.type)) return msg;
+    const ids = [...consumedUuids];
+    if (msg.type === 'result') consumedUuids = [];
+    if (!ids.length || msg.user_message_uuid || msg.user_message_uuids) return msg;
+    return { ...msg, user_message_uuid: ids.at(-1), user_message_uuids: ids };
+  }
 
   // Test-side: simulate SDK emitting a typed SDKMessage to the pm.
   function emitEvent(msg) {
@@ -107,15 +117,16 @@ function makeFakeQuery() {
       if (yieldQueue.length) {
         const v = yieldQueue.shift();
         if (v && v.__throw) throw v.__throw;
-        return { value: v, done: false };
+        return { value: echo(v), done: false };
       }
       if (closed) return { value: undefined, done: true };
-      return new Promise((resolve, reject) => {
+      const item = await new Promise((resolve, reject) => {
         consumerResolve = (r) => {
           if (r && typeof r.then === 'function') r.then(resolve, reject);
           else resolve(r);
         };
       });
+      return item.done ? item : { ...item, value: echo(item.value) };
     },
     async return() {
       closed = true;
@@ -134,13 +145,16 @@ function makeFakeQuery() {
       // pm pushes onto the iterable via its inputController.
       for await (const msg of asyncIterable) {
         pushedMessages.push(msg);
+        if (typeof msg.uuid === 'string') consumedUuids.push(msg.uuid);
         emitter.emit('userPushed', msg);
       }
     },
 
     async interrupt() {
       interrupted = true;
+      consumedUuids = [];
       emitter.emit('interrupted');
+      return { still_queued: [] };
     },
 
     async close() {

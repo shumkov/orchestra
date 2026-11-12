@@ -117,6 +117,28 @@ function codexExpectedStaticProfile(overrides = {}) {
   };
 }
 
+function codexPolicyProfile({ trusted, proxy }) {
+  const profile = codexExpectedStaticProfile();
+  const config = profile.expectedConfig;
+  if (proxy) {
+    config.modelProvider = 'cliproxyapi';
+    config.modelProviders = { count: 1, keySha256: [digest('cliproxyapi')] };
+  }
+  if (trusted) {
+    profile.permissionProfileId = config.defaultPermissions = 'polygram-trusted';
+    profile.expectedPermissionProfiles[0].id = 'polygram-trusted';
+    config.webSearch = 'live';
+    config.permissionProfiles = [{
+      id: 'polygram-trusted',
+      extends: null,
+      networkEnabled: true,
+      filesystemSha256: digest({ glob_scan_max_depth: null, ':root': 'write' }),
+      filesystem: [{ rootSha256: digest(':root'), access: 'write' }],
+    }];
+  }
+  return profile;
+}
+
 async function codexSpawnProfile({
   additionalModels = [],
   ...overrides
@@ -415,10 +437,27 @@ test('runtime:codex constructs CodexProcess only from trusted factory profile in
 });
 
 test('factory-created named-profile threads reach turn/start with real runtime policy', async (t) => {
-  for (const existingSessionId of [null, 'thread-existing']) {
-    await t.test(existingSessionId ? 'resume' : 'fresh', async () => {
-      const spawnProfile = await codexSpawnProfile();
+  for (const [trusted, proxy, existingSessionId] of [
+    [false, false, null],
+    [false, false, 'thread-existing'],
+    [false, true, null],
+    [false, true, 'thread-existing'],
+    [true, false, null],
+    [true, false, 'thread-existing'],
+    [true, true, null],
+    [true, true, 'thread-existing'],
+  ]) {
+    await t.test(`${trusted ? 'trusted' : 'limited'}/${proxy ? 'proxy' : 'native'}/${existingSessionId ? 'resume' : 'fresh'}`, async () => {
+      const spawnProfile = await codexSpawnProfile(codexPolicyProfile({ trusted, proxy }));
       const profile = spawnProfile.expectedStaticProfile;
+      const sandbox = trusted ? { type: 'dangerFullAccess' } : {
+        type: 'workspaceWrite',
+        networkAccess: false,
+        excludeSlashTmp: true,
+        excludeTmpdirEnvVar: true,
+        writableRootCount: 0,
+        writableRootSha256: [],
+      };
       const calls = [];
       let callbacks;
       const fakeClient = {
@@ -450,19 +489,12 @@ test('factory-created named-profile threads reach turn/start with real runtime p
                 threadSettings: {
                   model: 'gpt-5.6-sol',
                   effort: 'xhigh',
-                  modelProvider: 'openai',
+                  modelProvider: proxy ? 'cliproxyapi' : 'openai',
                   approvalPolicy: 'never',
                   approvalsReviewer: 'user',
-                  sandboxPolicy: {
-                    type: 'workspaceWrite',
-                    networkAccess: false,
-                    excludeSlashTmp: true,
-                    excludeTmpdirEnvVar: true,
-                    writableRootCount: 0,
-                    writableRootSha256: [],
-                  },
+                  sandboxPolicy: sandbox,
                   activePermissionProfile: {
-                    id: 'polygram-session',
+                    id: trusted ? 'polygram-trusted' : 'polygram-session',
                     extends: null,
                   },
                 },
@@ -471,7 +503,7 @@ test('factory-created named-profile threads reach turn/start with real runtime p
             return {
               cwd: profile.cwd,
               model: 'gpt-5.6-sol',
-              modelProvider: 'openai',
+              modelProvider: proxy ? 'cliproxyapi' : 'openai',
               reasoningEffort: 'xhigh',
               approvalPolicy: 'never',
               approvalsReviewer: 'user',
@@ -479,16 +511,9 @@ test('factory-created named-profile threads reach turn/start with real runtime p
                 count: 1,
                 sha256: [digest(profile.cwd)],
               },
-              sandbox: {
-                type: 'workspaceWrite',
-                networkAccess: false,
-                excludeSlashTmp: true,
-                excludeTmpdirEnvVar: true,
-                writableRootCount: 0,
-                writableRootSha256: [],
-              },
+              sandbox: sandbox,
               activePermissionProfile: {
-                id: 'polygram-session',
+                id: trusted ? 'polygram-trusted' : 'polygram-session',
                 extends: null,
               },
               thread: {
@@ -578,6 +603,85 @@ test('factory-created named-profile threads reach turn/start with real runtime p
         throw error;
       }
     });
+  }
+});
+
+test('factory trusted proxy rejects provider, sandbox and settings drift on start and resume', async (t) => {
+  for (const existingSessionId of [null, 'thread-existing']) {
+    for (const drift of ['provider', 'sandbox', 'settings']) {
+      await t.test(`${existingSessionId ? 'resume' : 'start'}/${drift}`, async () => {
+        const spawnProfile = await codexSpawnProfile(codexPolicyProfile({ trusted: true, proxy: true }));
+        const profile = spawnProfile.expectedStaticProfile;
+        const threadId = existingSessionId ?? 'thread-fresh';
+        const calls = [];
+        let callbacks;
+        const client = {
+          start: async () => {},
+          close: async () => {},
+          waitForFault: async () => null,
+          request: async (method) => {
+            calls.push(method);
+            if (method === 'thread/backgroundTerminals/list') {
+              return { count: 0, nextCursor: null };
+            }
+            if (method === 'thread/start' || method === 'thread/resume') {
+              return {
+                cwd: profile.cwd,
+                model: profile.model,
+                modelProvider: drift === 'provider' ? 'openai' : 'cliproxyapi',
+                reasoningEffort: profile.effort,
+                approvalPolicy: 'never',
+                approvalsReviewer: 'user',
+                runtimeWorkspaceRoots: { count: 1, sha256: [digest(profile.cwd)] },
+                sandbox: drift === 'sandbox'
+                  ? { type: 'workspaceWrite', networkAccess: true }
+                  : { type: 'dangerFullAccess' },
+                activePermissionProfile: { id: 'polygram-trusted', extends: null },
+                thread: { id: threadId, status: { type: 'idle' }, turns: [] },
+              };
+            }
+            throw new Error(`unexpected request ${method}`);
+          },
+        };
+        const factory = await makeCodexFactory({
+          codexSpawnProfile: spawnProfile,
+          codexClientFactory: (options) => { callbacks = options; return client; },
+        });
+        const proc = factory('trusted-proxy-drift', {
+          runtime: 'codex',
+          spawnProfileId: spawnProfile.spawnProfileId,
+          modelSettings: { model: profile.model, effort: profile.effort },
+          existingSessionId,
+        });
+        if (drift === 'settings') {
+          await proc.start(proc.spawnOptions);
+          assert.equal(proc.state, 'Idle');
+          await callbacks.onNotification({
+            method: 'thread/settings/updated',
+            params: {
+              threadId,
+              threadSettings: {
+                model: profile.model,
+                effort: profile.effort,
+                modelProvider: 'openai',
+                approvalPolicy: 'never',
+                approvalsReviewer: 'user',
+                sandboxPolicy: { type: 'dangerFullAccess' },
+                activePermissionProfile: { id: 'polygram-trusted', extends: null },
+              },
+            },
+          });
+          assert.equal(proc.containmentReason, 'thread-settings-drift');
+          assert.notEqual(proc.state, 'Idle');
+        } else {
+          await assert.rejects(proc.start(proc.spawnOptions), {
+            code: 'CODEX_THREAD_POLICY_MISMATCH',
+          });
+        }
+        assert.equal(calls.includes('turn/start'), false);
+        assert.equal(calls.filter((method) => method === 'thread/start' || method === 'thread/resume').length, 1);
+      });
+    }
   }
 });
 

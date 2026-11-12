@@ -3,19 +3,31 @@
 ## Publication and integration checkpoint — 2026-11-12
 
 Ivan authorized publication and planned rollout. Tracking issue
-[Polygram #133](https://github.com/shumkov/polygram/issues/133) is OPEN; the
-published title and complete body were read back and verified against the prepared
-body. The issue prerequisite and full matched matrix prerequisite are satisfied.
-The bounded correction is accepted with the retained limits below. Codex owns
-Orchestra 0.12.0; this worker must wait for its authoritative published base before
-Claude release version selection, tags or main integration. No deployment is
-performed here. The separately reviewed aligned pin/consumer preparation and both
-24-hour soaks remain; strict focused traces stay INCONCLUSIVE and require no new
-provider loop. Earlier authorization/pin-status statements below describe their
+[Polygram #133](https://github.com/shumkov/polygram/issues/133) is OPEN; its complete
+body was authoritatively read back and verified. The accepted matched matrix
+remains 23/23 on signed gate 6cceb3b. Bounded runtime correction is signed commit
+0664a00dea8b1b4fd1f8c3ff803683171b2c69d8, preserving its exact tested source.
+Local SDK 0.3.322 / CLI 2.1.322 pins and generated lock metadata are now prepared
+and independently reviewed CLEAN by compatibility, isolation and scope reviewers.
+Installed candidate entry/package/binary hashes equal the accepted matrix pair.
+Focused local checks: 425 PASS, 0 FAIL, 19 existing capability skips; full corrected
+runtime suite before the pin metadata change: 1,560 PASS, 19 existing skips.
+No new provider call was made. Strict focused traces remain INCONCLUSIVE within
+the accepted limits and no extra provider loop is mandatory.
+
+Codex owns Orchestra 0.12.0. Claude release version/tag/main integration waits
+for its authoritative published base; this worker does not deploy. Orchestra's
+package version remains 0.11.3 only as unreleased branch metadata, never a release
+claim. Consumer dependencies remain the coherent .283 pair until the actual
+subsequent Claude Orchestra artifact exists. The existing consumer contract now
+also verifies installed SDK/CLI metadata and shared physical SDK resolution;
+3/3 checks pass on that current .283 installation. Artifact-backed .322 consumer
+update and independent diff review, Linux rollback preservation and both 24-hour
+soaks remain. Earlier authorization/pin-status statements below describe their
 historical checkpoints and are superseded by this section.
 
 
-Status: proposed candidate; the SDK and CLI pins MUST remain 0.3.283 / 2.1.283 until the tracking issue exists and the checked old/new matrix passes on one recorded gate commit. A draft issue is not an opened issue. No release, consumer update, activation, or soak is authorized here.
+Historical preparation status: proposed candidate; the SDK and CLI pins MUST remain 0.3.283 / 2.1.283 until the tracking issue exists and the checked old/new matrix passes on one recorded gate commit. A draft issue is not an opened issue. No release, consumer update, activation, or soak is authorized here.
 
 
 ## Coordinator acceptance and retained limits

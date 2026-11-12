@@ -21,8 +21,8 @@ afterEach(() => {
 });
 
 describe('claude-bin — resolvePinnedClaudeBin', () => {
-  test('defaults to the compatibility-gated Claude Code 2.1.283 pin', () => {
-    assert.equal(CLAUDE_CLI_PINNED_VERSION, '2.1.283');
+  test('defaults to the compatibility-gated Claude Code 2.1.322 pin', () => {
+    assert.equal(CLAUDE_CLI_PINNED_VERSION, '2.1.322');
   });
 
   // The pinned Agent SDK defines the CLI version: its platform package ships

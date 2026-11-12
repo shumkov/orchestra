@@ -99,6 +99,8 @@ function hookMetadata(event, ordinal, trustStatus = 'trusted') {
     matcher: null,
     pluginId: null,
     statusMessage: null,
+    environmentId: null,
+    async: false,
   };
 }
 

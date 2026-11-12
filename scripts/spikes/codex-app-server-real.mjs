@@ -231,7 +231,7 @@ export async function attestPinnedCodexBinary(options) {
     || targetReceipt.binarySha256
       !== manifest.binarySha256ByTarget[targetReceipt.target]
     || targetReceipt.cliVersion !== manifest.cliVersion
-  ) throw new Error('production Codex binary pin differs from the U1 fixture');
+  ) throw new Error(`historical U1a fixture targets ${manifest.cliVersion}; active runtime is ${targetReceipt.cliVersion}; use the candidate runtime gate`);
   await attestProductionCodexBinary(options.binary, targetReceipt);
   if (options.launcher) validateExecutable(options.launcher, 'session launcher');
   return true;

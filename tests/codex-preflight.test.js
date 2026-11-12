@@ -1329,9 +1329,9 @@ test('spawn profile receipt rejects incomplete, extra, or forged preflight data'
 const HOOK_SOURCE_PATH = '/opt/orchestra/hook-artifacts/1/hooks.json';
 const HOOKS_OFF_SPAWN_PROFILE_ID_BY_TARGET = Object.freeze({
   'aarch64-apple-darwin':
-    '5d458a4e694667b81009a295cbe2cb4341abc2677b0066f5ce9c7cf41f4bcf1b',
+    '5e736d31f58d2f9bafbfeb3aba86414bad1e632a1eaaedef82304b497cbca0bf',
   'x86_64-unknown-linux-musl':
-    'cd133c6b3cacadad95a31cb651acff440272a33c011fadf803da3cfddf456f50',
+    '178c7be54e8f11a469714ab102590dc8e8a4e34a84b1e67a19991f5f34e6d354',
 });
 
 function hookMaterial(profile = expectedProfile()) {

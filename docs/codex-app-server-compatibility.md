@@ -2,6 +2,11 @@
 
 Date: 2026-07-26
 
+This is historical 0.145.0 evidence. The unactivated 0.167.2 candidate,
+independent gates and remaining blockers are recorded in
+[the upgrade spec](CODEX_RUNTIME_UPGRADE_SPEC.md) and
+[the upgrade report](CODEX_RUNTIME_UPGRADE_REPORT.md).
+
 Scope: U1a core protocol, steering, healthy stop, isolation, accepted
 native-beta containment contract, and U1b operational/security
 characterization

@@ -237,15 +237,15 @@ test('Codex target pins resolve lazily to immutable reviewed receipts', () => {
 
   assert.deepEqual(darwin, {
     target: 'aarch64-apple-darwin',
-    cliVersion: 'codex-cli 0.145.0',
+    cliVersion: 'codex-cli 0.167.2',
     binarySha256:
-      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+      '97bc82fd46f117cf10efb95e6ff0c81dc4784f5797bcdc2cb75093ba09e4def0',
   });
   assert.deepEqual(linux, {
     target: 'x86_64-unknown-linux-musl',
-    cliVersion: 'codex-cli 0.145.0',
+    cliVersion: 'codex-cli 0.167.2',
     binarySha256:
-      'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+      'a9672d0fa0dd8fcf8cad136fa0d056b914bc046f5ac3d78f4a5cf390655af56b',
   });
   assert.equal(Object.isFrozen(darwin), true);
   assert.equal(Object.isFrozen(linux), true);
@@ -253,9 +253,9 @@ test('Codex target pins resolve lazily to immutable reviewed receipts', () => {
   assert.equal(resolveCodexTargetPin('linux', 'x64'), linux);
   assert.deepEqual(protocolSchema.binarySha256ByTarget, {
     'aarch64-apple-darwin':
-      '1da3f4e0e96028b8a771814293c3033dafd1971f943f6c7e79b0897fe705f590',
+      '97bc82fd46f117cf10efb95e6ff0c81dc4784f5797bcdc2cb75093ba09e4def0',
     'x86_64-unknown-linux-musl':
-      'a2a05dafaa1acb002a45eaec0a462de5b13694fcfcd7bc43305f14781ce7be14',
+      'a9672d0fa0dd8fcf8cad136fa0d056b914bc046f5ac3d78f4a5cf390655af56b',
   });
   assert.equal(
     protocolSchema.binarySha256,
@@ -353,7 +353,7 @@ test('initialize accepts only the pinned generated response fields', async (t) =
       initialize: {
         result: {
           codexHome: 'ignored-by-malformed-response',
-          serverInfo: { name: 'invented', version: '0.145.0' },
+          serverInfo: { name: 'invented', version: '0.167.2' },
         },
       },
     },
@@ -1952,6 +1952,28 @@ test('thread attachment runtime workspace roots fail closed on malformed shapes'
   }
 });
 
+test('Codex 0.167 ChatGPT plan enum remains authenticated and account-private', async (t) => {
+  const plans = ['promax', 'self_serve_business_prolite', 'ent26', 'enterprise_cbp_automation', 'edu_plus', 'edu_pro', 'sci', 'sci_plus', 'future_unrecognized_plan'];
+  for (const planType of plans) {
+    await t.test(planType, async (t) => {
+      const harness = createHarness(t, { methods: { 'account/read': { result: {
+        account: { type: 'chatgpt', email: 'private@example.invalid', planType }, requiresOpenaiAuth: true,
+      } } } });
+      const client = harness.makeClient(); await client.start();
+      if (planType === 'future_unrecognized_plan') {
+        await rejectedWithCode(client.request('account/read', { refreshToken: false }), 'CODEX_PROTOCOL_ERROR');
+      } else {
+        const result = await client.request('account/read', { refreshToken: false });
+        assert.equal(result.account.type, 'chatgpt');
+        assert.equal(result.requiresOpenaiAuth, true);
+        assert.equal(result.account.email, undefined);
+        assert.equal(result.account.planType, undefined);
+      }
+      await client.close();
+    });
+  }
+});
+
 test('ChatGPT account responses require generated email and plan fields', async (t) => {
   const harness = createHarness(t, {
     methods: {
@@ -2064,11 +2086,56 @@ test('an unknown server request faults while a client RPC is pending', async (t)
   assert.throws(() => client.assertHealthy());
 });
 
+test('Codex read-state bookkeeping does not fault or enter the delivered stream', async (t) => {
+  const notifications = [];
+  const harness = createHarness(t, { afterInitialized: [{
+    method: 'thread/readState/changed',
+    params: { threadId: 'thread-1', readState: { revision: 'PRIVATE-UI-STATE' } },
+  }] });
+  const client = harness.makeClient({ onNotification: async (event) => notifications.push(event) });
+  await client.start();
+  await client.request('account/read', { refreshToken: false });
+  assert.deepEqual(notifications, []);
+  await client.close();
+  assert.equal(await client.waitForFault(), null);
+});
+
+test('authenticated Codex startup account summary does not fault or expose account data', async (t) => {
+  const notifications = [];
+  const harness = createHarness(t, { afterInitialized: [{
+    method: 'account/updated',
+    params: { authMode: 'chatgpt', planType: 'PRIVATE-ACCOUNT-PLAN' },
+  }] });
+  const client = harness.makeClient({ onNotification: async (event) => notifications.push(event) });
+  await client.start();
+  await client.request('account/read', { refreshToken: false });
+  assert.deepEqual(notifications, []);
+  await client.close();
+  assert.equal(await client.waitForFault(), null);
+});
+
+test('native provider moderation metadata does not interrupt a pending RPC or expose opaque data', async (t) => {
+  const notifications = [];
+  const harness = createHarness(t, { methods: { 'config/read': {
+    beforeResponseMessages: [{ method: 'turn/moderationMetadata', params: {
+      threadId: 'thread-1', turnId: 'turn-1', metadata: { private: 'PRIVATE_PROVIDER_METADATA' },
+    } }],
+  } } });
+  const client = harness.makeClient({ onNotification: async event => notifications.push(event) });
+  await client.start();
+  await client.request('config/read', { cwd: harness.cwd, includeLayers: true });
+  client.assertHealthy();
+  assert.deepEqual(notifications, []);
+  await client.close();
+  assert.equal(await client.waitForFault(), null);
+});
+
 test('unknown notifications fault without exposing their payload', async (t) => {
   // The `hook/` case pins that dropping the two known hook notifications did
   // not widen into tolerance for the whole namespace.
   for (const method of [
     'thread/experimental/unknown',
+    'turn/moderationMetadata/unknown',
     'hook/experimental/unknown',
   ]) {
     await t.test(method, async (subtest) => {
@@ -2539,7 +2606,7 @@ test('an exit event cannot overtake a final response still draining from stdout'
             codexHome: harness.codexHome,
             platformFamily: 'unix',
             platformOs: 'macos',
-            userAgent: 'fake-codex-app-server/0.145.0',
+            userAgent: 'fake-codex-app-server/0.167.2',
           },
         })}\n`);
       } else if (message.method === 'account/read') {
@@ -3409,6 +3476,8 @@ function hookMetadata(event, ordinal, trustStatus) {
     timeoutSec: 600,
     trustStatus,
     additionalContextLimit: null,
+    async: false,
+    environmentId: null,
     command: hookCommand(event),
     matcher: null,
     pluginId: null,
@@ -3517,6 +3586,20 @@ test('the discovery phase accepts the observed enabled-and-untrusted state', asy
     await client.verifyHooks({ phase: 'discovery' }),
     expectedVerification('untrusted'),
   );
+});
+
+test('Codex 0.167 command hooks with synchronous local metadata remain verifiable', async (t) => {
+  const result = hooksListResult('trusted', (hooks) => {
+    for (const hook of hooks) {
+      hook.async = false;
+      hook.environmentId = null;
+    }
+  });
+  const harness = createHarness(t, hooksScenario(result));
+  const client = harness.makeClient({ hookManifest: hookManifest(harness.cwd) });
+  await client.start();
+  const inventory = await client.verifyHooks({ phase: 'trusted' });
+  assert.equal(inventory.length, HOOK_EVENTS.length);
 });
 
 test('hooks/list stays refused on the public request surface', async (t) => {
@@ -3720,6 +3803,11 @@ test('phase rules reject every wrong-phase trust status and disabled hook', asyn
 
 test('the pinned optional shape is the only accepted one', async (t) => {
   const cases = [
+    ['async missing', (hooks) => { delete hooks[0].async; }],
+    ['async true', (hooks) => { hooks[0].async = true; }],
+    ['async malformed', (hooks) => { hooks[0].async = 'false'; }],
+    ['environmentId missing', (hooks) => { delete hooks[0].environmentId; }],
+    ['environmentId foreign', (hooks) => { hooks[0].environmentId = 'remote'; }],
     ['command missing', (hooks) => { delete hooks[0].command; }],
     ['command null', (hooks) => { hooks[0].command = null; }],
     ['command digest mismatch', (hooks) => {

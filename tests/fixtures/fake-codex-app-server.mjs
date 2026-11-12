@@ -105,7 +105,7 @@ function defaultResult(method, params) {
       codexHome: process.env.CODEX_HOME,
       platformFamily: process.platform === 'win32' ? 'windows' : 'unix',
       platformOs: process.platform === 'darwin' ? 'macos' : process.platform,
-      userAgent: 'fake-codex-app-server/0.145.0',
+      userAgent: 'fake-codex-app-server/0.167.2',
     };
   }
   if (method === 'config/read') {
@@ -126,7 +126,7 @@ function defaultResult(method, params) {
   if (method === 'thread/start' || method === 'thread/resume') {
     return {
       thread: {
-        cliVersion: '0.145.0',
+        cliVersion: '0.167.2',
         createdAt: 1,
         cwd,
         ephemeral: false,

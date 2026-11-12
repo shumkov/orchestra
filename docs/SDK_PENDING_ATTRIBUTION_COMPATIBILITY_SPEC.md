@@ -1,5 +1,23 @@
 # SDK pending attribution compatibility correction
 
+## Current release integration — 2026-11-12
+
+Published Codex Orchestra0.12.0 base706dab133bb2c696d34a950d8bdd4eebc22f02f5
+is integrated by signed merge e086896 without conflicts or manual source changes.
+All21upstream non-package changed files match that released base byte-for-byte;
+accepted Claude SDK runtime SHA remains unchanged. Prepared aligned pin commit
+f9ef1b8 follows bounded fix0664a00. Fresh main/npm showed0.12.0, so patch0.12.1
+is selected for the reviewed correction and Claude SDK0.3.322/CLI2.1.322 pair.
+The Orchestra publication hold has ended; PR/CI/OIDC release and exact registry
+artifact verification are authorized and in progress. No deployment is performed.
+Polygram consumer merge/version/publication remains held until coordinator supplies
+its released0.46.0 base, then requires actual0.12.1 consumer artifact validation.
+The accepted matrix23/23, existing runtime/focused receipts and strict focused
+INCONCLUSIVE limits remain unchanged; no provider repeat or new gate is needed.
+The coordinator owns staging and both mandatory24hsoaks. Earlier integration-hold
+statements below are historical and superseded by this checkpoint.
+
+
 ## Publication and integration checkpoint — 2026-11-12
 
 Ivan authorized publication and planned rollout. Tracking issue

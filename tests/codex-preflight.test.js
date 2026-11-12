@@ -181,8 +181,9 @@ function staticResults(profile = expectedProfile()) {
       nextCursor: null,
     },
     'account/read': {
-      account: { type: 'chatgpt' },
-      requiresOpenaiAuth: true,
+      account: profile.expectedConfig.modelProvider === 'cliproxyapi'
+        ? null : { type: 'chatgpt' },
+      requiresOpenaiAuth: profile.expectedConfig.modelProvider !== 'cliproxyapi',
     },
     'model/list': {
       data: [model()],
@@ -823,7 +824,7 @@ test('expected policy pins the named provider, user review, and one effective co
   }
 });
 
-test('explicit proxy and trusted policies preserve authenticated preflight and exact receipts', async () => {
+test('explicit proxy and trusted policies preserve provider-specific preflight and exact receipts', async () => {
   const ids = new Set();
   for (const trusted of [false, true]) {
     for (const proxy of [false, true]) {
@@ -832,8 +833,9 @@ test('explicit proxy and trusted policies preserve authenticated preflight and e
       const result = await preflightCodexRuntime(profile, {
         clientFactory: makeFactory(client),
       });
-      assert.equal(result.auth.authenticated, true);
-      assert.equal(result.auth.requiresOpenaiAuth, true);
+      assert.equal(result.auth.authenticated, !proxy);
+      assert.equal(result.auth.accountType, proxy ? null : 'chatgpt');
+      assert.equal(result.auth.requiresOpenaiAuth, !proxy);
       const receipt = createCodexSpawnProfile(profile, result);
       assert.deepEqual(receipt.expectedStaticProfile.expectedConfig, profile.expectedConfig);
       ids.add(receipt.spawnProfileId);
@@ -841,6 +843,54 @@ test('explicit proxy and trusted policies preserve authenticated preflight and e
     }
   }
   assert.equal(ids.size, 4);
+});
+
+test('CLIProxy without a native account yields a truthful external-provider receipt', async () => {
+  const profile = policyProfile({ trusted: true, proxy: true });
+  const client = new FakeClient(staticResults(profile));
+  const result = await preflightCodexRuntime(profile, { clientFactory: makeFactory(client) });
+  assert.deepEqual(result.auth, {
+    authenticated: false, accountType: null, requiresOpenaiAuth: false,
+  });
+  const receipt = createCodexSpawnProfile(profile, result);
+  assert.equal(receipt.spawnProfileId, result.spawnProfileId);
+  assert.equal(result.attestation.policy.modelProvider, 'cliproxyapi');
+  assert.equal(client.calls.some(({ method }) => method.startsWith('thread/')), false);
+  assert.throws(() => createCodexSpawnProfile(profile, deepFrozenClone(result)), {
+    code: 'CODEX_PREFLIGHT_RECEIPT_INVALID',
+  });
+  assert.throws(() => createCodexSpawnProfile(policyProfile({ trusted: true }), result), {
+    code: 'CODEX_PREFLIGHT_RECEIPT_INVALID',
+  });
+});
+
+test('provider-specific account mismatches fail before model discovery', async () => {
+  for (const proxy of [false, true]) {
+    const mismatches = proxy ? [
+      { account: null, requiresOpenaiAuth: true },
+      { account: { type: 'chatgpt' }, requiresOpenaiAuth: false },
+      { account: { type: 'chatgpt' }, requiresOpenaiAuth: true },
+      { account: { type: 'apiKey' }, requiresOpenaiAuth: false },
+      { requiresOpenaiAuth: false },
+      { account: null },
+    ] : [
+      { account: null, requiresOpenaiAuth: true },
+      { account: null, requiresOpenaiAuth: false },
+      { account: { type: 'chatgpt' }, requiresOpenaiAuth: false },
+      { account: { type: 'apiKey' }, requiresOpenaiAuth: true },
+    ];
+    for (const account of mismatches) {
+      const profile = policyProfile({ proxy });
+      const results = staticResults(profile);
+      results['account/read'] = account;
+      const client = new FakeClient(results);
+      await assert.rejects(preflightCodexRuntime(profile, {
+        clientFactory: makeFactory(client),
+      }), { code: 'CODEX_AUTH_UNAVAILABLE' });
+      assert.equal(client.calls.some(({ method }) => method === 'model/list'), false);
+      assert.equal(client.closed, 1);
+    }
+  }
 });
 
 test('trusted preflight accepts the Codex 0.145 serialized null filesystem default', async () => {

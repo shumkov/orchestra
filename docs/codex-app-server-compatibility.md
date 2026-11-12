@@ -904,3 +904,19 @@ configuration where `effective.hooks != null`, so the reviewed hook-free
 validation profile above is unchanged and was not re-run with hooks. A
 hook-enabled authenticated run against the hosted backend, and the
 wrapper/absolute-binary-path rejection, remain unproved here.
+
+## Provider-specific auth admission
+
+Native OpenAI preflight still requires a ChatGPT account and `requiresOpenaiAuth: true`.
+Explicit CLIProxy instead uses its private provider bearer with
+`requires_openai_auth = false` and requires a null account plus false auth requirement.
+Its receipt state is `auth: { authenticated: false, accountType: null, requiresOpenaiAuth: false }`;
+this does not claim external bearer validity or provider entitlement from `model/list`.
+The existing exact provider/config attestation and successful-result receipt provenance
+bind that state to CLIProxy and reject native/proxy mismatches. Native receipt shape
+and fingerprint inputs remain unchanged. Missing raw account fields fail closed locally
+instead of being projected into a legitimate null account.
+
+See [provider auth correction](CODEX_PROXY_AUTH_FIX_SPEC.md). Historical validation
+above that used a native auth clone for CLIProxy remains historical evidence; the
+current external route requires no native login or copied authentication.

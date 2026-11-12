@@ -1974,6 +1974,28 @@ test('Codex 0.167 ChatGPT plan enum remains authenticated and account-private', 
   }
 });
 
+test('external-provider missing account is rejected instead of becoming explicit null', async (t) => {
+  const harness = createHarness(t, { methods: {
+    'account/read': { result: { requiresOpenaiAuth: false } },
+  } });
+  const client = harness.makeClient();
+  await client.start();
+  await rejectedWithCode(client.request('account/read', { refreshToken: false }), 'CODEX_PROTOCOL_ERROR');
+  assert.throws(() => client.assertHealthy(), { code: 'CODEX_PROTOCOL_ERROR' });
+});
+
+test('external-provider explicit null account remains a valid wire response', async (t) => {
+  const harness = createHarness(t, { methods: {
+    'account/read': { result: { account: null, requiresOpenaiAuth: false } },
+  } });
+  const client = harness.makeClient();
+  await client.start();
+  assert.deepEqual(await client.request('account/read', { refreshToken: false }), {
+    account: null, requiresOpenaiAuth: false,
+  });
+  await client.close();
+});
+
 test('ChatGPT account responses require generated email and plan fields', async (t) => {
   const harness = createHarness(t, {
     methods: {

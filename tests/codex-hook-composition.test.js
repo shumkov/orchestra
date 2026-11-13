@@ -562,6 +562,7 @@ test('a resumed attachment is verified over the real transport before it resumes
   assert.deepEqual(session.map((message) => message.method), [
     'initialize',
     'hooks/list',
+    'thread/read',
     'thread/resume',
     'config/read',
     'configRequirements/read',

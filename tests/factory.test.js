@@ -480,6 +480,9 @@ test('factory-created named-profile threads reach turn/start with real runtime p
               nextCursor: null,
             };
           }
+          if (method === 'thread/read') {
+            return { thread: { id: params.threadId, ephemeral: false } };
+          }
           if (method === 'thread/start' || method === 'thread/resume') {
             const threadId = params.threadId ?? 'thread-fresh';
             await callbacks.onNotification({
@@ -623,6 +626,9 @@ test('factory trusted proxy rejects provider, sandbox and settings drift on star
             calls.push(method);
             if (method === 'thread/backgroundTerminals/list') {
               return { count: 0, nextCursor: null };
+            }
+            if (method === 'thread/read') {
+              return { thread: { id: threadId, ephemeral: false } };
             }
             if (method === 'thread/start' || method === 'thread/resume') {
               return {

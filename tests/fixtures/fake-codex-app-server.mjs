@@ -120,6 +120,9 @@ function defaultResult(method, params) {
     };
   }
   if (method === 'model/list') return { data: [], nextCursor: null };
+  if (method === 'thread/read') {
+    return { thread: defaultResult('thread/resume', params).thread, readState: null };
+  }
   if (method === 'thread/backgroundTerminals/list') {
     return { data: [], nextCursor: null };
   }

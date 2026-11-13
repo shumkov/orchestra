@@ -68,6 +68,11 @@
       "optional": [],
       "stateChanging": true
     },
+    "thread/read": {
+      "required": ["threadId", "includeTurns"],
+      "optional": [],
+      "stateChanging": false
+    },
     "thread/resume": {
       "required": [
         "threadId"

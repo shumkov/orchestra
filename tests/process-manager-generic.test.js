@@ -2166,6 +2166,17 @@ describe('ProcessManager — Codex daemon-wide lease and recovery', () => {
     assert.deepEqual(proc.selectedModelSettings, settings);
   });
 
+  test('failed Codex attachment followups report containment instead of model-settings failure', async () => {
+    const { pm } = runtimeManager();
+    const context = { runtime: 'codex', spawnProfileId: 'profile',
+      modelSettings: { model: 'gpt-5.6-sol', effort: 'high' } };
+    const proc = await pm.getOrSpawn('codex-a', context);
+    proc.state = 'ContainmentFailed';
+    proc.selectModelSettings = async () => ({ outcome: 'unavailable', reason: 'containment' });
+    await assert.rejects(pm.getOrSpawn('codex-a', context), { code: 'CODEX_CONTAINMENT_FAILED' });
+    assert.equal(pm.get('codex-a'), proc);
+  });
+
   test('warm getOrSpawn reconciles its requested model settings before returning the generation', async () => {
     const { pm } = runtimeManager();
     const proc = await pm.getOrSpawn('codex-a', {

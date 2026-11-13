@@ -132,6 +132,10 @@ class FakeClient {
   }
 
   defaultResult(method, params) {
+    if (method === 'thread/read') {
+      return { thread: { id: params.threadId, ephemeral: false,
+        status: { type: 'notLoaded' }, turns: [] } };
+    }
     if (method === 'thread/start') {
       return threadResult('codex-thread', params.model);
     }
@@ -468,6 +472,61 @@ test('fresh start checkpoints one stable thread and emits init once', async () =
   assert.equal(checkpoints.at(-1).kind, 'thread-initialized');
   assert.ok(checkpoints.every((entry) => entry.generationId === fixture.proc.generationId));
   await fixture.proc.kill();
+});
+
+test('missing saved Codex thread is rejected before resume without quarantining a mutation', async () => {
+  const checkpoints = [];
+  const fixture = makeProcess({
+    existingSessionId: 'saved-in-another-home',
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+    handlers: {
+      'thread/read': async () => { throw rpcError('saved thread unavailable', 'CODEX_THREAD_UNAVAILABLE'); },
+    },
+  });
+  await assert.rejects(fixture.start(), { code: 'CODEX_THREAD_UNAVAILABLE' });
+  assert.deepEqual(fixture.client.requests.map(({ method }) => method), ['thread/read']);
+  assert.equal(fixture.proc.startupReleaseSafe, true);
+  assert.equal(fixture.proc.closed, true);
+  assert.equal(checkpoints.some(({ kind }) => kind === 'request-prepared'), false);
+});
+
+test('resume metadata must identify the requested thread before mutation', async () => {
+  const fixture = makeProcess({
+    existingSessionId: 'saved-thread',
+    handlers: { 'thread/read': async () => ({ thread: { id: 'other-thread', ephemeral: false } }) },
+  });
+  await assert.rejects(fixture.start(), { code: 'CODEX_PROTOCOL_ERROR' });
+  assert.equal(fixture.client.requests.some(({ method }) => method === 'thread/resume'), false);
+});
+
+test('transport loss during resume preserves the pre-turn attachment classification', async () => {
+  const fixture = makeProcess({
+    existingSessionId: 'saved-thread',
+    handlers: { 'thread/resume': async (_, client) => {
+      await client.fault();
+      throw rpcError('synthetic transport loss', 'CODEX_RPC_OUTCOME_UNKNOWN');
+    } },
+  });
+  await assert.rejects(fixture.start());
+  await fixture.proc.containmentClosePromise;
+  assert.equal(fixture.proc.containmentReason, 'thread-attach-outcome-unknown');
+  assert.equal(fixture.proc.attachingThreadId, 'saved-thread');
+});
+
+test('rejected resume containment checkpoints retain the attaching thread identity', async () => {
+  const checkpoints = [];
+  const fixture = makeProcess({
+    existingSessionId: 'saved-thread',
+    checkpointSink: async (checkpoint) => checkpoints.push(checkpoint),
+    handlers: { 'thread/resume': async () => { throw rpcError('synthetic refusal'); } },
+  });
+  await assert.rejects(fixture.start(), { code: 'CODEX_RPC_ERROR' });
+  await fixture.proc.containmentClosePromise;
+  assert.equal(fixture.proc.providerSessionId, null);
+  const contained = checkpoints.filter(({ kind }) => kind === 'containment-entered'
+    || kind === 'containment-cleanup-completed');
+  assert.equal(contained.length, 2);
+  assert.equal(contained.every(({ threadId }) => threadId === 'saved-thread'), true);
 });
 
 test('resume preserves the provider thread; an active resumed thread is a recovery conflict', async () => {
@@ -5999,7 +6058,7 @@ test('hook trust is verified before a resumed thread starts', async () => {
   assert.deepEqual(verifications, [{ phase: 'trusted', requests: 0 }]);
   assert.deepEqual(
     fixture.client.requests.map(({ method }) => method),
-    ['thread/resume'],
+    ['thread/read', 'thread/resume'],
   );
   await fixture.proc.kill();
 });

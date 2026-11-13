@@ -194,6 +194,38 @@ async function waitForInitializedLog(harness) {
   );
 }
 
+test('saved-thread metadata read stays local and cannot request conversation history', async (t) => {
+  const harness = createHarness(t);
+  const client = harness.makeClient();
+  await client.start();
+  const result = await client.request('thread/read', { threadId: 'saved-thread', includeTurns: false });
+  assert.deepEqual(result.thread, { id: 'saved-thread', ephemeral: false,
+    status: { type: 'idle' }, turns: [] });
+  assert.equal(result.readState, undefined);
+  await rejectedWithCode(client.request('thread/read', {
+    threadId: 'saved-thread', includeTurns: true,
+  }), 'CODEX_RPC_REJECTED');
+  assert.equal(harness.requests().filter(({ method }) => method === 'thread/read').length, 1);
+});
+
+test('missing saved-thread read normalizes only the exact requested-ID rejection', async (t) => {
+  for (const [message, code, expected] of [
+    ['thread not loaded: saved-thread', -32600, 'CODEX_THREAD_UNAVAILABLE'],
+    ['thread not loaded: another-thread', -32600, 'CODEX_RPC_ERROR'],
+    ['thread not loaded: saved-thread', -32603, 'CODEX_RPC_ERROR'],
+    ['opaque private error', -32600, 'CODEX_RPC_ERROR'],
+  ]) {
+    const harness = createHarness(t, { methods: { 'thread/read': { error: { code, message } } } });
+    const client = harness.makeClient();
+    await client.start();
+    const error = await rejectedWithCode(client.request('thread/read', {
+      threadId: 'saved-thread', includeTurns: false,
+    }), expected);
+    assert.equal(error.rpcMessage, undefined);
+    assert.equal(error.message.includes(message), false);
+  }
+});
+
 function methodParams(method, cwd) {
   switch (method) {
     case 'config/read':
@@ -210,6 +242,8 @@ function methodParams(method, cwd) {
       return { cwd, model: 'gpt-5.6-sol' };
     case 'thread/resume':
       return { threadId: 'thread-1' };
+    case 'thread/read':
+      return { threadId: 'thread-1', includeTurns: false };
     case 'turn/start':
       return {
         threadId: 'thread-1',

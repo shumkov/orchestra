@@ -22,7 +22,7 @@ const assert = require('node:assert/strict');
 const net = require('node:net');
 const fs = require('node:fs');
 
-const { CliProcess } = require('../index');
+const { CliProcess, hookEventTail } = require('../index');
 
 const READY_BANNER = 'Listening for channel messages from: server:orchestra-bridge';
 const quietLogger = { warn: () => {}, error: () => {}, log: () => {}, debug: () => {} };
@@ -609,7 +609,26 @@ test('interim consumed acknowledgement keeps the busy absolute checkpoint extend
   assert.equal((await sendP).alreadyDelivered, true);
 });
 
-test('an unproven old autosteer reply stays late through dispatch, quoting, and bookkeeping', async t => {
+// The UserPromptSubmit hook as the pinned CLI writes it. A follow-up folded
+// into a running query fires its own UserPromptSubmit carrying that query's
+// prompt_id; a follow-up claude runs as its own query gets a new prompt_id.
+function upsHook(turnId, promptId) {
+  return hookEventTail.normalizeHookEvent({
+    session_id: 'claude-sid',
+    transcript_path: '/tmp/claude-sid.jsonl',
+    cwd: '/tmp',
+    permission_mode: 'bypassPermissions',
+    polygram_received_at_ms: Date.now(),
+    hook_event_name: 'UserPromptSubmit',
+    prompt: `<channel source="orchestra-bridge" chat_id="chat-1" user="u" msg_id="1" turn_id="${turnId}">hi</channel>`,
+    prompt_id: promptId,
+  });
+}
+
+// A follow-up folded into one turn and answered later must stay a late reply:
+// crediting it to whatever turn is pending now would mark an unrelated turn as
+// answered and swallow that turn's own Stop answer.
+test('a reply to a follow-up folded into an earlier turn stays late and is not credited to the current turn', async t => {
   const dispatched = [];
   const events = [];
   const cp = makeCliProcess({
@@ -625,17 +644,29 @@ test('an unproven old autosteer reply stays late through dispatch, quoting, and 
     await cp.kill('test');
   });
 
-  const sendP = cp.send('Current primary', { context: { sourceMsgId: 6406 } });
-  sendP.catch(() => {});
-  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  const earlierP = cp.send('Earlier primary', { context: { sourceMsgId: 6400 } });
+  const earlier = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent(upsHook(earlier.turn_id, 'prompt-earlier'));
   assert.equal(cp.injectUserMessage({
     content: 'Earlier folded follow-up',
     msgId: 6407,
     source: 'autosteer',
   }), true);
   const folded = await bridge.waitFor(
-    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+    m => m.kind === 'user_msg' && m.turn_id !== earlier.turn_id,
   );
+  cp._handleHookEvent(upsHook(folded.turn_id, 'prompt-earlier'));
+  cp._captureStopHookData(cp.pendingTurns.get(earlier.turn_id), {
+    lastAssistantMessage: 'Answer to the earlier primary.',
+  });
+  cp._finalizeTurn(earlier.turn_id);
+  await earlierP;
+
+  const sendP = cp.send('Current primary', { context: { sourceMsgId: 6409 } });
+  const primary = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== earlier.turn_id && m.turn_id !== folded.turn_id,
+  );
+  cp._handleHookEvent(upsHook(primary.turn_id, 'prompt-current'));
 
   bridge.send({
     kind: 'tool',
@@ -657,6 +688,194 @@ test('an unproven old autosteer reply stays late through dispatch, quoting, and 
   assert.deepEqual(cp.pendingTurns.get(primary.turn_id)?.replies, []);
   assert.equal(events.some(event => event.kind === 'cli-late-reply-correlated'), true);
   assert.equal(events.some(event => event.kind === 'cli-fold-reply-attributed'), false);
+  assert.equal(events.some(event => event.kind === 'cli-fold-reply-credited'), false);
+
+  cp._captureStopHookData(cp.pendingTurns.get(primary.turn_id), {
+    lastAssistantMessage: 'Answer to the current primary.',
+  });
+  cp._finalizeTurn(primary.turn_id);
+  const result = await sendP;
+  assert.equal(result.alreadyDelivered, false,
+    'the current turn still delivers its own answer');
+  assert.equal(result.text, 'Answer to the current primary.');
+});
+
+// Production, UMI finance topic, 2026-11-18: the agent posted an interim
+// checklist for the primary, answered an autosteered follow-up with a final
+// reply that named only the follow-up in consumed_turn_ids, and then Stop's
+// recap of that answer was sent again as a second message.
+async function foldedFollowUpWithoutPrimaryProof(t, {
+  primaryInterim,
+  followUpInterim = false,
+  followUpPromptId = 'prompt-primary',
+  end = 'stop',
+}) {
+  const dispatched = [];
+  const events = [];
+  const cp = makeCliProcess({
+    toolDispatcher: async (call) => {
+      dispatched.push(call);
+      return { ok: true, message_id: 1243 };
+    },
+  });
+  cp.db = { logEvent: (kind, detail) => events.push({ kind, detail }) };
+  const bridge = await startWithFakeBridge(cp);
+  t.after(async () => {
+    bridge.close();
+    await cp.kill('test');
+  });
+
+  const sendP = cp.send('Go on with step 2', { context: { sourceMsgId: 1238 } });
+  const settled = sendP.then(
+    result => ({ outcome: 'resolved', result }),
+    err => ({ outcome: 'rejected', err }),
+  );
+  const primary = await bridge.waitFor(m => m.kind === 'user_msg');
+  cp._handleHookEvent(upsHook(primary.turn_id, 'prompt-primary'));
+
+  if (primaryInterim) {
+    bridge.send({
+      kind: 'tool',
+      session: cp.sessionKey,
+      tool_call_id: 'checklist',
+      name: 'reply',
+      args: {
+        chat_id: cp.chatId,
+        text: '- [x] Step 2 recorded\n- [ ] Research methods',
+        turn_id: primary.turn_id,
+        consumed_turn_ids: [primary.turn_id],
+        interim: true,
+      },
+    });
+    await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'checklist');
+  }
+
+  assert.equal(cp.injectUserMessage({
+    content: 'Did you research the methods?',
+    msgId: 1240,
+    source: 'autosteer',
+  }), true);
+  const folded = await bridge.waitFor(
+    m => m.kind === 'user_msg' && m.turn_id !== primary.turn_id,
+  );
+  if (followUpPromptId) cp._handleHookEvent(upsHook(folded.turn_id, followUpPromptId));
+
+  bridge.send({
+    kind: 'tool',
+    session: cp.sessionKey,
+    tool_call_id: 'steer-answer',
+    name: 'reply',
+    args: {
+      chat_id: cp.chatId,
+      text: 'Yes, three research directions, with sources.',
+      turn_id: folded.turn_id,
+      consumed_turn_ids: [folded.turn_id],
+      ...(followUpInterim ? { interim: true } : {}),
+    },
+  });
+  await bridge.waitFor(m => m.kind === 'tool_ack' && m.tool_call_id === 'steer-answer');
+  await new Promise(resolve => setImmediate(resolve));
+
+  const steerDispatch = dispatched[dispatched.length - 1];
+  assert.equal(steerDispatch.sourceMsgId, 1240,
+    'the answer to the follow-up still quotes the follow-up');
+
+  if (end === 'stop-failure') {
+    cp._handleHookEvent(hookEventTail.normalizeHookEvent({
+      session_id: 'claude-sid',
+      transcript_path: '/tmp/claude-sid.jsonl',
+      cwd: '/tmp',
+      permission_mode: 'bypassPermissions',
+      polygram_received_at_ms: Date.now(),
+      hook_event_name: 'StopFailure',
+      prompt_id: 'prompt-primary',
+      error: 'server_error',
+      last_assistant_message: 'API Error: 500',
+    }));
+  } else {
+    const pending = cp.pendingTurns.get(primary.turn_id);
+    cp._captureStopHookData(pending, {
+      lastAssistantMessage: 'Ivan asked whether I researched the methods; I did.',
+    });
+    cp._finalizeTurn(primary.turn_id);
+  }
+  return { settled: await settled, events, primary, folded, cp };
+}
+
+test('an answered folded follow-up stops the Stop recap after an interim checklist', async t => {
+  const { settled, events, primary, folded, cp } = await foldedFollowUpWithoutPrimaryProof(t, {
+    primaryInterim: true,
+  });
+  assert.equal(settled.result.alreadyDelivered, true,
+    'the Stop recap of an answer already in the chat is not sent again');
+  assert.equal(events.some(e => e.kind === 'cli-interim-only-final-rescued'), false);
+  assert.deepEqual(
+    events.find(e => e.kind === 'cli-fold-reply-credited')?.detail,
+    {
+      chat_id: cp.chatId,
+      thread_id: cp.threadId,
+      session_key: cp.sessionKey,
+      backend: cp.backend,
+      turn_id: primary.turn_id,
+      reply_turn_id: folded.turn_id,
+      source: 'autosteer',
+    },
+  );
+  assert.equal(
+    events.find(e => e.kind === 'cli-resolve-delivery')?.detail.branch,
+    'fold-reply-credited',
+  );
+});
+
+test('an answered folded follow-up stops the zero-reply Stop fallback', async t => {
+  const { settled } = await foldedFollowUpWithoutPrimaryProof(t, { primaryInterim: false });
+  assert.equal(settled.result.alreadyDelivered, true,
+    'the Stop recap of an answer already in the chat is not sent again');
+});
+
+test('an interim reply to a folded follow-up does not count as the turn\'s answer', async t => {
+  const { settled, events } = await foldedFollowUpWithoutPrimaryProof(t, {
+    primaryInterim: false,
+    followUpInterim: true,
+  });
+  assert.equal(settled.result.alreadyDelivered, false,
+    'a status line is not an answer, so the Stop text is still delivered');
+  assert.equal(events.some(e => e.kind === 'cli-fold-reply-credited'), false);
+});
+
+// A follow-up claude ran as its own query (new prompt_id) says nothing about
+// the primary's answer: the primary's Stop text may be its only answer.
+test('a follow-up run as its own query is not credited to the primary', async t => {
+  const { settled, events } = await foldedFollowUpWithoutPrimaryProof(t, {
+    primaryInterim: false,
+    followUpPromptId: 'prompt-next-cycle',
+  });
+  assert.equal(settled.result.alreadyDelivered, false);
+  assert.equal(settled.result.text, 'Ivan asked whether I researched the methods; I did.');
+  assert.equal(events.some(e => e.kind === 'cli-fold-reply-credited'), false);
+});
+
+// Without the follow-up's UserPromptSubmit there is no proof it ran inside
+// the primary's query. Sending a possible duplicate is better than losing an
+// answer.
+test('a follow-up whose pickup was not observed is not credited', async t => {
+  const { settled, events } = await foldedFollowUpWithoutPrimaryProof(t, {
+    primaryInterim: false,
+    followUpPromptId: null,
+  });
+  assert.equal(settled.result.alreadyDelivered, false);
+  assert.equal(events.some(e => e.kind === 'cli-fold-reply-credited'), false);
+});
+
+// Answering the follow-up does not answer the primary, so when the query then
+// fails the primary must still get its error notice.
+test('a failed query after an answered folded follow-up still reports the error', async t => {
+  const { settled } = await foldedFollowUpWithoutPrimaryProof(t, {
+    primaryInterim: false,
+    end: 'stop-failure',
+  });
+  assert.equal(settled.outcome, 'rejected');
+  assert.equal(settled.err.code, 'CLAUDE_API_ERROR');
 });
 
 test('a failed folded delivery leaves its matching Stop answer deliverable', async t => {

@@ -446,3 +446,67 @@ the client fault-prone if the signal arrives from another source.
 The rest of the generated ServerNotification set stays fail-closed. None of
 those notifications has been observed in this configuration, so classifying
 them now would be unproven. Each one needs its own source-backed evidence.
+
+
+## Generated-schema notification audit (0.167.2)
+
+The 0.167.2 generated ServerNotification set has 52 methods that the pinned
+subset left unclassified, `skills/changed` included. Each was traced to its
+emitters in the rust-v0.167.2 source and checked against this client's fixed
+request set, its single stdio connection, Linux, `approval_policy = "never"`,
+`approvals_reviewer = "user"`, a custom Responses provider and no MCP servers.
+
+Reachable without a client opt-in, so each one is dropped as an exact method:
+
+- `model/rerouted`: an `openai-model` or `x-openai-model` value, in the HTTP
+  response headers or in an SSE or websocket event's embedded headers,
+  differs (case-insensitively) from the requested slug. It fires at most once
+  per turn. Path: codex-api/src/sse/responses.rs, then
+  core/src/session/mod.rs, then app-server bespoke_event_handling.rs.
+  It does not change thread settings, so no later `thread/settings/updated`
+  reports a different model.
+  There is no auth or provider gate, and the only schema reason is
+  `highRiskCyberActivity`. It is sent with a `warning`, which is already dropped.
+- `model/verification`: a `response.metadata` stream event carrying
+  `openai_verification_recommendation`; the only schema value is
+  `trustedAccessForCyber`.
+- `model/safetyBuffering/updated`: a `safety_buffering` stream field or metadata
+  event; it is a UI hint.
+
+All three are observational. The turn continues, and its outcome still arrives
+through items and `turn/completed`. Whether a given proxy forwards these
+upstream signals cannot be settled from code, so they are classified because
+the source allows them, not because a capture saw them. Regression tests
+prove a pending RPC stays healthy with zero delivered notifications, and a
+sibling `model/rerouted/unknown` still faults.
+
+Left fail-closed, all unreachable here:
+
+- Emitted only after a client request this client never sends:
+  - command/exec, process/spawn, fs/watch and fuzzy-file-search sessions;
+  - all `thread/realtime/*` (only `thread/realtime/start` starts a conversation);
+  - windows sandbox setup, external-agent import and account login;
+  - thread archive, unarchive, delete, revert, name, section, attachment and
+    metadata;
+  - the project requests;
+  - `thread/queue/*` (the queue is not touched by turn start or steer);
+  - app/list, the MCP OAuth and event-stream requests, and gateway OAuth.
+- Gated off by config: guardian and auto-review notifications need an
+  on-request or granular policy with the auto-review reviewer. Auth recovery
+  is implemented only by the Bedrock provider. Environment connect and
+  disconnect need a remote exec-server environment.
+- Never constructed by the app-server:
+  - `thread/compacted`: auto-compaction surfaces as a `contextCompaction`
+    item, which the item projection already accepts;
+  - `item/mcpToolCall/progress`;
+  - `thread/prediction/updated`;
+  - `windows/worldWritableWarning`.
+- `serverRequest/resolved` only follows a server request, which this client
+  already denies and faults on, so classifying it would change nothing.
+- `thread/closed` and `thread/environment/disconnected` mean the runtime is
+  gone and must not be silently dropped. Idle unload needs the connection to
+  stop being a thread subscriber, which happens only through
+  `thread/unsubscribe` (never sent) or connection close.
+
+Re-run this audit on every Codex pin bump: diff the generated ServerNotification
+set against both lists and classify each new method from source.

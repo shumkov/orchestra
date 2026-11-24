@@ -2205,14 +2205,50 @@ test('workspace skills invalidation does not interrupt a pending RPC', async (t)
   assert.equal(await client.waitForFault(), null);
 });
 
+// The provider can attach cyber-safety signals to any turn: a reroute to
+// another model, a trusted-access verification recommendation, or a
+// safety-buffering UI hint. Each is observational; the turn keeps running and
+// its real outcome still arrives through items and turn/completed.
+test('provider safety signals do not interrupt a pending RPC or reach the sink', async (t) => {
+  const messages = [
+    { method: 'model/rerouted', params: {
+      threadId: 'thread-1', turnId: 'turn-1', fromModel: 'PRIVATE_FROM_MODEL',
+      toModel: 'PRIVATE_TO_MODEL', reason: 'highRiskCyberActivity',
+    } },
+    { method: 'model/verification', params: {
+      threadId: 'thread-1', turnId: 'turn-1', verifications: ['trustedAccessForCyber'],
+    } },
+    { method: 'model/safetyBuffering/updated', params: {
+      threadId: 'thread-1', turnId: 'turn-1', model: 'PRIVATE_MODEL', fasterModel: null,
+      reasons: ['PRIVATE_REASON'], useCases: ['PRIVATE_USE_CASE'], showBufferingUi: true,
+    } },
+  ];
+  for (const message of messages) {
+    await t.test(message.method, async (subtest) => {
+      const notifications = [];
+      const harness = createHarness(subtest, { methods: { 'config/read': {
+        beforeResponseMessages: [message],
+      } } });
+      const client = harness.makeClient({ onNotification: async event => notifications.push(event) });
+      await client.start();
+      await client.request('config/read', { cwd: harness.cwd, includeLayers: true });
+      client.assertHealthy();
+      assert.deepEqual(notifications, []);
+      await client.close();
+      assert.equal(await client.waitForFault(), null);
+    });
+  }
+});
+
 test('unknown notifications fault without exposing their payload', async (t) => {
-  // The `hook/` and `skills/` cases pin that dropping known exact methods did
-  // not widen into tolerance for the whole namespace.
+  // The `hook/`, `skills/` and `model/` cases pin that dropping known exact
+  // methods did not widen into tolerance for the whole namespace.
   for (const method of [
     'thread/experimental/unknown',
     'turn/moderationMetadata/unknown',
     'hook/experimental/unknown',
     'skills/changed/unknown',
+    'model/rerouted/unknown',
   ]) {
     await t.test(method, async (subtest) => {
       const harness = createHarness(subtest, {

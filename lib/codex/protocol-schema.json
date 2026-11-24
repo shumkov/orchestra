@@ -181,7 +181,10 @@
     "thread/readState/changed",
     "account/updated",
     "turn/moderationMetadata",
-    "skills/changed"
+    "skills/changed",
+    "model/rerouted",
+    "model/verification",
+    "model/safetyBuffering/updated"
   ],
   "deniedServerRequests": {
     "item/commandExecution/requestApproval": {

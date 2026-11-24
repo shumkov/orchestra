@@ -2186,13 +2186,33 @@ test('native provider moderation metadata does not interrupt a pending RPC or ex
   assert.equal(await client.waitForFault(), null);
 });
 
+// The app-server watches the workspace skills directory and emits this
+// parameterless invalidation signal on any write beneath it, including a
+// `__pycache__` file a model-run script leaves behind or a cron job updating
+// skill state. It carries no thread, turn or payload, and the client never
+// calls `skills/list`, so it is dropped rather than treated as a violation.
+test('workspace skills invalidation does not interrupt a pending RPC', async (t) => {
+  const notifications = [];
+  const harness = createHarness(t, { methods: { 'config/read': {
+    beforeResponseMessages: [{ method: 'skills/changed', params: {} }],
+  } } });
+  const client = harness.makeClient({ onNotification: async event => notifications.push(event) });
+  await client.start();
+  await client.request('config/read', { cwd: harness.cwd, includeLayers: true });
+  client.assertHealthy();
+  assert.deepEqual(notifications, []);
+  await client.close();
+  assert.equal(await client.waitForFault(), null);
+});
+
 test('unknown notifications fault without exposing their payload', async (t) => {
-  // The `hook/` case pins that dropping the two known hook notifications did
+  // The `hook/` and `skills/` cases pin that dropping known exact methods did
   // not widen into tolerance for the whole namespace.
   for (const method of [
     'thread/experimental/unknown',
     'turn/moderationMetadata/unknown',
     'hook/experimental/unknown',
+    'skills/changed/unknown',
   ]) {
     await t.test(method, async (subtest) => {
       const harness = createHarness(subtest, {

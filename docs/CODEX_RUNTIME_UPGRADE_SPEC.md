@@ -420,3 +420,29 @@ Node22.23.5 x64 ran without target overrides or injected attestors. No Linux
 external inference or production launcher changes. This is translated execution,
 not native x64 CPU/seccomp/sandbox or systemd scope cleanup proof. Preserve that
 limitation for release/activation; no blanket descendant guarantee is added.
+
+
+## Skills invalidation notification amendment
+
+Production Polygram Codex lanes on 0.167.2 entered containment with
+CODEX_PROTOCOL_ERROR (`app-server-fault`, client fault class `protocol`) both
+mid-turn and while idle. The mid-turn fault followed a model-run Python script
+that wrote a `__pycache__/*.pyc` under the workspace `skills/` tree by ~0.2s; the
+idle faults coincided with a daily job rewriting a state file under `skills/`.
+The pinned binary emits `skills/changed` on any write beneath the watched skills
+directory (reproduced against the pinned 0.167.2 app-server with a fresh
+`CODEX_HOME`). The generated schema declares it as a parameterless invalidation
+signal ("re-run `skills/list` ... when refreshed skill metadata is needed"). It
+carries no thread, turn, checkpoint, authority or payload; Orchestra never calls
+`skills/list`, so there is nothing to refresh.
+
+Narrow correction: classify only this exact method as dropped. No wildcard
+acceptance of the `skills/` namespace and no payload exposure. Regression tests
+prove a pending RPC stays healthy with zero delivered notifications, and a
+sibling `skills/changed/unknown` still faults. Alternative rejected: disabling
+the watcher would need an unpinned config/startup surface and would still leave
+the client fault-prone if the signal arrives from another source.
+
+The rest of the generated ServerNotification set stays fail-closed. None of
+those notifications has been observed in this configuration, so classifying
+them now would be unproven. Each one needs its own source-backed evidence.

@@ -180,7 +180,8 @@
     "mcpServer/startupStatus/updated",
     "thread/readState/changed",
     "account/updated",
-    "turn/moderationMetadata"
+    "turn/moderationMetadata",
+    "skills/changed"
   ],
   "deniedServerRequests": {
     "item/commandExecution/requestApproval": {

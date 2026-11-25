@@ -1,6 +1,6 @@
 # CLI backend: configured MCP servers next to the bridge
 
-Status: draft for review.
+Status: reviewed (two spec reviewers, 25 Nov 2026), review fixes folded in.
 
 ## Problem
 
@@ -14,23 +14,23 @@ effect, there is no way to give a chat or a topic any other MCP server:
   `.mcp.json` and plugin servers are all ignored under strict mode.
 - An agent file's frontmatter `mcpServers` is ignored for a main-thread `--agent`
   (verified with Claude CLI 2.1.322, with and without strict mode).
-- The consumer's agent-bundle `settings.json` `mcpServers` only reaches the SDK backend.
+- A consumer's agent-bundle `settings.json` `mcpServers` only reaches the SDK backend.
 
 Concrete case: UMI's instagram role (Shumabit bot, marketing forum topic 1306) needs the
 Canva MCP. The CLI already has Canva's OAuth stored. A contained test on the production
 host proved the target behaviour: the pinned CLI with `--strict-mcp-config` and an
 `--mcp-config` holding `{"canva":{"type":"http","url":"https://mcp.canva.com/mcp"}}`
 connected Canva (source `dynamic`, 46 tools), and a read-only `search-designs` returned
-real designs. The stored OAuth entry (`canva|<hash>` in `~/.claude/.credentials.json`)
-was reused; no new entry was created and no login was needed.
+real designs, reusing the stored OAuth entry.
 
 ## Chosen approach
 
 `CliProcess` reads an `mcpServers` object from the resolved chat config, with the same
-precedence it already uses for `agent`, `cwd` and `isolateUserConfig`: the topic's value
-when the topic sets one, otherwise the chat's. It validates the entries and writes the
-valid ones into the existing 0600 mcp-config file next to the bridge. The flags do not
-change: still `--strict-mcp-config`, still one `--mcp-config <file>` as the last flag.
+topic-over-chat precedence it uses for `agent`, `cwd` and `isolateUserConfig`. It
+validates the entries strictly and writes the valid ones into the existing 0600
+mcp-config file next to the bridge. For every configured server it also denies that
+server's OAuth tools. Otherwise the argv is unchanged: still `--strict-mcp-config`, still
+one `--mcp-config <file>` as the last flag.
 
 ```jsonc
 // consumer config (polygram: config.json → chats[<id>] or chats[<id>].topics[<thread>])
@@ -39,7 +39,8 @@ change: still `--strict-mcp-config`, still one `--mcp-config <file>` as the last
 }
 ```
 
-Written file:
+Written file (the bridge key is first in insertion order, so Claude starts it first, and
+it is assigned again last, so a configured entry can never replace it):
 
 ```json
 { "mcpServers": {
@@ -48,138 +49,167 @@ Written file:
 } }
 ```
 
+Built as `{ [bridge]: def, ...servers, [bridge]: def }`.
+
+### OAuth reuse rule
+
+The CLI stores MCP OAuth under `mcpOAuth["<name>|<sha256(JSON{type,url,headers})>[0:16]"]`
+in `~/.claude/.credentials.json`. A configured server reuses an existing login only if the
+**name, type, exact URL (no added or dropped trailing slash) and headers** equal the
+`claude mcp add` registration. Verified on the VPS: `canva` and a probe named
+`canva-probe` with the same URL got the same hash suffix but separate entries; the probe
+had no token. Anything else means a new, unauthenticated entry.
+
 ### Precedence: topic replaces chat
 
-A topic that sets `mcpServers` replaces the chat's whole set; it does not merge per
-server name. Reasons:
+When a topic sets `mcpServers` (non-null), it replaces the chat's whole set; it does not
+merge per server name. `null` or absent at topic level inherits the chat's. A topic's
+`{}` drops the chat's servers. A legacy string topic config (a bare name) inherits the
+chat's.
 
-- It matches every other topic-over-chat key in this backend (`agent`, `cwd`,
-  `isolateUserConfig`) and polygram's SDK backend, where `composeSdkOptions` copies
-  `topicConfig.mcpServers` over `chatConfig.mcpServers` as a whole value. One rule for
-  both backends.
-- It gives a topic a way to drop a chat-wide server (`"mcpServers": {}`), which per-name
-  merging would need a special `null` value for.
+- Same rule as `agent`, `cwd` and `isolateUserConfig` in this backend.
+- Rejected: per-name merge. Not needed for the use case, and it would need a removal
+  marker.
 
-Rejected: per-name merge (topic adds to chat). Not needed for the use case, differs from
-the SDK backend, and needs extra removal semantics.
+### Validation (strict)
 
-### Validation
+A small pure module `lib/process/cli-mcp-servers.js`,
+`resolveConfiguredMcpServers({ value, reservedName })` → `{ servers, skipped }`, unit-tested
+without tmux.
 
-Validation runs at spawn, in a small pure function (`lib/process/cli-mcp-servers.js`,
-`resolveConfiguredMcpServers({ value, reservedName })` → `{ servers, skipped }`), so it can
-be unit-tested without tmux.
+- `value` absent or `null`: no extra servers. The written file is byte-identical to
+  today's.
+- `value` not a plain object: no extra servers, one skip with reason `not-an-object`.
+- Per entry, all must hold or the entry is skipped:
+  - name matches `^[A-Za-z0-9_-]{1,64}$` (`invalid-name`) and is not the bridge name
+    (`reserved-name`);
+  - value is a plain object with only known fields for its type (`invalid-definition`
+    otherwise):
+    - `http` / `sse`: `type` (required), `url` (required, `https:` or `http:` URL),
+      `headers` (object of strings), `oauth` (object), `timeout` (finite number > 0);
+    - `stdio`: `type: "stdio"` (optional), `command` (non-empty string), `args` (array of
+      strings), `env` (object of strings), `timeout` (finite number > 0).
+- A skipped entry never stops the session: it starts with the bridge and the valid rest.
 
-- `mcpServers` absent or `null`: no extra servers (today's behaviour, byte-identical
-  file).
-- `mcpServers` not a plain object (array, string, number): ignore it entirely, one
-  warning.
-- Per entry:
-  - The name must match `^[A-Za-z0-9_-]{1,64}$` (Claude's MCP server name rule; the
-    name becomes the `mcp__<name>__` tool prefix).
-  - The name must not equal `bridgeServerName`. The bridge entry is always written last
-    over any configured entry, so a collision can never replace the bridge even if this
-    check regressed.
-  - The value must be a plain object with either `type: "http"` or `type: "sse"` and a
-    string `url` that parses as an `https:` or `http:` URL, or a stdio server: optional
-    `type: "stdio"`, a non-empty string `command`, optional string array `args`,
-    optional object `env` of strings.
-  - Unknown extra fields (`headers`, `oauth`, `timeout`) are passed through unchanged:
-    Claude owns that schema, and orchestra only checks enough to keep a typo from
-    reaching the CLI.
-- An invalid entry is skipped, not fatal. The session still starts with the bridge and
-  the remaining valid servers.
+**Settled on the pinned CLI (2.1.322, VPS, 25 Nov 2026):** a file with one valid server
+and three bad entries (`{"type":"http"}` without a url, `{"foo":1}`, a bare number)
+started normally: the bad entries were dropped silently, Canva connected with all 46
+tools. So the CLI does not reject the whole file over a bad entry, but it also gives no
+signal. Orchestra validates before writing so a typo is visible in its event and logs,
+and so a future CLI that is stricter cannot take the bridge down.
 
-Rejected: failing the spawn on any invalid entry. One bad optional server would take the
-whole topic offline; the bridge, which carries every reply, must not depend on it.
+### Denying OAuth tools
+
+When an HTTP server has no usable token, the interactive CLI (the CLI backend runs the
+TUI) exposes `mcp__<name>__authenticate` and `mcp__<name>__complete_authentication`. Under
+`bypassPermissions` a role could start an OAuth flow from a group chat. Verified on
+2.1.322: a `canva-probe` server without a token showed both tools in the TUI (not in
+`-p`).
+
+For every configured server, `CliProcess` adds
+`--disallowedTools mcp__<n>__authenticate,mcp__<n>__complete_authentication,…` (one
+comma-joined argument, placed before `--settings`). Verified on 2.1.322 under
+`--permission-mode bypassPermissions --dangerously-skip-permissions`: with the flag, both
+tools are gone (ToolSearch finds nothing) and the probe left no credential entry. A
+re-login is an operator action: Ivan runs `claude` → `/mcp` interactively as the bot user
+in the working directory where the server is registered (`/home/shumabit/shumabit-claude`
+for Canva).
 
 ### Logging and secrets
 
 Server definitions may carry secrets (`headers.Authorization`, `env` tokens).
 
-- Values are written only to the existing mcp-config file (mode 0600, re-chmodded,
-  removed on teardown with the socket). The file path is in argv; contents never are.
-- One `cli-mcp-servers` event per spawn with names and types only:
-  `{ servers: [{ name, type }], skipped: [{ name, reason }] }`. `reason` is a fixed code
-  (`invalid-name`, `reserved-name`, `invalid-definition`, `not-an-object`), never the
-  value. Nothing is emitted when no servers are configured.
-- A skipped entry also logs one `logger.warn` line with the name and reason code.
-- A test asserts that a secret placed in `headers` and `env` appears in neither the
-  event, the warn line nor argv.
+- Values are written only to the mcp-config file (mode 0600, re-chmodded, removed on
+  teardown). The file path is in argv; contents never are.
+- One `cli-mcp-servers` event per spawn through `_logEvent`, with names and types only:
+  `{ servers: [{ name, type }], skipped: [{ name, reason }] }`. Not emitted when nothing
+  is configured. `reason` is a fixed code, never a value.
+- A skipped entry also logs one `logger.warn` line with the name and the code.
+- Boot cleanup: `sweepStaleMcpConfigs({ sessionPrefix, dir })` removes
+  `<prefix>-<hex32>-mcp.json` files whose `<prefix>-<hex32>.sock` is missing or refuses a
+  connection (its daemon is gone). A file whose socket accepts belongs to a live session,
+  possibly another bot's daemon under the same Linux user and prefix, and stays. The
+  consumer calls it at boot next to the tmux orphan sweep. Today 11 such files sit in the
+  VPS's `/tmp`, each holding a bridge socket secret.
 
 ### When a change takes effect
 
-MCP servers are fixed when `claude` starts. A configured change reaches a session on its
-next spawn:
+MCP servers are fixed when `claude` starts.
 
-- `/new` (fresh conversation), `/reload` (same conversation, `--resume`), an idle
-  eviction or a crash respawn all start a new `claude` with the current config.
-- A warm process keeps its spawn-time servers. `mcpServers` is not added to the
-  spawn-identity fields: a respawn with `--resume` and a different server set is a
-  valid continuation (the conversation keeps working; tools just appear or disappear),
-  so there is no reason to drop the stored session.
-- Consumer note (polygram): the daemon reads `config.json` only at boot, so an edit to
-  the file takes effect after a daemon restart; boot also sweeps orphaned tmux sessions,
-  so every CLI session respawns with the new config on its next message.
+- `/new` (fresh conversation), `/reload` (same conversation, `--resume`), an idle eviction,
+  a crash respawn or a daemon restart start a new `claude` with the current config.
+- A warm process keeps its spawn-time servers. `mcpServers` is not a spawn-identity field:
+  a respawn with `--resume` and a different server set continues the same conversation.
+- The consumer decides when its config changes (polygram: at boot only; see its spec).
 
-### Failure modes
+### Failure modes (measured on 2.1.322 where marked)
 
 | Failure | Behaviour |
 | --- | --- |
-| Invalid entry | Skipped, warn + event; session starts with the rest. |
-| Server unreachable, slow, or OAuth expired / needs login | Claude CLI marks that server failed or `needs-auth` and starts anyway; its tools are absent. The bridge is unaffected. The role's skill already tells the agent to say "Canva is not connected" when the tools are missing. Verified before release (see Verification). |
-| Slow HTTP server at startup | Claude connects MCP servers concurrently; the startup gate waits only for the bridge's ready signal. Verified with an unreachable URL before release. |
-| Name collision with the bridge | Skipped as `reserved-name`; bridge written last regardless. |
-| Re-login needed | Out of scope for the bot: an operator runs `claude mcp` / `/mcp` interactively as the bot user. Bot sessions never start an OAuth flow (no browser). |
+| Invalid entry | Skipped by Orchestra, warn + event; session starts with the rest. The CLI would also drop it silently (measured). |
+| Server needs OAuth | Status `needs-auth`, no tools; its OAuth tools are denied (measured). The role says the tool is not connected. |
+| Server unreachable (`https://10.255.255.1/mcp`, packets dropped) | TUI reached its prompt in about 1 s with the server still pending; it then showed as `failed` (measured). In `-p` mode the first turn waited for the 30 s MCP connect timeout (33.5 s vs 17 s), which does not apply to the TUI the CLI backend runs. |
+| Name collision with the bridge | Skipped as `reserved-name`; bridge assigned last regardless. |
 
-### Security
+### Security and limits
 
-- Config is operator-owned (`config.json`, 0600, root/bot user). Members cannot set it;
-  polygram's `/config` commands do not expose `mcpServers`.
-- A server is scoped to the chat or topic that names it. In the UMI deployment it is
-  set only on topic 1306 of the Shumabit bot; the UMI Assistant bot has its own chats and
-  gets nothing.
+- Config is operator-owned (`config.json`, 0600). polygram's `/config` does not expose
+  `mcpServers`.
+- A server is scoped to the chat or topic that names it. Isolation is config-only: all
+  bots of a host may run as one Linux user and share `~/.claude/.credentials.json`.
 - Strict mode stays on, so nothing else leaks in.
+- Content a server returns (Canva designs, comments, assets) is data, not instructions;
+  consumers say so in the skills that use it.
+- No approval gate is added on any server's write tools. For Canva, Ivan granted the
+  instagram role full use of UMI-owned Canva items (25 Nov 2026); per-design rules stay in
+  the `umi-canva` skill.
 
 ## Interface
 
-- New module `lib/process/cli-mcp-servers.js`: `resolveConfiguredMcpServers({ value, reservedName })`.
-- `CliProcess._spawnTmuxClaude`: resolve `topicConfig?.mcpServers !== undefined ?
-  topicConfig.mcpServers : opts.chatConfig?.mcpServers`, call the resolver, build
-  `{ mcpServers: { ...servers, [bridgeServerName]: bridge } }`, emit the event.
-- No new constructor option, no argv change. `README.md` documents the config key.
+- New `lib/process/cli-mcp-servers.js`: `resolveConfiguredMcpServers`,
+  `buildMcpConfig({ bridgeName, bridgeDef, servers })`, `authToolDenyList(servers)`,
+  `sweepStaleMcpConfigs({ sessionPrefix, dir, logger })`.
+- `index.js` exports `sweepStaleMcpConfigs` (next to `orphanSweep`).
+- `CliProcess._spawnTmuxClaude`: topic resolution moves above the mcp-config write; the
+  file is built with `buildMcpConfig`; `--disallowedTools` added when servers exist; the
+  event is emitted.
+- `README.md` documents the config key.
 
-## Tests (TDD, `tests/cli-mcp-servers.test.js` and `tests/cli-process.test.js`)
+## Tests (TDD)
 
-Resolver:
-- absent/null → `{}`; non-object → `{}` + `not-an-object`.
-- valid http, sse and stdio entries pass through, extra fields kept.
-- bad name, reserved name, missing url/command, non-http(s) URL, non-string args → each
-  skipped with its code, others kept.
+`tests/cli-mcp-servers.test.js`:
+- absent/null → `{}`; non-object → `{}` + `not-an-object`;
+- valid http (with headers, oauth, timeout), sse and stdio pass through;
+- bad name, reserved name, missing url/command, `ftp:` URL, unknown field, non-string
+  header, non-array args → each skipped with its code, others kept;
+- `buildMcpConfig`: bridge first in key order, bridge definition wins over a same-named
+  entry;
+- deny list: two tools per server, comma-joined;
+- sweep: removes a file with no socket and one whose socket refuses; keeps one whose socket
+  accepts; ignores unrelated names.
 
-Spawn (existing fake tmux runner pattern):
-- No `mcpServers`: the written file equals today's (bridge only). Guards against a
-  silent behaviour change for every other consumer and chat.
-- Chat `mcpServers`: file holds bridge + canva; argv unchanged; `--mcp-config` still last.
-- Topic `mcpServers` replaces chat's; topic `{}` yields bridge only.
-- Configured entry named like the bridge: the bridge definition in the file is the real
-  bridge, and the event lists it as skipped.
-- Secrets in `headers`/`env` absent from argv, the event and logger output; file mode
-  0600.
+`tests/cli-process.test.js` (existing fake tmux pattern):
+- no `mcpServers`: the file holds only the bridge and argv has no `--disallowedTools`
+  (guards every other consumer);
+- chat `mcpServers`: file holds bridge + canva; `--disallowedTools` present;
+  `--mcp-config` still last;
+- topic replaces chat; topic `{}` → bridge only; topic without the key, topic `null` and a
+  legacy string topic inherit the chat's;
+- secrets in `headers`/`env` absent from argv, events and logger output; file mode 0600.
 
-## Verification before release (on the production host, contained)
+## Verification
 
-1. Pinned CLI in a private tmux socket and temp dir, with `--strict-mcp-config`,
-   `--dangerously-load-development-channels` and an mcp-config holding a stub channel
-   server plus canva: the TUI reaches its prompt, `/mcp` shows canva connected.
-2. Same with an unreachable `https://127.0.0.1:9/mcp` server: the TUI still reaches its
-   prompt within the normal startup time; the server is listed as failed.
+Done before implementation (VPS, pinned 2.1.322, temp dirs, private tmux socket, artifacts
+removed): the three measurements above (bad entries, needs-auth probe with and without
+the deny flag, unreachable server timing).
 
-After deploy: the instagram topic's fresh session lists `mcp__canva__*` tools and a
-read-only `search-designs` succeeds; another Shumabit topic's session shows no canva
-tools.
+After deploy (polygram rollout): the instagram topic's respawned session (a `/reload` or a
+normal message, which resumes) lists `mcp__canva__*` and a read-only `search-designs`
+works; the `cli-mcp-servers` events show canva only for topic 1306, none for `cmo`
+(chat-level General) or other topics.
 
 ## Out of scope
 
-- Per-name merging, `null` removal, agent-level MCP for the CLI backend.
-- The tmux (non-channels) backend's `isolateUserConfig` path.
+- Per-name merging, agent-level MCP for the CLI backend.
+- The tmux and Codex backends (the key does nothing there).
 - Water: unaffected unless its config sets `mcpServers`.

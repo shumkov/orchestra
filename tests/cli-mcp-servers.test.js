@@ -107,10 +107,42 @@ test('skip records never carry the server definition (it may hold secrets)', () 
   assert.ok(!JSON.stringify(skipped).includes(secret));
 });
 
-test('a name longer than 64 characters is rejected', () => {
-  const long = 'a'.repeat(65);
-  assert.deepEqual(resolve({ [long]: CANVA }).skipped, [{ name: long, reason: 'invalid-name' }]);
+test('a name longer than 64 characters is rejected, and reported cut to 64', () => {
+  const long = 'a'.repeat(5000);
+  assert.deepEqual(resolve({ [long]: CANVA }).skipped, [{ name: 'a'.repeat(64), reason: 'invalid-name' }]);
   assert.deepEqual(Object.keys(resolve({ ['a'.repeat(64)]: CANVA }).servers), ['a'.repeat(64)]);
+});
+
+// The name becomes the mcp__<name>__ tool prefix and is joined with commas
+// into --disallowedTools, so separators must never pass.
+test('names with a comma, dot, slash or space are rejected', () => {
+  for (const name of ['a,b', 'a.b', 'a/b', 'a b', '']) {
+    assert.deepEqual(resolve({ [name]: CANVA }), {
+      servers: {},
+      skipped: [{ name, reason: 'invalid-name' }],
+    }, JSON.stringify(name));
+  }
+});
+
+// JSON.parse makes "__proto__" an own key; assigning it to a plain object
+// would set the prototype instead and drop the entry without a trace.
+test('a server named __proto__ is rejected visibly, not silently dropped', () => {
+  const value = JSON.parse('{"__proto__":{"type":"http","url":"https://x.example/mcp"},"canva":'
+    + JSON.stringify(CANVA) + '}');
+  const { servers, skipped } = resolve(value);
+  assert.deepEqual(Object.keys(servers), ['canva']);
+  assert.equal(Object.getPrototypeOf(servers), Object.prototype);
+  assert.deepEqual(skipped, [{ name: '__proto__', reason: 'invalid-name' }]);
+});
+
+test('an oauth value that is not an object is rejected', () => {
+  for (const oauth of ['client-id', 5, ['x'], null]) {
+    assert.deepEqual(
+      resolve({ canva: { ...CANVA, oauth } }).skipped,
+      [{ name: 'canva', reason: 'invalid-definition' }],
+      JSON.stringify(oauth),
+    );
+  }
 });
 
 test('the bridge starts first and cannot be replaced by a configured entry', () => {
@@ -158,10 +190,15 @@ function tmpDir(t) {
 }
 
 const hex = (c) => c.repeat(32);
+const HOUR_AGO = (Date.now() - 60 * 60 * 1000) / 1000;
 
-test('sweep removes config files whose session is gone and keeps live ones', async (t) => {
+test('sweep removes old config files whose session is gone and keeps live ones', async (t) => {
   const dir = tmpDir(t);
-  const write = (name) => fs.writeFileSync(path.join(dir, name), '{}', { mode: 0o600 });
+  const write = (name) => {
+    const p = path.join(dir, name);
+    fs.writeFileSync(p, '{}', { mode: 0o600 });
+    fs.utimesSync(p, HOUR_AGO, HOUR_AGO);
+  };
 
   // Dead: no socket at all.
   write(`polygram-${hex('a')}-mcp.json`);
@@ -189,6 +226,46 @@ test('sweep removes config files whose session is gone and keeps live ones', asy
     `water-${hex('d')}-mcp.json`,
   ].sort());
   assert.equal(result.removed.length, 2);
+});
+
+// Both bots share /tmp and the prefix, and a release restarts both: one
+// daemon's boot sweep runs while the other's sessions are cold-starting. A
+// young file is never probed, because connecting to a session that is still
+// starting can disturb its bridge handshake.
+test('sweep leaves young config files alone and never connects to their sockets', async (t) => {
+  const dir = tmpDir(t);
+  // Young, no socket: could be a session between writing its config and listening.
+  fs.writeFileSync(path.join(dir, `polygram-${hex('e')}-mcp.json`), '{}', { mode: 0o600 });
+  // Young, with a listening socket that never sends hello (a starting session).
+  fs.writeFileSync(path.join(dir, `polygram-${hex('f')}-mcp.json`), '{}', { mode: 0o600 });
+  let connections = 0;
+  const starting = net.createServer(() => { connections++; });
+  await new Promise(r => starting.listen(path.join(dir, `polygram-${hex('f')}.sock`), r));
+  t.after(() => starting.close());
+
+  const result = await sweepStaleMcpConfigs({
+    sessionPrefix: 'polygram', dir, logger: { warn() {}, log() {} },
+  });
+  await new Promise(r => setTimeout(r, 30));
+
+  assert.deepEqual(result.removed, []);
+  assert.equal(connections, 0, 'a starting session must not be probed');
+  assert.equal(fs.readdirSync(dir).filter(f => f.endsWith('-mcp.json')).length, 2);
+});
+
+test('the minimum age is 15 minutes by default and can be set', async (t) => {
+  const dir = tmpDir(t);
+  const p = path.join(dir, `polygram-${hex('a')}-mcp.json`);
+  fs.writeFileSync(p, '{}', { mode: 0o600 });
+  const tenMinAgo = (Date.now() - 10 * 60 * 1000) / 1000;
+  fs.utimesSync(p, tenMinAgo, tenMinAgo);
+  const quiet = { warn() {}, log() {} };
+
+  assert.deepEqual((await sweepStaleMcpConfigs({ sessionPrefix: 'polygram', dir, logger: quiet })).removed, []);
+  assert.deepEqual(
+    (await sweepStaleMcpConfigs({ sessionPrefix: 'polygram', dir, logger: quiet, minAgeMs: 5 * 60 * 1000 })).removed,
+    [`polygram-${hex('a')}-mcp.json`],
+  );
 });
 
 test('sweep tolerates a missing directory', async () => {

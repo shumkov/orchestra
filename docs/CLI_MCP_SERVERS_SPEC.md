@@ -125,12 +125,22 @@ Server definitions may carry secrets (`headers.Authorization`, `env` tokens).
   `{ servers: [{ name, type }], skipped: [{ name, reason }] }`. Not emitted when nothing
   is configured. `reason` is a fixed code, never a value.
 - A skipped entry also logs one `logger.warn` line with the name and the code.
-- Boot cleanup: `sweepStaleMcpConfigs({ sessionPrefix, dir })` removes
-  `<prefix>-<hex32>-mcp.json` files whose `<prefix>-<hex32>.sock` is missing or refuses a
-  connection (its daemon is gone). A file whose socket accepts belongs to a live session,
-  possibly another bot's daemon under the same Linux user and prefix, and stays. The
-  consumer calls it at boot next to the tmux orphan sweep. Today 11 such files sit in the
-  VPS's `/tmp`, each holding a bridge socket secret.
+- Boot cleanup: `sweepStaleMcpConfigs({ sessionPrefix, dir, minAgeMs })` removes
+  `<prefix>-<hex32>-mcp.json` files older than `minAgeMs` (default 15 minutes) whose
+  `<prefix>-<hex32>.sock` is missing or refuses a connection (its daemon is gone). A file
+  whose socket accepts belongs to a live session, possibly another bot's daemon under the
+  same Linux user and prefix, and stays. The consumer calls it at boot next to the tmux
+  orphan sweep. Today 11 such files sit in the VPS's `/tmp`, each holding a bridge socket
+  secret.
+- Why the age floor (code review, reproduced): a release restarts both bots together, so
+  one daemon's sweep can run while the other's sessions are cold-starting. Probing a
+  starting session's socket used to take its single bridge slot and fail the start with
+  `BRIDGE_DISCONNECTED`. Young files are therefore never probed, and, as the lasting fix,
+  `ChannelsBridgeServer` gives the slot only to a connection that passes the hello
+  handshake: an unauthenticated connection never blocks the real bridge and its close is
+  never reported as `bridge-disconnected`.
+- Invalid names (including `__proto__`, which would otherwise silently become the
+  object's prototype) are reported cut to 64 characters.
 
 ### When a change takes effect
 

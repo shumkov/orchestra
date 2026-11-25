@@ -2315,7 +2315,41 @@ test('pending request cap rejects before writing another request', async (t) => 
   await Promise.allSettled(pending);
 });
 
-test('inbound line and byte queue caps fault instead of buffering without bound', async (t) => {
+test('a burst of command output in one stdout chunk is processed, not faulted', async (t) => {
+  // Production symptom: Codex ran several commands in parallel; their output
+  // reached the client as ~500 item/commandExecution/outputDelta lines in one
+  // second, and the generation died with "app-server inbound message queue
+  // exceeded the size limit". One pipe chunk of small notifications holds more
+  // lines than maxQueuedLines; pausing stdout must stop splitting that chunk
+  // instead of faulting on it.
+  const deltas = Array.from({ length: 600 }, (_, index) => ({
+    method: 'item/commandExecution/outputDelta',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'exec-1',
+      delta: `line ${index}\n`,
+    },
+  }));
+  const harness = createHarness(t, {
+    methods: { 'config/read': { beforeResponseMessages: deltas } },
+  });
+  const client = harness.makeClient();
+  await client.start();
+
+  await client.request('config/read', {
+    cwd: harness.cwd,
+    includeLayers: true,
+  });
+  assert.doesNotThrow(() => client.assertHealthy());
+  await client.close();
+  assert.equal(await client.waitForFault(), null);
+});
+
+test('a chunk over the line or byte queue cap is queued with backpressure, not faulted', async (t) => {
+  // Ten notifications in one write always reach the client as one chunk, so
+  // this pins the per-chunk cap check deterministically: before, the split
+  // loop faulted on the third line (line cap) or the seventh (byte cap).
   const warnings = Array.from(
     { length: 10 },
     () => ({ method: 'warning', params: {} }),
@@ -2338,28 +2372,59 @@ test('inbound line and byte queue caps fault instead of buffering without bound'
     await t.test(entry.name, async (subtest) => {
       const harness = createHarness(subtest, {
         methods: {
-          'config/read': {
-            beforeResponseMessages: warnings,
-            hold: true,
-          },
+          'config/read': { beforeResponseMessages: warnings },
         },
       });
       const client = harness.makeClient(entry.options);
       await client.start();
 
-      await rejectedWithinWithCode(
-        client.request('config/read', {
-          cwd: harness.cwd,
-          includeLayers: true,
-        }),
-        'CODEX_PROTOCOL_ERROR',
-      );
-      assert.throws(
-        () => client.assertHealthy(),
-        { code: 'CODEX_PROTOCOL_ERROR' },
-      );
+      await client.request('config/read', {
+        cwd: harness.cwd,
+        includeLayers: true,
+      });
+      assert.doesNotThrow(() => client.assertHealthy());
+      await client.close();
+      assert.equal(await client.waitForFault(), null);
     });
   }
+});
+
+test('a stream that ignores pause() still faults once the queue is at its caps', async (t) => {
+  const harness = createHarness(t);
+  const { client, child } = attachFakeSupervisor(harness, {
+    client: { maxQueuedLines: 2 },
+  });
+  child.stdout.pause = () => child.stdout;
+  // The first line never finishes handling, so nothing leaves the queue.
+  client._handleLine = () => new Promise(() => {});
+  const warning = `${JSON.stringify({ method: 'warning', params: {} })}\n`;
+
+  child.stdout.write(warning.repeat(3));
+  await new Promise((resolve) => setImmediate(resolve));
+  // The fake child never completed start(), so read the fault state directly.
+  assert.equal(client.protocolError, null, 'one chunk over the cap is accepted');
+
+  child.stdout.write(warning);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(client.protocolError?.code, 'CODEX_PROTOCOL_ERROR');
+  assert.match(client.protocolError.message, /queue exceeded the size limit/);
+});
+
+test('close resumes a stdout paused by backpressure', async (t) => {
+  // A paused pipe can leave the app-server blocked writing output while it
+  // should be reading the stdin EOF that asks it to shut down.
+  const harness = createHarness(t);
+  const { client, child } = attachFakeSupervisor(harness, {
+    client: { maxQueuedLines: 2 },
+  });
+  client._handleLine = () => new Promise(() => {});
+  const warning = `${JSON.stringify({ method: 'warning', params: {} })}\n`;
+  child.stdout.write(warning.repeat(2));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(child.stdout.isPaused(), true, 'backpressure paused stdout');
+
+  await client.close();
+  assert.equal(child.stdout.isPaused(), false);
 });
 
 test('oversized, malformed, partial, and stderr failures reject pending work without leaking content', async (t) => {

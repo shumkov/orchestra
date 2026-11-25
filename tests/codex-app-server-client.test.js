@@ -2346,6 +2346,68 @@ test('a burst of command output in one stdout chunk is processed, not faulted', 
   assert.equal(await client.waitForFault(), null);
 });
 
+test('a command that printed over 1 MiB does not fault the client on its item/completed line', async (t) => {
+  // Production symptom: a command printed one 2.3 MB JSON line and the
+  // generation died with "app-server line exceeded the size limit". Codex caps
+  // a command's aggregatedOutput at about 1 MiB, but JSON escaping grows that
+  // in the item/completed line: '"' doubles, control characters become
+  // \u00XX (six bytes each). The client must accept the largest such line.
+  const completedCommand = (aggregatedOutput) => ({
+    method: 'item/completed',
+    params: {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      completedAtMs: 1_764_000_000_000,
+      item: {
+        id: 'call-1',
+        type: 'commandExecution',
+        command: '/bin/zsh -lc cat large.json',
+        cwd: '/workspace',
+        processId: null,
+        source: 'agent',
+        status: 'completed',
+        commandActions: [],
+        aggregatedOutput,
+        exitCode: 0,
+        durationMs: 120,
+      },
+    },
+  });
+  const capturedOutputBytes = 1_048_576;
+  const cases = [{
+    name: 'quotes escaped to twice their size',
+    output: '"'.repeat(capturedOutputBytes),
+    minLineBytes: 2 * 1024 * 1024,
+  }, {
+    name: 'control characters escaped to six times their size',
+    output: '\u0001'.repeat(capturedOutputBytes),
+    minLineBytes: 6 * 1024 * 1024,
+  }];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async (subtest) => {
+      const message = completedCommand(entry.output);
+      assert.ok(
+        Buffer.byteLength(JSON.stringify(message)) >= entry.minLineBytes,
+        'the notification line is as large as the escaping makes it',
+      );
+      const harness = createHarness(subtest, {
+        methods: { 'config/read': { beforeResponseMessages: [message] } },
+      });
+      const client = harness.makeClient();
+      await client.start();
+
+      await client.request('config/read', {
+        cwd: harness.cwd,
+        includeLayers: true,
+      });
+      assert.doesNotThrow(() => client.assertHealthy());
+      await client.close();
+      assert.equal(await client.waitForFault(), null);
+    });
+  }
+});
+
 test('a chunk over the line or byte queue cap is queued with backpressure, not faulted', async (t) => {
   // Ten notifications in one write always reach the client as one chunk, so
   // this pins the per-chunk cap check deterministically: before, the split
@@ -2434,6 +2496,12 @@ test('oversized, malformed, partial, and stderr failures reject pending work wit
       methods: { 'config/read': { oversizedBytes: 2_048 } },
     },
     options: { maxLineBytes: 512 },
+  }, {
+    // The default limit admits a command's escaped output, not any size.
+    name: 'line over the default limit',
+    scenario: {
+      methods: { 'config/read': { oversizedBytes: 8 * 1024 * 1024 } },
+    },
   }, {
     name: 'malformed JSON',
     scenario: {

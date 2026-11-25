@@ -38,6 +38,7 @@ const hookSettings = require('./lib/process/hook-settings');
 const hookEventTail = require('./lib/process/hook-event-tail');
 const startupGate = require('./lib/tmux/startup-gate');
 const attachmentBase = require('./lib/process/attachment-base');
+const { sweepStaleMcpConfigs } = require('./lib/process/cli-mcp-servers');
 
 const { createTmuxRunner } = require('./lib/tmux/tmux-runner');
 const orphanSweep = require('./lib/tmux/orphan-sweep');
@@ -60,6 +61,8 @@ module.exports = {
   ChannelsBridgeServer, bridgeProtocol,
   // tmux lifecycle
   createTmuxRunner, orphanSweep, pollScheduler, logTail, startupGate,
+  // boot cleanup of mcp-config files left by dead CLI sessions
+  sweepStaleMcpConfigs,
   // claude binary pin+vendor
   claudeBin,
   // observability
